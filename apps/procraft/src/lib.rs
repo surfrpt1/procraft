@@ -2007,6 +2007,30 @@ impl ProCraftApp {
     /// Composite view uploads one `set_partial` per tile under the dirty
     /// rect; pan, zoom and rotation never recomposite.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
+        // "View" can be checked on a layer with no mask. If that view would
+        // also suppress the viewport fallback this document needs, drop it
+        // for the frame rather than ask for a canvas texture this GPU cannot
+        // hold.
+        let has_mask = self
+            .doc
+            .layers
+            .get(self.doc.active)
+            .is_some_and(|l| l.mask.is_some());
+        if self.view_mask
+            && !has_mask
+            && canvas::viewport_active(
+                viewport_forced(),
+                cfg!(any(target_os = "android", target_os = "ios")),
+                self.doc.w.max(self.doc.h),
+                ctx.input(|i| i.max_texture_side),
+            )
+        {
+            self.view_mask = false;
+            let msg = "This layer has no mask.";
+            if self.status != msg {
+                self.status = msg.to_string();
+            }
+        }
         // Viewport-resolution fallback (spec §4): the draw path composites
         // the visible rect, so there is nothing to upload here. Drop the
         // full-canvas texture — at 8K it is 268 MB of VRAM this path never
@@ -2027,11 +2051,6 @@ impl ProCraftApp {
         // and no mask on the layer, the dirty rect must reach the composite
         // path below (which patches tiles) instead of being drained here and
         // leaving the composite to flatten the whole canvas.
-        let has_mask = self
-            .doc
-            .layers
-            .get(self.doc.active)
-            .is_some_and(|l| l.mask.is_some());
         match mask_action(self.view_mask, has_mask, self.mask_shown) {
             // The canvas texture holds mask pixels that no longer apply:
             // drop it once so the composite path starts from a clean
