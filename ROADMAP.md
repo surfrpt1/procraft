@@ -27,7 +27,8 @@ people touch daily. Ranked by user-visible value per effort.
 - [x] **M47 — Palm rejection + Pencil.** Double-tap/hover, touch guards.
   **→ PC checkpoint #5 + iPad check #3 (IPA).**
 - Deferred to Batch 6: 8K canvas + lazy compositing (standalone perf
-  epic, riskiest — Batch 5 stays shippable without it).
+  epic, riskiest — Batch 5 stays shippable without it). Shipped on
+  branch `8k-canvas`.
 
 ## Batch 6 slice: M48 — Transform handles (done, user-verified)
 
@@ -39,7 +40,9 @@ people touch daily. Ranked by user-visible value per effort.
   (midpoint-quadratic `StrokeCurve`), and the Transform-layer buttons
   (session base — no compounding resample). All user-verified good;
   pushed bb5c777.
-- Batch 6 remainder: 8K canvas + lazy compositing perf epic.
+- Batch 6 remainder: 8K canvas + lazy compositing perf epic — shipped
+  on branch `8k-canvas` (tiled storage + tile-undo, LRU composite cache,
+  v12 format, viewport fallback).
 
 ## Batch 7 — keybinds + settings (planned 2026-10-17)
 
@@ -165,7 +168,10 @@ Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
 
 ## P2 — performance + platform (when P0 hurts)
 
-- [ ] 8K canvas, 100+ layers with lazy compositing.
+- [x] 8K canvas, 100+ layers with lazy compositing.
+  256² copy-on-write tiles with tile-pointer undo, tile uploads behind an
+  LRU composite cache, v12 per-tile project format, viewport fallback for
+  GPUs that cannot hold an 8K texture.
 - [ ] Palm rejection + Pencil double-tap/hover.
 - [ ] Time-lapse recording.
 - [ ] iPad layout polish pass.

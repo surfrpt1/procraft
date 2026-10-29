@@ -2014,3 +2014,20 @@ git commit -m "perf(engine): tilebench and 8K measurements"
 - Spec §1 (tiled storage) → task 1; §2 (undo) → task 2; §3 (target A display) → tasks 6–7; §4 (fallback B) → task 10; §5 (limits + v12) → tasks 8 and 9; §6 (memory guard) → tasks 2 and 8; phases 1–6 map to tasks 1–11 in order.
 - Conversion cost: tasks 2–5 are mechanical sweeps over 542 `.pixels` sites; the two rules (dense bridge for cold paths, `get`/`set` for per-pixel paths) keep them reviewable per file. Brush corpus byte-equality is the hard gate that phase 1 stayed behaviour-neutral.
 - Type names used consistently: `Raster`, `TILE`, `StackPlan`, `CompositeCache`, `ViewRect`, `ViewTex`, `viewport_active`, `tile_image`, `layer_alloc_bytes`, `alloc_bytes`.
+
+## Measurement log
+
+`cargo run --release -p procraft-engine --example tilebench` (release build). Tile
+figures are one 256² centre tile, 20 repetitions averaged; every layer holds a
+loaded patch in that tile, so 100L measures 100 blended layers, not empty-tile
+fast paths.
+
+| Date | Host | 4K / 1L tile | 4K / 100L tile | 8K / 1L tile | 8K / 100L tile | 8K flatten (100L) |
+|---|---|---|---|---|---|---|
+| 2026-10-29 | Windows 11 (x86_64), Intel Core i5-8250U @ 1.60 GHz, 8 GiB — desktop | 1.28 ms | 77.70 ms | 1.27 ms | 81.98 ms | 25438 ms (25.4 s) |
+
+- Host `layer_alloc_bytes()` for the 8K/100-layer document: 26,214,400 bytes
+  (100 loaded tiles, 25.0 MiB) — the tile column above is that memory's cost.
+- Android tablet: **pending a device run** — canvas-texture feel with per-tile
+  `set_partial` (target A) vs forced `PROCRAFT_FORCE_VIEWPORT_CANVAS=1`, plus
+  that document's `layer_alloc_bytes()`; controller/project owner close this.
