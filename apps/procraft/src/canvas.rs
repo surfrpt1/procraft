@@ -107,11 +107,49 @@ impl CompositeCache {
     }
 }
 
+/// Assemble the full canvas image (`w * h * 4`, row-major) from composite
+/// tiles: tiles are interleaved row by row within each tile row.
+///
+/// The texture is dense, so appending whole tiles in tile-block order
+/// scrambles every canvas with more than one tile column. This walks the
+/// cache one tile row at a time, crops each tile to the canvas edge (edge
+/// tiles share the band's cropped height, so the first entry gives the row
+/// count) and emits each canvas row as one slice per tile in `tx` order.
+pub fn full_image(doc: &Document, plan: &StackPlan, cache: &mut CompositeCache) -> Vec<u8> {
+    let w = doc.w as usize;
+    let mut img = Vec::with_capacity(w * doc.h as usize * 4);
+    for ty in 0..doc.tiles_y() {
+        let band: Vec<(Vec<u8>, usize, usize)> = (0..doc.tiles_x())
+            .map(|tx| {
+                let tile = cache.tile(doc, plan, tx, ty);
+                tile_image(doc, tile, tx, ty)
+            })
+            .collect();
+        // Every tile in a band crops to the same height; a tile outside the
+        // canvas would be `(empty, 0, 0)`, so the first entry is the band.
+        let rows = band.first().map_or(0, |(_, _, h)| *h);
+        for row in 0..rows {
+            for (rgba, tw, _) in &band {
+                let start = row * tw * 4;
+                img.extend_from_slice(&rgba[start..start + tw * 4]);
+            }
+        }
+    }
+    debug_assert_eq!(img.len(), w * doc.h as usize * 4);
+    img
+}
+
 /// Crop one composite tile to the canvas edge for `set_partial`,
 /// returning `(rgba, w, h)`. A tile wholly outside the canvas yields
-/// `(empty, 0, 0)`; a missing slice bottom is zero-filled rather than
-/// panicking, like the engine's own out-of-canvas pixels.
+/// `(empty, 0, 0)`; a short slice is zero-filled in release builds rather
+/// than panicking, like the engine's own out-of-canvas pixels (debug
+/// builds assert the engine's full-tile size instead).
 pub fn tile_image(doc: &Document, tile: &[u8], tx: u32, ty: u32) -> (Vec<u8>, usize, usize) {
+    debug_assert_eq!(
+        tile.len(),
+        TILE_BYTES,
+        "composite tile is not TILE * TILE * 4 bytes"
+    );
     let x0 = tx.saturating_mul(TILE);
     let y0 = ty.saturating_mul(TILE);
     let w = doc.w.saturating_sub(x0).min(TILE) as usize;
@@ -134,7 +172,7 @@ pub fn tile_image(doc: &Document, tile: &[u8], tx: u32, ty: u32) -> (Vec<u8>, us
 
 #[cfg(test)]
 mod tests {
-    use procraft_engine::Document;
+    use procraft_engine::{BlendMode, Document, Raster};
 
     use super::*;
 
@@ -142,6 +180,78 @@ mod tests {
         let mut doc = Document::new(w, h);
         doc.layers[0].pixels.set4(0, px);
         doc
+    }
+
+    /// Content crossing tile seams in both axes: a semi-transparent base,
+    /// a multiply layer, and an offset layer revealed through a mask.
+    fn busy_doc(w: u32, h: u32) -> Document {
+        let mut doc = Document::new(w, h);
+        doc.background = [12, 34, 56, 255];
+        let stride = w as usize;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y as usize * stride + x as usize) * 4;
+                doc.layers[0].pixels.set4(
+                    i,
+                    [
+                        (x * 3 % 256) as u8,
+                        (y * 5 % 256) as u8,
+                        ((x + y) * 7 % 256) as u8,
+                        (64 + (x + y) % 192) as u8,
+                    ],
+                );
+            }
+        }
+        doc.add_layer("multiply".into());
+        doc.layers[1].blend = BlendMode::Multiply;
+        for y in 0..h {
+            for x in 0..w {
+                if (x + y) % 3 == 0 {
+                    let i = (y as usize * stride + x as usize) * 4;
+                    doc.layers[1].pixels.set4(i, [255, 40, 220, 180]);
+                }
+            }
+        }
+        doc.add_layer("masked".into());
+        doc.layers[2].opacity = 0.73;
+        doc.layers[2].ox = 25;
+        doc.layers[2].oy = -9;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y as usize * stride + x as usize) * 4;
+                let v = ((x * 11 + y * 7) % 256) as u8;
+                doc.layers[2].pixels.set4(i, [v, 255 - v, 90, 255]);
+            }
+        }
+        let mask = doc.layers[2].mask.get_or_insert_with(|| Raster::mask(w, h));
+        for y in 0..h {
+            for x in 0..w {
+                mask.set(
+                    y as usize * stride + x as usize,
+                    ((x * 13 + y * 5) % 256) as u8,
+                );
+            }
+        }
+        doc
+    }
+
+    fn assert_full_image_matches_flatten(w: u32, h: u32) {
+        let doc = busy_doc(w, h);
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let img = full_image(&doc, &plan, &mut cache);
+        let flat = doc.flatten();
+        assert_eq!(img.len(), w as usize * h as usize * 4);
+        assert_eq!(img.len(), flat.len());
+        // Compare in place: the vectors are ~1 MB, so a failing `assert_eq!`
+        // would dump both. The first differing byte is the useful report.
+        if let Some(i) = img.iter().zip(&flat).position(|(a, b)| a != b) {
+            panic!(
+                "first mismatch at byte {i}: full_image {:?} != flatten {:?}",
+                &img[i..(i + 4).min(img.len())],
+                &flat[i..(i + 4).min(flat.len())]
+            );
+        }
     }
 
     #[test]
@@ -254,5 +364,45 @@ mod tests {
         assert_eq!(cache.bytes(), 0);
         assert!(cache.tiles.is_empty());
         assert!(cache.order.is_empty());
+    }
+
+    #[test]
+    fn full_image_matches_flatten() {
+        // 3 × 2 tiles with edge cropping in both axes (88 px last column,
+        // 44 px last row); the tile order bug shows up on the first row.
+        assert_full_image_matches_flatten(600, 300);
+    }
+
+    #[test]
+    fn full_image_matches_flatten_on_an_exact_tile_grid() {
+        // 2 × 1 tiles, no cropping: ordering alone has to be right.
+        assert_full_image_matches_flatten(512, 256);
+    }
+
+    #[test]
+    fn full_image_is_row_major() {
+        let mut doc = Document::new(600, 300);
+        doc.background = [0, 0, 0, 255];
+        let left = [200, 30, 40, 255];
+        let right = [10, 220, 90, 255];
+        for y in 0..TILE {
+            for x in 0..2 * TILE {
+                let px = if x < TILE { left } else { right };
+                doc.layers[0].pixels.set4((y * doc.w + x) as usize * 4, px);
+            }
+        }
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let img = full_image(&doc, &plan, &mut cache);
+        assert_eq!(img.len(), doc.w as usize * doc.h as usize * 4);
+        // Canvas row 0 holds tile (0,0) then tile (1,0), side by side.
+        assert_eq!(&img[0..4], &left);
+        assert_eq!(&img[TILE as usize * 4..TILE as usize * 4 + 4], &right);
+        // Tile-block order would have laid tile (1,0) a whole tile later.
+        assert_ne!(
+            &img[TILE_BYTES..TILE_BYTES + 4],
+            &right,
+            "tile (1,0) must not start a whole tile into the buffer"
+        );
     }
 }

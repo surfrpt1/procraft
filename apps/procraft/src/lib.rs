@@ -1951,20 +1951,12 @@ impl ProCraftApp {
             return;
         }
         self.anim_shown = None;
-        // Full upload: new/changed texture. Walk the tiles row-major;
-        // `tile_image` crops the last column and row so the dense buffer
-        // is exactly `w * h * 4` and the texture stays canvas-sized.
+        // Full upload: new/changed texture. `full_image` interleaves the
+        // tiles row by row and crops the last column and row, so the dense
+        // buffer is exactly `w * h * 4` and the texture stays canvas-sized.
         if self.texture.is_none() {
             let plan = self.doc.stack_plan();
-            let (tw, th) = (self.doc.tiles_x(), self.doc.tiles_y());
-            let mut img = Vec::with_capacity(self.doc.w as usize * self.doc.h as usize * 4);
-            for ty in 0..th {
-                for tx in 0..tw {
-                    let tile = self.composite.tile(&self.doc, &plan, tx, ty);
-                    let (rgba, _, _) = canvas::tile_image(&self.doc, tile, tx, ty);
-                    img.extend_from_slice(&rgba);
-                }
-            }
+            let img = canvas::full_image(&self.doc, &plan, &mut self.composite);
             let image = ColorImage::from_rgba_unmultiplied(
                 [self.doc.w as usize, self.doc.h as usize],
                 &img,
