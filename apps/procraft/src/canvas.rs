@@ -1,16 +1,23 @@
 //! Canvas display: composite tiles behind an LRU cache.
 //!
-//! The canvas texture is dense (`doc.w` × `doc.h`), but the composite is
-//! produced and uploaded tile by tile so a dab costs one 256² tile pass
-//! instead of a full-canvas one. [`CompositeCache`] holds the tiles that
-//! were recomposited while the texture survived, and [`tile_image`]
-//! crops a tile to the canvas edge so every upload fits the dense
-//! texture without changing its size (UVs stay 0..1).
+//! Two targets share that composite. Target A is one dense canvas texture
+//! (`doc.w` × `doc.h`) fed by tile uploads: [`full_image`] interleaves the
+//! tiles row by row, [`tile_image`] crops them to the canvas edge, and a
+//! dab re-uploads the tiles its dirty rect touches, so the texture never
+//! changes size (UVs stay 0..1).
+//!
+//! Target B is the viewport fallback for documents the GPU cannot hold: a
+//! screen-sized texture ([`ViewTex`]) covering only the canvas rect the
+//! view shows ([`ViewRect`]), sampled from the same composite tiles by
+//! [`view_pixels`] when the fallback triggers. A view change re-samples it
+//! whole; a dirty revision patches just the texels under the dirty rect.
 //!
 //! The cache is keyed by tile only: a tile is trusted until something
 //! evicts it. Content edits evict the tiles their dirty rect touches
 //! (see `ProCraftApp::refresh_texture`); dropping the canvas texture
-//! (new/open/resize/undo-driven rebuild) clears the whole cache.
+//! (new/open/resize/undo-driven rebuild) clears the whole cache — with one
+//! deliberate exception: the viewport path drops the dense texture without
+//! invalidating, because the cache is exactly what it samples.
 
 use procraft_engine::{Document, StackPlan, MAX_CANVAS_SIDE, TILE};
 
@@ -284,7 +291,7 @@ fn texel_span(origin: f32, step: f32, len: usize, band_lo: f32, band_hi: f32) ->
 /// one cache lookup per texel would dominate the frame. Each canvas tile is
 /// fetched once, then every texel whose center lands in it is copied — the
 /// inner loop is pure sampling.
-pub fn view_pixels(
+pub(crate) fn view_pixels(
     doc: &Document,
     plan: &StackPlan,
     cache: &mut CompositeCache,
@@ -380,6 +387,47 @@ fn dirty_texels(view: ViewRect, out: [usize; 2], rect: (u32, u32, u32, u32)) -> 
     }
 }
 
+/// What a [`ViewTex::render`] call has to do: rewrite the whole texture,
+/// patch one texel rect, or nothing at all.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ViewUpdate {
+    Full,
+    Partial([usize; 4]),
+    None,
+}
+
+/// The pure full/partial/none decision behind [`ViewTex::render`].
+///
+/// A new view or output size re-samples everything. So does a revision
+/// change with no dirty rect (the dirt is unknown). A dirty rect that maps
+/// to no texel of the view — a symmetric dab on the hidden half, a filtered
+/// region off-screen — is a no-op, not a full pass. A rect covering at
+/// least half the texture is no cheaper than a full pass.
+fn plan_update(
+    key_matches: bool,
+    rev_matches: bool,
+    dirty: Option<(u32, u32, u32, u32)>,
+    view: ViewRect,
+    out: [usize; 2],
+) -> ViewUpdate {
+    if !key_matches {
+        return ViewUpdate::Full;
+    }
+    if rev_matches {
+        return ViewUpdate::None;
+    }
+    let Some(rect) = dirty else {
+        return ViewUpdate::Full;
+    };
+    match dirty_texels(view, out, rect) {
+        Some([c0, r0, c1, r1]) if (c1 - c0) * (r1 - r0) * 2 < out[0] * out[1] => {
+            ViewUpdate::Partial([c0, r0, c1, r1])
+        }
+        Some(_) => ViewUpdate::Full,
+        None => ViewUpdate::None,
+    }
+}
+
 /// View key: what the texture currently in hand depicts. Revision is not
 /// part of it — a dirty revision takes the cheaper partial path instead of
 /// a full re-render. The cache epoch stands in for document identity,
@@ -431,6 +479,16 @@ impl ViewTex {
         self.tex.as_ref()
     }
 
+    /// Drop the texture and everything describing it, freeing its VRAM. A
+    /// cleared view is a missing texture, so the next [`render`](Self::render)
+    /// takes the full path.
+    pub fn clear(&mut self) {
+        self.tex = None;
+        self.view = None;
+        self.key = None;
+        self.rev = 0;
+    }
+
     /// Bring the texture up to date for `view` (canvas pixels) laid out as
     /// `out` texels. Full pass on a new view or output size, partial pass
     /// over the dirty rect otherwise; no work at all when nothing changed.
@@ -441,7 +499,7 @@ impl ViewTex {
         cache: &mut CompositeCache,
         view: ViewRect,
         out: [usize; 2],
-    ) -> &egui::TextureHandle {
+    ) {
         let out = [out[0].max(1), out[1].max(1)];
         let key = view_key(view, out, (doc.w, doc.h), cache.epoch());
         let rev = doc.revision();
@@ -451,23 +509,17 @@ impl ViewTex {
         if let Some(rect) = dirty {
             evict_tiles(cache, rect);
         }
-        if self.tex.is_none() || self.key != Some(key) {
-            self.full(ctx, doc, cache, view, out);
-        } else if rev != self.rev {
-            let region = dirty.and_then(|r| dirty_texels(view, out, r));
-            // A dirty area covering half the texture is no cheaper than a
-            // full pass (and a missing rect means the dirt is unknown).
-            match region {
-                Some([c0, r0, c1, r1]) if (c1 - c0) * (r1 - r0) * 2 < out[0] * out[1] => {
-                    self.partial(doc, cache, view, out, [c0, r0, c1, r1]);
-                }
-                _ => self.full(ctx, doc, cache, view, out),
-            }
+        match plan_update(self.key == Some(key), rev == self.rev, dirty, view, out) {
+            ViewUpdate::Full => self.full(ctx, doc, cache, view, out),
+            ViewUpdate::Partial(region) => self.partial(doc, cache, view, out, region),
+            ViewUpdate::None => {}
         }
+        // Every path, including the no-op one, records what the texture now
+        // depicts, so the next frame does not redo a pass the dirty rect
+        // could not make cheaper.
         self.key = Some(key);
         self.rev = rev;
         self.view = Some(view);
-        self.tex.as_ref().expect("render built a texture")
     }
 
     fn full(
@@ -481,7 +533,13 @@ impl ViewTex {
         let plan = doc.stack_plan();
         let pixels = view_pixels(doc, &plan, cache, view, out, None);
         let image = egui::ColorImage::from_rgba_unmultiplied(out, &pixels);
-        self.tex = Some(ctx.load_texture("canvas-view", image, egui::TextureOptions::LINEAR));
+        // Update in place when possible: a reload would churn the texture id
+        // and free the old one on every full pass (forced/desktop wheel).
+        if let Some(handle) = &mut self.tex {
+            handle.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.tex = Some(ctx.load_texture("canvas-view", image, egui::TextureOptions::LINEAR));
+        }
     }
 
     fn partial(
@@ -939,5 +997,132 @@ mod tests {
         assert!(cache.tiles.contains_key(&(2, 0)));
         let fresh = view_pixels(&doc, &plan, &mut cache, view, out, None);
         assert_eq!(&fresh[px..px + 4], &[200, 100, 50, 255], "recomposited");
+    }
+
+    /// The texel columns/rows whose sample centers land on dirty canvas
+    /// pixels, brute-forced from the sampler's own formula: the ground truth
+    /// `dirty_texels` must cover, never replace.
+    fn texels_touching(
+        view: ViewRect,
+        out: [usize; 2],
+        rect: (u32, u32, u32, u32),
+    ) -> Option<[usize; 4]> {
+        let (dx, dy) = (
+            (view.x1 - view.x0) / out[0] as f32,
+            (view.y1 - view.y0) / out[1] as f32,
+        );
+        let (rows, cols): (Vec<usize>, Vec<usize>) = (
+            (0..out[1])
+                .filter(|row| {
+                    let y = (view.y0 + (*row as f32 + 0.5) * dy).floor() as u32;
+                    (rect.1..=rect.3).contains(&y)
+                })
+                .collect(),
+            (0..out[0])
+                .filter(|col| {
+                    let x = (view.x0 + (*col as f32 + 0.5) * dx).floor() as u32;
+                    (rect.0..=rect.2).contains(&x)
+                })
+                .collect(),
+        );
+        match (rows.first(), rows.last(), cols.first(), cols.last()) {
+            (Some(r0), Some(r1), Some(c0), Some(c1)) => Some([*c0, *r0, c1 + 1, r1 + 1]),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn dirty_texels_covers_every_texel_sampling_the_dirty_pixels() {
+        // 8K canvas, 2732-texel viewport: a fractional 2.9985 canvas px per
+        // texel, the 3.0 device case where rounding is the hazard.
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 8192.0,
+            y1: 8192.0,
+        };
+        let out = [2732, 2732];
+        let dirty = (1000, 2000, 1300, 2100);
+        let got = dirty_texels(view, out, dirty).expect("dirty rect is on screen");
+        let want = texels_touching(view, out, dirty).expect("some texel samples it");
+        assert!(
+            got[0] <= want[0] && got[1] <= want[1] && got[2] >= want[2] && got[3] >= want[3],
+            "got {got:?} must cover every sampling texel {want:?}"
+        );
+        // Small enough to be worth a partial upload.
+        assert_eq!(
+            plan_update(true, false, Some(dirty), view, out),
+            ViewUpdate::Partial(got)
+        );
+    }
+
+    #[test]
+    fn off_view_dirty_rects_are_a_no_op() {
+        // The symmetry mirror dabs the hidden half; nothing to upload.
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1000.0,
+            y1: 1000.0,
+        };
+        let out = [500, 500];
+        let dirty = (2000, 100, 2100, 200);
+        assert_eq!(dirty_texels(view, out, dirty), None);
+        assert_eq!(texels_touching(view, out, dirty), None);
+        assert_eq!(
+            plan_update(true, false, Some(dirty), view, out),
+            ViewUpdate::None
+        );
+    }
+
+    #[test]
+    fn a_canvas_sized_dirty_rect_takes_the_full_pass() {
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 8192.0,
+            y1: 8192.0,
+        };
+        let out = [2732, 2732];
+        let dirty = (0, 0, 8191, 8191);
+        let region = dirty_texels(view, out, dirty).expect("covers the view");
+        assert_eq!((region[0], region[1]), (0, 0));
+        assert!(region[2] >= out[0] - 1 && region[3] >= out[1] - 1);
+        assert_eq!(
+            plan_update(true, false, Some(dirty), view, out),
+            ViewUpdate::Full
+        );
+    }
+
+    #[test]
+    fn a_new_view_or_an_unknown_dirty_rect_takes_the_full_pass() {
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 8192.0,
+            y1: 8192.0,
+        };
+        let out = [2732, 2732];
+        // View/output key changed (even with the same revision).
+        assert_eq!(plan_update(false, true, None, view, out), ViewUpdate::Full);
+        // Revision moved but the dirty rect was already consumed: the dirt
+        // is unknown, so everything is rewritten.
+        assert_eq!(plan_update(true, false, None, view, out), ViewUpdate::Full);
+    }
+
+    #[test]
+    fn an_unchanged_revision_does_no_work() {
+        let view = ViewRect {
+            x0: 4000.0,
+            y0: 4000.0,
+            x1: 5000.0,
+            y1: 5000.0,
+        };
+        let out = [1024, 1024];
+        assert_eq!(plan_update(true, true, None, view, out), ViewUpdate::None);
+        assert_eq!(
+            plan_update(true, true, Some((4100, 4100, 4200, 4200)), view, out),
+            ViewUpdate::None
+        );
     }
 }

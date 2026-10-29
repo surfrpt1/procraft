@@ -2012,6 +2012,11 @@ impl ProCraftApp {
             self.texture = None;
             return;
         }
+        // Target A from here on: the viewport texture is dead weight, and a
+        // dropped handle forces a full pass if the fallback returns.
+        if self.view_tex.texture().is_some() {
+            self.view_tex.clear();
+        }
         // Mask viewer: grayscale of the active layer's mask, full upload.
         if self.view_mask {
             if let Some(mv) = self.doc.mask_view() {
