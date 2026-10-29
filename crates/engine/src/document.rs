@@ -883,7 +883,10 @@ impl Document {
         false
     }
 
-    fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
+    /// Reference compositor: one pixel, walking every layer through dense
+    /// reads. The tile compositor (`composite_tile`) must match it byte for
+    /// byte; tests compare the two.
+    pub(crate) fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let (mut r, mut g, mut b) = (
             self.background[0] as f32,
             self.background[1] as f32,
@@ -934,28 +937,58 @@ impl Document {
     }
 
     /// Composite bottom-to-top over the background into RGBA bytes.
+    /// Walks tiles through the stack plan: one composite per 256² tile,
+    /// then tile rows are copied into canvas rows.
     pub fn flatten(&self) -> Vec<u8> {
-        let n = (self.w * self.h) as usize;
-        let mut out = vec![0u8; n * 4];
-        for y in 0..self.h {
-            for x in 0..self.w {
-                let i = ((y * self.w + x) * 4) as usize;
-                out[i..i + 4].copy_from_slice(&self.composite_pixel(x, y));
+        let plan = self.stack_plan();
+        let mut out = vec![0u8; (self.w as usize) * (self.h as usize) * 4];
+        for ty in 0..self.tiles_y() {
+            for tx in 0..self.tiles_x() {
+                let tile = self.composite_tile(&plan, tx, ty);
+                let x0 = (tx * TILE) as usize;
+                let y0 = (ty * TILE) as usize;
+                let tw = (self.w as usize - x0).min(TILE as usize);
+                let th = (self.h as usize - y0).min(TILE as usize);
+                for row in 0..th {
+                    let src = row * TILE as usize * 4;
+                    let dst = ((y0 + row) * self.w as usize + x0) * 4;
+                    out[dst..dst + tw * 4].copy_from_slice(&tile[src..src + tw * 4]);
+                }
             }
         }
         out
     }
 
     /// Composite only the inclusive region `(x0, y0)..=(x1, y1)` (clamped),
-    /// row-major RGBA, for partial texture uploads.
+    /// row-major RGBA, for partial texture uploads. Tiles are composited
+    /// once per tile row and emitted in canvas row order, so a region
+    /// spanning tiles still yields a contiguous row-major buffer.
     pub fn flatten_region(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
+        if self.w == 0 || self.h == 0 {
+            // No tiles exist; the pixel loop used to emit the single
+            // background pixel at (0, 0). Keep that result.
+            return self.composite_pixel(0, 0).to_vec();
+        }
         let x1 = x1.min(self.w.saturating_sub(1));
         let y1 = y1.min(self.h.saturating_sub(1));
         let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let plan = self.stack_plan();
         let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                out.extend_from_slice(&self.composite_pixel(x, y));
+        let (tx0, tx1) = (x0 / TILE, x1 / TILE);
+        for ty in y0 / TILE..=y1 / TILE {
+            let row_tiles: Vec<Vec<u8>> = (tx0..=tx1)
+                .map(|tx| self.composite_tile(&plan, tx, ty))
+                .collect();
+            for y in y0.max(ty * TILE)..=y1.min((ty + 1) * TILE - 1) {
+                let row_in_tile = (y % TILE) as usize * TILE as usize;
+                for (i, tx) in (tx0..=tx1).enumerate() {
+                    let cx0 = (tx * TILE).max(x0);
+                    let cx1 = ((tx + 1) * TILE - 1).min(x1);
+                    for x in cx0..=cx1 {
+                        let o = (row_in_tile + (x % TILE) as usize) * 4;
+                        out.extend_from_slice(&row_tiles[i][o..o + 4]);
+                    }
+                }
             }
         }
         out

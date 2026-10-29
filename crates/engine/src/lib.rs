@@ -4,6 +4,7 @@
 
 mod animation;
 mod brush;
+mod composite;
 mod document;
 mod guides;
 mod import_filter;
@@ -27,6 +28,7 @@ pub use brush::{
     open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color,
     DabDynamics, ShapePoly, Stroke, Taper, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE,
 };
+pub use composite::StackPlan;
 pub use document::{
     curves_lut, gallery_thumb, levels_lut, BlendMode, Document, Layer, LayerGroup, PaintTarget,
     SymmetryMode, MAX_CANVAS_SIDE,
