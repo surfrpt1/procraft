@@ -2,6 +2,90 @@
 
 use crate::raster::{Raster, TILE};
 
+/// Write one raster as a v12 tile table: `u32 count`, then per allocated
+/// tile `u16 tx, u16 ty, u32 len, len bytes` of zlib-compressed raw tile
+/// bytes. Empty (unallocated) tiles are omitted, so a sparse 8K layer
+/// saves only the tiles that hold content.
+fn write_tile_table(f: &mut std::fs::File, raster: &Raster) -> Result<(), String> {
+    use std::io::Write;
+    let count = raster.allocated_tiles().count() as u32;
+    f.write_all(&count.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    for (tx, ty, tile) in raster.allocated_tiles() {
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(tile).map_err(|e| e.to_string())?;
+        let packed = enc.finish().map_err(|e| e.to_string())?;
+        f.write_all(&(tx as u16).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(ty as u16).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(packed.len() as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&packed).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Read a v12 tile table into a fresh raster. `take` hands out the file
+/// bytes and fails closed on truncation. Every record is validated against
+/// the canvas grid, a sane payload length and the exact tile size, so a
+/// corrupt table returns `Err` instead of loading wrong pixels.
+fn read_tile_table<'a>(
+    take: &mut impl FnMut(usize) -> Result<&'a [u8], String>,
+    w: u32,
+    h: u32,
+    bpp: u8,
+) -> Result<Raster, String> {
+    use std::io::Read;
+    let mut raster = Raster::new(w, h, bpp);
+    let slots = raster.tiles_x() as u64 * raster.tiles_y() as u64;
+    let count = u32::from_le_bytes(
+        take(4)?[..4]
+            .try_into()
+            .map_err(|_| "bad tile count".to_string())?,
+    );
+    if count as u64 > slots {
+        return Err("project has bad tile count".to_string());
+    }
+    let tile_len = raster.tile_len();
+    for _ in 0..count {
+        let tx = u16::from_le_bytes(
+            take(2)?[..2]
+                .try_into()
+                .map_err(|_| "bad tile x".to_string())?,
+        ) as u32;
+        let ty = u16::from_le_bytes(
+            take(2)?[..2]
+                .try_into()
+                .map_err(|_| "bad tile y".to_string())?,
+        ) as u32;
+        if tx >= raster.tiles_x() || ty >= raster.tiles_y() {
+            return Err("project has out-of-range tile".to_string());
+        }
+        let len = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad tile length".to_string())?,
+        ) as usize;
+        if len == 0 || len > tile_len + 10 * 1024 * 1024 {
+            return Err("project has bad tile length".to_string());
+        }
+        let packed = take(len)?;
+        // Bound the inflate at the tile size so a bomb cannot balloon the
+        // read; a short or long result is a corrupt tile.
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(packed)
+            .take(tile_len as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|_| "project has corrupt tile".to_string())?;
+        if raw.len() != tile_len {
+            return Err("project has corrupt tile".to_string());
+        }
+        raster.tile_mut(tx, ty).copy_from_slice(&raw);
+    }
+    Ok(raster)
+}
+
 /// How a layer's pixels combine with what's beneath.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
@@ -3045,14 +3129,14 @@ impl Document {
     }
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
-    /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 11 adds per-layer text blocks (v10 and older files
-    /// still open text-less; old app versions cleanly refuse v11 files at
-    /// the magic).
+    /// to a `.procraft` file: magic + little-endian records. Version 12
+    /// stores per-tile zlib payloads (only allocated 256² tiles are
+    /// written), so sparse 8K documents stay small; older readers cleanly
+    /// refuse v12 files at the magic. Versions 1-11 stay readable.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT11").map_err(|e| e.to_string())?;
+        f.write_all(b"PCRAFT12").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -3151,29 +3235,17 @@ impl Document {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
                 }
             }
-            let expect = (self.w * self.h * 4) as usize;
-            let pixels = layer.pixels.to_dense();
-            if pixels.len() != expect {
+            // v12 writes only the tiles that hold content; a dense layer
+            // with assigned tiles serializes as a tile table.
+            if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.bpp() != 4 {
                 return Err("layer has wrong pixel size".to_string());
             }
-            let mut enc =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            enc.write_all(&pixels).map_err(|e| e.to_string())?;
-            let packed = enc.finish().map_err(|e| e.to_string())?;
-            f.write_all(&(packed.len() as u32).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&packed).map_err(|e| e.to_string())?;
-            // Optional reveal mask, zlib-compressed like the pixels.
-            match layer.mask.as_ref().map(|m| m.to_dense()) {
-                Some(m) if m.len() == (self.w * self.h) as usize => {
+            write_tile_table(&mut f, &layer.pixels)?;
+            // Optional reveal mask, one byte per pixel, same tile table.
+            match layer.mask.as_ref() {
+                Some(m) if m.w() == self.w && m.h() == self.h && m.bpp() == 1 => {
                     f.write_all(&[1u8]).map_err(|e| e.to_string())?;
-                    let mut enc =
-                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-                    enc.write_all(&m).map_err(|e| e.to_string())?;
-                    let packed = enc.finish().map_err(|e| e.to_string())?;
-                    f.write_all(&(packed.len() as u32).to_le_bytes())
-                        .map_err(|e| e.to_string())?;
-                    f.write_all(&packed).map_err(|e| e.to_string())?;
+                    write_tile_table(&mut f, m)?;
                 }
                 _ => {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
@@ -3257,7 +3329,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v11 = magic == b"PCRAFT11";
+        let v12 = magic == b"PCRAFT12";
+        let v11 = v12 || magic == b"PCRAFT11";
         let v10 = v11 || magic == b"PCRAFT10";
         let v9 = v10 || magic == b"PCRAFT09";
         let v8 = v9 || magic == b"PCRAFT08";
@@ -3491,33 +3564,44 @@ impl Document {
                 None
             };
             let expect = (w * h * 4) as usize;
-            let pixels = if v4 {
-                let comp_len = u32::from_le_bytes(
-                    take(4)?[..4]
-                        .try_into()
-                        .map_err(|_| "bad compressed size".to_string())?,
-                ) as usize;
-                if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
-                    return Err("project has bad compressed size".to_string());
-                }
-                let packed = take(comp_len)?.to_vec();
-                let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
-                let mut raw = Vec::with_capacity(expect);
-                use std::io::Read;
-                dec.read_to_end(&mut raw)
-                    .map_err(|_| "project has corrupt pixels".to_string())?;
-                if raw.len() != expect {
-                    return Err("project has corrupt pixels".to_string());
-                }
-                raw
+            // v12 stores a tile table; v1-v11 store one dense zlib payload,
+            // which `Raster::from_dense` splits into tiles on load (all-zero
+            // tiles stay unallocated, so a resave flattens identically).
+            let pixels = if v12 {
+                read_tile_table(&mut take, w, h, 4)?
             } else {
-                take(expect)?.to_vec()
+                let raw = if v4 {
+                    let comp_len = u32::from_le_bytes(
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad compressed size".to_string())?,
+                    ) as usize;
+                    if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
+                        return Err("project has bad compressed size".to_string());
+                    }
+                    let packed = take(comp_len)?.to_vec();
+                    let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
+                    let mut raw = Vec::with_capacity(expect);
+                    use std::io::Read;
+                    dec.read_to_end(&mut raw)
+                        .map_err(|_| "project has corrupt pixels".to_string())?;
+                    if raw.len() != expect {
+                        return Err("project has corrupt pixels".to_string());
+                    }
+                    raw
+                } else {
+                    take(expect)?.to_vec()
+                };
+                Raster::from_dense(w, h, 4, &raw)
             };
-            // v5 appends an optional zlib-compressed reveal mask per layer.
+            // v5 appends an optional reveal mask per layer: dense in v5-v11,
+            // a tile table in v12.
             let mask = if v5 {
                 let flag = take(1)?[0];
                 if flag == 0 {
                     None
+                } else if v12 {
+                    Some(read_tile_table(&mut take, w, h, 1)?)
                 } else {
                     let want = (w * h) as usize;
                     let comp_len = u32::from_le_bytes(
@@ -3537,7 +3621,7 @@ impl Document {
                     if raw.len() != want {
                         return Err("project has corrupt mask".to_string());
                     }
-                    Some(raw)
+                    Some(Raster::from_dense(w, h, 1, &raw))
                 }
             } else {
                 None
@@ -3662,8 +3746,8 @@ impl Document {
                 visible,
                 opacity,
                 blend,
-                pixels: Raster::from_dense(w, h, 4, &pixels),
-                mask: mask.map(|m| Raster::from_dense(w, h, 1, &m)),
+                pixels,
+                mask,
                 clip,
                 ox,
                 oy,
@@ -3958,7 +4042,7 @@ mod tests {
         let path = dir.join("procraft-v8.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -4009,7 +4093,7 @@ mod tests {
         let path = dir.join("procraft-v9.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -4077,7 +4161,7 @@ mod tests {
         let path = dir.join("procraft-v10.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].hold, 3);
@@ -4174,14 +4258,242 @@ mod tests {
     }
 
     #[test]
-    fn save_emits_v11_magic() {
+    fn save_emits_v12_magic() {
         let doc = Document::new(2, 1);
         let dir = std::env::temp_dir();
-        let path = dir.join("procraft-v11-magic.pcraft");
+        let path = dir.join("procraft-v12-magic.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
+    }
+
+    /// Hand-build a v12 record with one layer holding one tile. Returns the
+    /// buffer plus the offsets the validation tests mutate.
+    struct V12Fixture {
+        buf: Vec<u8>,
+        count_at: usize,
+        tx_at: usize,
+        len_at: usize,
+        payload_at: usize,
+        payload_end: usize,
+    }
+
+    fn v12_fixture(tx: u16, ty: u16, raw: &[u8]) -> V12Fixture {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT12");
+        buf.extend_from_slice(&256u32.to_le_bytes());
+        buf.extend_from_slice(&256u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One layer.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Active layer.
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No group.
+        let count_at = buf.len();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One tile.
+        let tx_at = buf.len();
+        buf.extend_from_slice(&tx.to_le_bytes());
+        buf.extend_from_slice(&ty.to_le_bytes());
+        let len_at = buf.len();
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(raw).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        let payload_at = buf.len();
+        buf.extend_from_slice(&packed);
+        let payload_end = buf.len();
+        buf.extend_from_slice(&[0]); // No mask.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+        buf.extend_from_slice(&[0]); // No text.
+        V12Fixture {
+            buf,
+            count_at,
+            tx_at,
+            len_at,
+            payload_at,
+            payload_end,
+        }
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_sparse_layers_small() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-sparse.procraft");
+        let mut doc = Document::new(8192, 8192);
+        doc.add_layer("second".into());
+        doc.layers[0].pixels.set4(0, [1, 2, 3, 255]);
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "sparse 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        assert_eq!(back.layers[0].pixels.get4(0), [1, 2, 3, 255]);
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 256 * 1024);
+        assert_eq!(back.layers[1].pixels.alloc_bytes(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_masks_and_groups() {
+        let mut doc = Document::new(300, 300);
+        doc.add_mask(0);
+        let last = 299 * 300 + 299;
+        doc.layers[0].mask.as_mut().unwrap().set(last, 0);
+        doc.layers[0].pixels.set4(0, [10, 20, 30, 255]);
+        doc.layers[0].pixels.set4(last * 4, [40, 50, 60, 255]);
+        let g = doc.new_group("G".to_string());
+        doc.set_group_opacity(g, 0.5);
+        doc.layers[0].group = Some(g);
+        doc.add_layer("empty".to_string());
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-tiles.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers.len(), 2);
+        assert_eq!(back.layers[0].pixels.get4(0), [10, 20, 30, 255]);
+        assert_eq!(back.layers[0].pixels.get4(last * 4), [40, 50, 60, 255]);
+        // Two painted corner tiles, not the whole 2x2 grid.
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 2 * 256 * 1024);
+        assert_eq!(back.layers[1].pixels.alloc_bytes(), 0);
+        assert_eq!(back.layers[0].mask.as_ref().unwrap().get(last), 0);
+        assert_eq!(back.layers[0].group, Some(g));
+        assert_eq!(back.group_opacity(0), 0.5);
+        assert_eq!(back.flatten(), doc.flatten());
+    }
+
+    #[test]
+    fn v11_file_resaves_as_v12_with_identical_flatten() {
+        // Hand-build a valid version-11 record (dense pixels, mask, text
+        // tail) so the resave exercises the dense-to-tile split.
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v11-to-v12.pcraft");
+        let resave = dir.join("procraft-v11-to-v12-resaved.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT11");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No group.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[7u8; 4 * 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[1]); // Has a mask.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[200u8; 4 * 2]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+        buf.extend_from_slice(&[1]); // Has text.
+        buf.extend_from_slice(&4.0f32.to_le_bytes());
+        buf.extend_from_slice(&3.0f32.to_le_bytes());
+        buf.extend_from_slice(&12.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0, 0, 0, 255]);
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No outline.
+        buf.extend_from_slice(&[0]); // No font.
+        let t = b"hi";
+        buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        buf.extend_from_slice(t);
+        let head = buf.clone();
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let flat = back.flatten();
+        back.save_project(&resave).unwrap();
+        let raw = std::fs::read(&resave).unwrap();
+        assert_eq!(&raw[..8], b"PCRAFT12");
+        assert_eq!(&head[..8], b"PCRAFT11", "the crafted input stays v11");
+        let again = Document::open_project(&resave).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&resave);
+        assert_eq!(again.flatten(), flat);
+        assert_eq!(again.layers[0].pixels, vec![7u8; 4 * 2 * 4]);
+        assert_eq!(again.layers[0].mask.as_ref().unwrap().get(3), 200);
+        assert!(again.layers[0].is_text());
+        assert_eq!(again.layers[0].text.as_ref().unwrap().text, "hi");
+    }
+
+    #[test]
+    fn v12_tile_table_rejects_corrupt_records() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-corrupt.pcraft");
+        let mut raw = vec![0u8; 256 * 256 * 4];
+        raw[..4].copy_from_slice(&[1, 2, 3, 255]);
+        let base = v12_fixture(0, 0, &raw);
+        let check = |bad: &[u8]| -> String {
+            std::fs::write(&path, bad).unwrap();
+            let err = Document::open_project(&path).unwrap_err();
+            assert!(!err.is_empty(), "empty error message");
+            err
+        };
+        // Absurd tile count.
+        let mut bad = base.buf.clone();
+        bad[base.count_at..base.count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(check(&bad).contains("tile count"));
+        // Tile outside the 1x1 grid.
+        let mut bad = base.buf.clone();
+        bad[base.tx_at..base.tx_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(check(&bad).contains("tile"));
+        // Absurd payload length.
+        let mut bad = base.buf.clone();
+        bad[base.len_at..base.len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        check(&bad);
+        // Corrupt payload bytes (zlib checksum catches them).
+        let mut bad = base.buf.clone();
+        for b in bad[base.payload_at..base.payload_end].iter_mut() {
+            *b ^= 0xFF;
+        }
+        check(&bad);
+        // A payload shorter than the full tile must not be padded silently.
+        let short = v12_fixture(0, 0, &[1, 2, 3, 255]);
+        assert!(check(&short.buf).contains("corrupt tile"));
+        // Truncations at every field boundary fail closed.
+        for n in [
+            base.count_at,
+            base.count_at + 2,
+            base.tx_at,
+            base.tx_at + 2,
+            base.len_at,
+            base.len_at + 2,
+            base.payload_at,
+            base.payload_at + 1,
+            base.payload_end,
+        ] {
+            check(&base.buf[..n]);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -4666,7 +4978,7 @@ mod tests {
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
@@ -5679,7 +5991,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);
