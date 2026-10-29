@@ -22,6 +22,9 @@ pub const MIN_ANIM_HOLD: u32 = 1;
 pub const MAX_ANIM_HOLD: u32 = 8;
 /// Sanity cap on exported frames (layer counts never reach it in practice).
 pub const MAX_GIF_FRAMES: usize = 256;
+/// Import dimension cap. GIF frames are buffered dense before layers are
+/// built, so this is memory-driven rather than the canvas limit.
+pub const MAX_GIF_SIDE: u32 = 4096;
 /// M41 Time-lapse: frames staged per session (ring-evicted past this).
 pub const MAX_LAPSE_FRAMES: usize = 180;
 /// M41 Time-lapse: staged snapshots downscale to this longest side.
@@ -300,8 +303,8 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
     }
     let dec = GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let (w, h) = dec.dimensions();
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
-        return Err("gif has bad dimensions".to_string());
+    if w == 0 || h == 0 || w > MAX_GIF_SIDE || h > MAX_GIF_SIDE {
+        return Err(format!("gif has bad dimensions (max {MAX_GIF_SIDE} each)"));
     }
     // Buffer frames first: the rate comes from the first delay, but every
     // frame keeps its own hold.

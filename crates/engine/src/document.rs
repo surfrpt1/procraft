@@ -2998,9 +2998,12 @@ impl Document {
 
     /// Load an image file flattened onto a fresh layer.
     /// M45 hardening: files over 64MB fail closed on metadata, and
-    /// dimensions are checked from the header before the full decode
-    /// so a phone panorama can't OOM the session (cap matches
-    /// [`MAX_CANVAS_SIDE`] and `rehome_canvas`).
+    /// dimensions are checked from the header before the full decode.
+    /// That bounds the encoded input, not peak memory: at the
+    /// [`MAX_CANVAS_SIDE`] cap a decode can still hold ~268 MB dense
+    /// plus ~256 MB of tiles, so the guard stops absurd files rather
+    /// than promising the session cannot OOM. The cap matches
+    /// `rehome_canvas`.
     pub fn load_background(&mut self, path: &std::path::Path) -> Result<(), String> {
         const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -4468,9 +4471,13 @@ mod tests {
     #[test]
     fn canvas_cap_allows_8k_but_not_more() {
         assert_eq!(MAX_CANVAS_SIDE, 8192);
-        assert!(Document::new(8192, 8192)
-            .rehome_canvas(8192, 8192, 0, 0)
-            .is_ok());
+        // Grow a small document to the cap: a same-size rehome
+        // short-circuits, so growth is the real boundary.
+        let mut doc = Document::new(64, 64);
+        doc.rehome_canvas(8192, 8192, 0, 0).unwrap();
+        assert_eq!((doc.w, doc.h), (8192, 8192));
+        // Area outside the old 64x64 content reads the page background.
+        assert_eq!(doc.sample(8000, 8000), Some([255, 255, 255]));
         let err = Document::new(64, 64)
             .rehome_canvas(8193, 64, 0, 0)
             .unwrap_err();

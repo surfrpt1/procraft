@@ -562,6 +562,61 @@ fn layer_readout(doc: &Document) -> String {
     )
 }
 
+/// Downscale the composite to a `side`-bounding box by sampling
+/// `Document::sample` on a block grid (max 2x2 samples per output pixel).
+/// Unlike `flatten` + `gallery_thumb`, this never materialises the full
+/// canvas (268 MB at 8192²), so it stays cheap on the UI thread while
+/// recording a time-lapse or rebuilding the Gallery. Aspect is preserved;
+/// documents already within `side` keep their dimensions (no upscale).
+/// Returns `(rgba, width, height)`; empty input yields an empty thumbnail.
+fn sampled_thumb(doc: &Document, side: u32) -> (Vec<u8>, usize, usize) {
+    let (w, h) = (doc.w, doc.h);
+    if w == 0 || h == 0 || side == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    let longest = w.max(h);
+    let (tw, th) = if longest <= side {
+        (w, h)
+    } else {
+        let scale = side as f64 / longest as f64;
+        (
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+        )
+    };
+    let mut out = vec![0u8; (tw as usize) * (th as usize) * 4];
+    for ty in 0..th {
+        // Source rows under this output row: probe the first and last one,
+        // so a block averages across its extent instead of one corner.
+        let sy0 = ty * h / th;
+        let sy1 = ((ty + 1) * h / th).saturating_sub(1).max(sy0);
+        for tx in 0..tw {
+            let sx0 = tx * w / tw;
+            let sx1 = ((tx + 1) * w / tw).saturating_sub(1).max(sx0);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for &sy in &[sy0, sy1] {
+                for &sx in &[sx0, sx1] {
+                    if let Some(px) = doc.sample(sx, sy) {
+                        r += px[0] as u32;
+                        g += px[1] as u32;
+                        b += px[2] as u32;
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let d = ((ty * tw + tx) * 4) as usize;
+            out[d] = ((r + n / 2) / n) as u8;
+            out[d + 1] = ((g + n / 2) / n) as u8;
+            out[d + 2] = ((b + n / 2) / n) as u8;
+            out[d + 3] = 255;
+        }
+    }
+    (out, tw as usize, th as usize)
+}
+
 /// M49: what makes two settings snapshots differ in the discrete sense.
 /// Zoom is excluded — it coalesces through `should_flush_zoom` and gets
 /// written by its own quiet-period path.
@@ -6292,15 +6347,14 @@ impl ProCraftApp {
             return;
         }
         self.lapse_last = std::time::Instant::now();
-        let (bytes, tw, th) =
-            gallery_thumb(&self.doc.flatten(), self.doc.w, self.doc.h, LAPSE_SIDE);
+        let (bytes, tw, th) = sampled_thumb(&self.doc, LAPSE_SIDE);
         if bytes.is_empty() {
             return;
         }
         if self.lapse_frames.len() >= MAX_LAPSE_FRAMES {
             self.lapse_frames.remove(0);
         }
-        self.lapse_frames.push((bytes, tw, th));
+        self.lapse_frames.push((bytes, tw as u32, th as u32));
     }
 
     /// Adopt an imported GIF as the document (one layer per frame, active
@@ -6426,13 +6480,11 @@ impl ProCraftApp {
             let tex = Document::open_project(std::path::Path::new(path))
                 .ok()
                 .and_then(|doc| {
-                    let (bytes, tw, th) =
-                        gallery_thumb(&doc.flatten(), doc.w, doc.h, GALLERY_THUMB_SIDE);
+                    let (bytes, tw, th) = sampled_thumb(&doc, GALLERY_THUMB_SIDE);
                     if bytes.is_empty() {
                         return None;
                     }
-                    let img =
-                        ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &bytes);
+                    let img = ColorImage::from_rgba_unmultiplied([tw, th], &bytes);
                     Some(ctx.load_texture(format!("gallery-{idx}"), img, TextureOptions::LINEAR))
                 });
             self.gallery_thumbs.push(tex);
@@ -14771,8 +14823,9 @@ mod tests {
     }
 
     #[test]
-    fn new_canvas_clamps_at_the_engine_cap() {
+    fn engine_cap_matches_the_8k_preset() {
         assert_eq!(MAX_CANVAS_SIDE, 8192);
+        assert_eq!(CANVAS_PRESETS[2], ("8K", MAX_CANVAS_SIDE, MAX_CANVAS_SIDE));
     }
 
     #[test]
@@ -14804,5 +14857,29 @@ mod tests {
             layer_readout(&doc),
             "1 layer(s), active: Layer 1 · 256.0 KB"
         );
+    }
+
+    #[test]
+    fn sampled_thumb_downscales_without_flattening() {
+        // 600x300: a 2:1 canvas downscaled into a 96 px box is 96x48, and
+        // sampling never allocates the full 600x300 composite.
+        let (w, h) = (600u32, 300u32);
+        let mut dense = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let d = ((y * w + x) * 4) as usize;
+                let rgb = if x < w / 2 { [255, 0, 0] } else { [0, 0, 255] };
+                dense[d..d + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+        let mut doc = Document::new(w, h);
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &dense);
+        let (bytes, tw, th) = sampled_thumb(&doc, GALLERY_THUMB_SIDE);
+        assert_eq!((tw, th), (96, 48));
+        assert_eq!(bytes.len(), tw * th * 4);
+        assert_eq!(&bytes[..4], &[255, 0, 0, 255]);
+        let last = (tw - 1) * 4;
+        assert_eq!(&bytes[last..last + 4], &[0, 0, 255, 255]);
+        assert!(bytes.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
     }
 }
