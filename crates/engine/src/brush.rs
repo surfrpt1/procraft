@@ -954,10 +954,18 @@ impl Document {
                     continue;
                 }
                 if brush.eraser {
-                    // Destination-out: scale existing alpha down.
+                    // Destination-out: scale existing alpha down. A pixel the
+                    // erase takes to alpha 0 is canonicalised to [0, 0, 0, 0]
+                    // so invisible pixels carry no colour: all-zero tiles are
+                    // then exactly the invisible ones the v12 writer omits.
+                    // Alpha > 0 keeps its RGB untouched.
                     let keep = 255u16.saturating_sub(a as u16);
                     let alpha = ((layer.pixels.get(o + 3) as u16 * keep) / 255) as u8;
-                    layer.pixels.set(o + 3, alpha);
+                    if alpha == 0 {
+                        layer.pixels.set4(o, [0, 0, 0, 0]);
+                    } else {
+                        layer.pixels.set(o + 3, alpha);
+                    }
                 } else {
                     composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
@@ -1081,9 +1089,15 @@ impl Document {
                     continue;
                 }
                 if brush.eraser {
+                    // Destination-out, canonicalised like the round dab: an
+                    // alpha-0 pixel becomes [0, 0, 0, 0] (see `dab`).
                     let keep = 255u16.saturating_sub(a as u16);
                     let alpha = ((layer.pixels.get(o + 3) as u16 * keep) / 255) as u8;
-                    layer.pixels.set(o + 3, alpha);
+                    if alpha == 0 {
+                        layer.pixels.set4(o, [0, 0, 0, 0]);
+                    } else {
+                        layer.pixels.set(o + 3, alpha);
+                    }
                 } else {
                     composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
@@ -2365,16 +2379,25 @@ impl Document {
             true
         };
         let layer = &mut self.layers[self.active];
-        let mut visited = vec![0u8; (w * h) as usize];
+        // One bit per canvas pixel (`w * h` bits, 8 MiB at 8K): the visited
+        // set is a membership test, not a value, so a byte per pixel was 8x
+        // larger than necessary.
+        let mut visited = vec![0u8; (w as usize * h as usize).div_ceil(8)];
         let mut stack = seeds;
         let mut any = false;
+        // Grow-only on purpose: the growth pass reads `matched`, the common
+        // `grow == 0` path never does, so a whole-canvas fill at 8K must not
+        // accumulate ~0.5 GiB of coordinates nobody reads. With `grow > 0`
+        // this is filled exactly as before, so the empty check still means
+        // "the seed region matched nothing".
         let mut matched: Vec<(u32, u32)> = Vec::new();
         while let Some((cx, cy)) = stack.pop() {
             let idx = (cy * w + cx) as usize;
-            if visited[idx] == 1 {
+            let (byte, bit) = (idx / 8, 1u8 << (idx % 8));
+            if visited[byte] & bit != 0 {
                 continue;
             }
-            visited[idx] = 1;
+            visited[byte] |= bit;
             let content: [u8; 4] = match slot(cx, cy) {
                 Some(o) if o + 3 < layer.pixels.len() => layer.pixels.get4(o),
                 _ => [0, 0, 0, 0],
@@ -2382,7 +2405,9 @@ impl Document {
             if !matches(&content) {
                 continue;
             }
-            matched.push((cx, cy));
+            if grow > 0 {
+                matched.push((cx, cy));
+            }
             // Store only where the buffer exists (see `slot`).
             if let Some(o) = slot(cx, cy) {
                 if o + 3 < layer.pixels.len() {
@@ -3168,15 +3193,9 @@ mod tests {
         );
         e.push(16.0, 16.0);
         drop(e);
-        // Eraser removes alpha (destination-out); color bytes of fully
-        // transparent pixels are intentionally left alone.
-        assert!(doc.layers[0]
-            .pixels
-            .to_dense()
-            .iter()
-            .skip(3)
-            .step_by(4)
-            .all(|&b| b == 0));
+        // Eraser removes alpha (destination-out); pixels it takes to alpha 0
+        // are canonicalised to [0, 0, 0, 0], so nothing invisible survives.
+        assert!(doc.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -3210,13 +3229,14 @@ mod tests {
             ..brush
         };
         doc.dab(&eraser, Color([0, 0, 0, 255]), 150.0, 150.0);
-        // Destination-out clears alpha only; the color bytes of a fully
-        // transparent pixel are deliberately left alone (same contract as
-        // `stroke_paints_and_eraser_clears`), so the seam readback is
-        // [r, g, b, 0] rather than a zeroed pixel.
+        // Destination-out clears alpha, and a pixel it takes to alpha 0 is
+        // canonicalised to [0, 0, 0, 0]: invisible pixels carry no colour, so
+        // the v12 writer's all-zero-tile omission drops exactly the invisible
+        // tiles on reload ("erased costs nothing" holds at any RGB). Partial
+        // erasure keeps its RGB — only alpha 0 is canonical.
         assert_eq!(
             doc.layers[0].pixels.get4(((150 * 300 + 150) * 4) as usize),
-            [10, 20, 30, 0]
+            [0, 0, 0, 0]
         );
         assert!(doc.undo());
         assert_eq!(

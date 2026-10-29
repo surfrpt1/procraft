@@ -2012,7 +2012,7 @@ git commit -m "perf(engine): tilebench and 8K measurements"
 ## Self-review notes
 
 - Spec §1 (tiled storage) → task 1; §2 (undo) → task 2; §3 (target A display) → tasks 6–7; §4 (fallback B) → task 10; §5 (limits + v12) → tasks 8 and 9; §6 (memory guard) → tasks 2 and 8; phases 1–6 map to tasks 1–11 in order.
-- Conversion cost: tasks 2–5 are mechanical sweeps over 542 `.pixels` sites; the two rules (dense bridge for cold paths, `get`/`set` for per-pixel paths) keep them reviewable per file. Brush corpus byte-equality is the hard gate that phase 1 stayed behaviour-neutral.
+- Conversion cost: tasks 2–5 are mechanical sweeps over 542 `.pixels` sites; the two rules (dense bridge for cold paths, `get`/`set` for per-pixel paths) keep them reviewable per file. Phase-1 neutrality rested on the functional suite plus the seam, COW and slide tests, not on the brush corpus: `tests/brush_corpus.rs` is env-gated (`PROCRAFT_BRUSH_CORPUS`) and `#[ignore]`d, and no golden corpus exists.
 - Type names used consistently: `Raster`, `TILE`, `StackPlan`, `CompositeCache`, `ViewRect`, `ViewTex`, `viewport_active`, `tile_image`, `layer_alloc_bytes`, `alloc_bytes`.
 
 ## Measurement log

@@ -30,14 +30,20 @@ pub const CACHE_DESKTOP: usize = 320 * 1024 * 1024;
 
 /// Whether the display takes the viewport-resolution fallback (spec §4)
 /// instead of one canvas-sized texture: forced for captures, native mobile
-/// above 4K, or any GPU whose texture limit is below the 8K canvas cap.
+/// above 4K, any canvas the GPU's texture limit cannot hold, or a legacy
+/// document above the 8K cap (target A was sized for the cap; a 16384²
+/// texture is ~1 GiB even when the GPU nominally allows the size).
 pub fn viewport_active(
     forced: bool,
     native_mobile: bool,
     side: u32,
     max_texture_side: usize,
 ) -> bool {
-    forced || (native_mobile && side > 4096) || max_texture_side < MAX_CANVAS_SIDE as usize
+    forced
+        || (native_mobile && side > 4096)
+        || max_texture_side < MAX_CANVAS_SIDE as usize
+        || side as usize > max_texture_side
+        || side > MAX_CANVAS_SIDE
 }
 
 /// Bytes of one full composite tile, which is what the engine returns.
@@ -856,6 +862,10 @@ mod tests {
         assert!(
             viewport_active(false, false, 1024, 4096),
             "GPU below the 8K ceiling takes the fallback"
+        );
+        assert!(
+            viewport_active(false, false, 16384, 16384),
+            "a legacy oversized canvas never asks for a too-large texture"
         );
     }
 

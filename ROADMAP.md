@@ -168,7 +168,7 @@ Plan: `docs/superpowers/plans/2026-10-27-ui-modernization.md`.
 
 ## P2 — performance + platform (when P0 hurts)
 
-- [x] 8K canvas, 100+ layers with lazy compositing.
+- [x] 8K canvas, 100+ layers with lazy compositing (device verification pending).
   256² copy-on-write tiles with tile-pointer undo, tile uploads behind an
   LRU composite cache, v12 per-tile project format, viewport fallback for
   GPUs that cannot hold an 8K texture.

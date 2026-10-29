@@ -552,6 +552,17 @@ impl UndoEntry {
     }
 }
 
+/// One canvas pixel of the mask viewer image: grayscale of the mask byte at
+/// the layer-offset slot, black outside the layer. Shared by
+/// [`Document::mask_view`] and [`Document::mask_view_region`].
+fn mask_view_px(layer: &Layer, mask: &Raster, x: u32, y: u32, w: u32, h: u32) -> [u8; 4] {
+    let v = match layer.local_offset(x, y, w, h) {
+        Some(o) => mask.get(o / 4),
+        None => 0,
+    };
+    [v, v, v, 255]
+}
+
 impl Document {
     pub fn new(w: u32, h: u32) -> Self {
         Self {
@@ -1971,15 +1982,37 @@ impl Document {
         if m.len() != (self.w * self.h) as usize {
             return None;
         }
-        let dense = m.to_dense();
-        let mut out = Vec::with_capacity(dense.len() * 4);
+        let mut out = Vec::with_capacity((self.w as usize) * (self.h as usize) * 4);
         for y in 0..self.h {
             for x in 0..self.w {
-                let v = match layer.local_offset(x, y, self.w, self.h) {
-                    Some(o) => dense.get(o / 4).copied().unwrap_or(0),
-                    None => 0,
-                };
-                out.extend_from_slice(&[v, v, v, 255]);
+                out.extend_from_slice(&mask_view_px(layer, m, x, y, self.w, self.h));
+            }
+        }
+        Some(out)
+    }
+
+    /// One inclusive canvas rect of [`mask_view`](Self::mask_view) as row-major
+    /// RGBA, `(x1 - x0 + 1) * (y1 - y0 + 1) * 4` bytes, clamped to the canvas:
+    /// what a dirty-rect mask upload needs. Reads the mask through the tile
+    /// accessors rather than densifying it (a dense 8K mask is 64 MB), so a
+    /// dab-sized rect costs a dab-sized read. `None` when there is no (valid)
+    /// mask, the canvas is empty, or the rect is empty.
+    pub fn mask_view_region(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<Vec<u8>> {
+        let layer = self.layers.get(self.active)?;
+        let m = layer.mask.as_ref()?;
+        if m.len() != (self.w * self.h) as usize || self.w == 0 || self.h == 0 {
+            return None;
+        }
+        let (x0, y0) = (x0.min(self.w - 1), y0.min(self.h - 1));
+        let (x1, y1) = (x1.min(self.w - 1), y1.min(self.h - 1));
+        if x0 > x1 || y0 > y1 {
+            return None;
+        }
+        let (rw, rh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+        let mut out = Vec::with_capacity(rw * rh * 4);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.extend_from_slice(&mask_view_px(layer, m, x, y, self.w, self.h));
             }
         }
         Some(out)
@@ -4407,6 +4440,48 @@ mod tests {
     }
 
     #[test]
+    fn v12_roundtrip_omits_fully_erased_colored_tiles() {
+        use crate::brush::{Brush, Color};
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-erased-colored.procraft");
+        let mut doc = Document::new(8192, 8192);
+        // Coloured counterpart of the black case: the eraser canonicalises
+        // alpha-0 pixels to [0, 0, 0, 0], so a fully erased coloured tile is
+        // all-zero and the writer omits it. Without that, reload would
+        // re-allocate 256 KiB for a tile nobody can see.
+        let paint = Brush {
+            size: 16.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&paint, Color::rgb(200, 40, 40), 16.0, 16.0);
+        assert_eq!(doc.layers[0].pixels.allocated_tiles().count(), 1);
+        let eraser = Brush {
+            eraser: true,
+            size: 32.0,
+            ..paint
+        };
+        doc.dab(&eraser, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert!(
+            doc.layers[0]
+                .pixels
+                .allocated_tiles()
+                .all(|(_, _, t)| t.iter().all(|&b| b == 0)),
+            "erased coloured pixels are canonical zero, not [200, 40, 40, 0]"
+        );
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "fully erased 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            back.layers[0].pixels.alloc_bytes(),
+            0,
+            "the erased coloured tile allocates nothing on reload"
+        );
+    }
+
+    #[test]
     fn v12_roundtrip_keeps_masks_and_groups() {
         let mut doc = Document::new(300, 300);
         doc.add_mask(0);
@@ -5468,6 +5543,50 @@ mod tests {
         let view = doc.mask_view().unwrap();
         assert_eq!(&view[0..4], &[0, 0, 0, 255]);
         assert_eq!(&view[4..8], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn mask_view_region_matches_the_sub_rect_of_mask_view() {
+        let mut doc = Document::new(300, 300);
+        doc.add_mask(0);
+        // Partially painted mask: every byte differs, some are zero.
+        let pattern: Vec<u8> = (0..300u32 * 300)
+            .map(|i| ((i * 7 + i / 300) % 256) as u8)
+            .collect();
+        doc.layers[0].mask.as_mut().unwrap().replace_dense(&pattern);
+        // Non-zero offset: the left 251 columns and the bottom 37 rows hold
+        // no layer content, so those region pixels must read concealed.
+        doc.layers[0].ox = 251;
+        doc.layers[0].oy = -37;
+        let full = doc.mask_view().unwrap();
+        for &(x0, y0, x1, y1) in &[
+            (0u32, 0u32, 63u32, 47u32), // fully outside the layer
+            (200, 0, 299, 60),          // straddles the left edge
+            (251, 250, 299, 299),       // straddles the bottom edge
+            (0, 0, 299, 299),           // the whole canvas
+        ] {
+            let region = doc.mask_view_region(x0, y0, x1, y1).unwrap();
+            let rw = (x1 - x0 + 1) as usize;
+            assert_eq!(region.len(), rw * (y1 - y0 + 1) as usize * 4);
+            for y in y0..=y1 {
+                let got = (y - y0) as usize * rw * 4;
+                let want = (y as usize * 300 + x0 as usize) * 4;
+                assert_eq!(
+                    &region[got..got + rw * 4],
+                    &full[want..want + rw * 4],
+                    "row {y} of ({x0}, {y0})-({x1}, {y1})"
+                );
+            }
+        }
+        assert!(
+            doc.mask_view_region(0, 0, 63, 47)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0, 0, 0, 255]),
+            "out-of-layer pixels read concealed"
+        );
     }
 
     #[test]

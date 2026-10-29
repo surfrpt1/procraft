@@ -60,7 +60,9 @@ pub struct Raster {
 
 **Invariant:** a `None` slot and an all-zero tile are equivalent. Tests assert
 `get`/`region` equality between both forms, and that zero tiles are never
-materialised by dense loads.
+materialised by dense loads. The eraser canonicalises every pixel it takes to
+alpha 0 to `[0, 0, 0, 0]` (masks already write 0), so alpha-0 pixels carry no
+colour and an all-zero tile is exactly an invisible tile.
 
 ## 2. Undo
 
@@ -97,6 +99,9 @@ materialised by dense loads.
   recomposited tile. Pan, zoom and rotation never recomposite.
 - Mask view and Animation Assist keep their dedicated upload paths, but both
   read through the same tile accessor so neither special-cases storage.
+- Both still upload the full canvas texture (mask view now rebuilds it once and
+  then patches the dirty rect), so they require a canvas that fits the GPU
+  limit; a larger canvas shows a status message instead of the upload.
 - The canvas texture needs a GPU `max_texture_size` of at least 8192. When the
   device reports less, the app takes the fallback in section 4 instead.
 
@@ -156,7 +161,10 @@ materialised by dense loads.
    trigger above, including the host override.
 6. **Measurement.** `cargo run --release -p procraft-engine --example tilebench`
    reports composite time per tile for 1/10/100 layers at 4K and 8K; on-device
-   numbers recorded in the plan log.
+   numbers recorded in the plan log. Measured caveat: `flatten` at 8K/100 layers
+   takes ~22 s on the 15 W host and that figure is a floor, because the
+   compositor does not skip empty layers — export at that size is a batch
+   operation, not interactive.
 
 Phases 1–4 complete the milestone; 5 is the VRAM escape hatch and 6 gates a
 "done" claim. If the schedule slips, 5 is the piece to cut.

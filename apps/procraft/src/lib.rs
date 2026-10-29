@@ -2017,22 +2017,59 @@ impl ProCraftApp {
         if self.view_tex.texture().is_some() {
             self.view_tex.clear();
         }
-        // Mask viewer: grayscale of the active layer's mask, full upload.
+        // Mask viewer: grayscale of the active layer's mask. Draining the
+        // dirty rect first means a mask dab re-reads and re-uploads only
+        // that rect; the full canvas is built once per texture (open,
+        // resize, view toggle), never per frame.
         if self.view_mask {
-            if let Some(mv) = self.doc.mask_view() {
-                // The canvas texture is not the composite here, so no
-                // composite tile can be trusted when the view returns.
+            let dirty = self.doc.take_dirty();
+            // The texture is canvas-sized, so a GPU that cannot hold one
+            // would reject the upload in the backend: say so instead.
+            if self.doc.w.max(self.doc.h) as usize > ctx.input(|i| i.max_texture_side) {
+                self.status =
+                    "Mask view needs a canvas texture this GPU cannot allocate.".to_string();
+                self.texture = None;
                 self.composite.invalidate();
-                let dirty = self.texture.is_none() || self.doc.take_dirty().is_some();
-                if dirty {
+                return;
+            }
+            // The canvas texture is not the composite here, so no composite
+            // tile can be trusted when the view returns.
+            self.composite.invalidate();
+            if self.texture.is_none() {
+                if let Some(mv) = self.doc.mask_view() {
                     let img = ColorImage::from_rgba_unmultiplied(
                         [self.doc.w as usize, self.doc.h as usize],
                         &mv,
                     );
                     self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                    return;
                 }
-                return;
+            } else {
+                match dirty {
+                    Some((x0, y0, x1, y1)) => match self.doc.mask_view_region(x0, y0, x1, y1) {
+                        Some(bytes) => {
+                            let img = ColorImage::from_rgba_unmultiplied(
+                                [(x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize],
+                                &bytes,
+                            );
+                            if let Some(handle) = &mut self.texture {
+                                handle.set_partial(
+                                    [x0 as usize, y0 as usize],
+                                    img,
+                                    TextureOptions::LINEAR,
+                                );
+                            }
+                            return;
+                        }
+                        // Mask gone: fall through and rebuild from the
+                        // composite instead of leaving a stale texture.
+                        None => self.texture = None,
+                    },
+                    // Nothing changed: the upload is already correct.
+                    None => return,
+                }
             }
+            // No mask to show: fall through to Animation Assist / composite.
         }
         // Animation Assist: the canvas shows the current frame only
         // (active layer over the page), not the full composite.
