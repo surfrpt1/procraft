@@ -283,23 +283,25 @@ fn wet_boost(fa: f32, wet: f32) -> f32 {
 /// backdrop, then alpha composites source-over. Normal reproduces the
 /// classic path bit-for-bit; the eraser keeps destination-out upstream.
 fn composite_dab(
-    pixels: &mut [u8],
+    pixels: &mut crate::raster::Raster,
     o: usize,
     color: [u8; 4],
     src_a: f32,
     mode: super::document::BlendMode,
 ) {
-    let dst_a = pixels[o + 3] as f32 / 255.0;
+    let dst = pixels.get4(o);
+    let dst_a = dst[3] as f32 / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
     if out_a <= 0.0 {
         return;
     }
+    let mut out = dst;
     for ch in 0..3 {
-        let b = mode.apply(color[ch] as f32, pixels[o + ch] as f32);
-        pixels[o + ch] =
-            ((b * src_a + pixels[o + ch] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+        let b = mode.apply(color[ch] as f32, dst[ch] as f32);
+        out[ch] = ((b * src_a + dst[ch] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
     }
-    pixels[o + 3] = (out_a * 255.0).round() as u8;
+    out[3] = (out_a * 255.0).round() as u8;
+    pixels.set4(o, out);
 }
 
 /// Brush shape settings. All original math: a radial falloff stamp laid down
@@ -718,7 +720,7 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
-                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+                layer_mask.set(o, (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8);
             }
         }
     }
@@ -844,7 +846,7 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
-                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+                layer_mask.set(o, (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8);
             }
         }
     }
@@ -948,7 +950,8 @@ impl Document {
                 if brush.eraser {
                     // Destination-out: scale existing alpha down.
                     let keep = 255u16.saturating_sub(a as u16);
-                    layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
+                    let alpha = ((layer.pixels.get(o + 3) as u16 * keep) / 255) as u8;
+                    layer.pixels.set(o + 3, alpha);
                 } else {
                     composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
@@ -1073,7 +1076,8 @@ impl Document {
                 }
                 if brush.eraser {
                     let keep = 255u16.saturating_sub(a as u16);
-                    layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
+                    let alpha = ((layer.pixels.get(o + 3) as u16 * keep) / 255) as u8;
+                    layer.pixels.set(o + 3, alpha);
                 } else {
                     composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
                 }
@@ -1294,9 +1298,7 @@ impl Document {
                     continue;
                 }
                 let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                let Some(pxs) = self.layers[active].pixels.get(o..o + 4) else {
-                    continue;
-                };
+                let pxs = self.layers[active].pixels.get4(o);
                 for c in 0..4 {
                     sum[c] += pxs[c] as f32;
                 }
@@ -1315,10 +1317,8 @@ impl Document {
         let (clx, cly) = (x.round() as i32 - lox, y.round() as i32 - loy);
         let core = if clx >= 0 && cly >= 0 && clx < w as i32 && cly < bh {
             let o = ((cly as u32 * w + clx as u32) * 4) as usize;
-            self.layers[active]
-                .pixels
-                .get(o..o + 4)
-                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32])
+            let p = self.layers[active].pixels.get4(o);
+            Some([p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32])
         } else {
             None
         };
@@ -1381,10 +1381,12 @@ impl Document {
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
-                for (d, f) in layer.pixels[o..o + 4].iter_mut().zip(finger.iter()) {
+                let mut pxs = layer.pixels.get4(o);
+                for (d, f) in pxs.iter_mut().zip(finger.iter()) {
                     let v = *d as f32;
                     *d = (v + (*f - v) * k).round().clamp(0.0, 255.0) as u8;
                 }
+                layer.pixels.set4(o, pxs);
             }
         }
     }
@@ -1980,22 +1982,17 @@ impl Document {
             return;
         }
         let src_a = brush.opacity.clamp(0.0, 1.0) * sel_k;
-        let dst_a = layer.pixels[o + 3] as f32 / 255.0;
+        let mut dst = layer.pixels.get4(o);
+        let dst_a = dst[3] as f32 / 255.0;
         let out_a = src_a + dst_a * (1.0 - src_a);
         if out_a > 0.0 {
             let c = color.0;
-            layer.pixels[o] =
-                ((c[0] as f32 * src_a + layer.pixels[o] as f32 * dst_a * (1.0 - src_a)) / out_a)
+            for ch in 0..3 {
+                dst[ch] = ((c[ch] as f32 * src_a + dst[ch] as f32 * dst_a * (1.0 - src_a)) / out_a)
                     .round() as u8;
-            layer.pixels[o + 1] = ((c[1] as f32 * src_a
-                + layer.pixels[o + 1] as f32 * dst_a * (1.0 - src_a))
-                / out_a)
-                .round() as u8;
-            layer.pixels[o + 2] = ((c[2] as f32 * src_a
-                + layer.pixels[o + 2] as f32 * dst_a * (1.0 - src_a))
-                / out_a)
-                .round() as u8;
-            layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
+            }
+            dst[3] = (out_a * 255.0).round() as u8;
+            layer.pixels.set4(o, dst);
         }
         let w = self.w;
         let h = self.h;
@@ -2296,7 +2293,7 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let snap = self.layers[self.active].pixels.clone();
+        let snap = self.layers[self.active].pixels.to_dense();
         let (lox, loy) = (self.layers[self.active].ox, self.layers[self.active].oy);
         // Canvas cell -> buffer offset, if the layer covers it. Uncovered
         // canvas reads as transparent content (fill can flow through it
@@ -2374,12 +2371,7 @@ impl Document {
             }
             visited[idx] = 1;
             let content: [u8; 4] = match slot(cx, cy) {
-                Some(o) if o + 3 < layer.pixels.len() => [
-                    layer.pixels[o],
-                    layer.pixels[o + 1],
-                    layer.pixels[o + 2],
-                    layer.pixels[o + 3],
-                ],
+                Some(o) if o + 3 < layer.pixels.len() => layer.pixels.get4(o),
                 _ => [0, 0, 0, 0],
             };
             if !matches(&content) {
@@ -2389,7 +2381,9 @@ impl Document {
             // Store only where the buffer exists (see `slot`).
             if let Some(o) = slot(cx, cy) {
                 if o + 3 < layer.pixels.len() {
-                    layer.pixels[o..o + 4].copy_from_slice(&blend_over(content, color, opacity));
+                    layer
+                        .pixels
+                        .set4(o, blend_over(content, color, opacity));
                     any = true;
                 }
             }
@@ -2462,14 +2456,13 @@ impl Document {
                     let mut is_open = selected(nx, ny);
                     if is_open && !region {
                         if let Some(o) = slot(nx, ny) {
-                            if o + 3 < layer.pixels.len()
-                                && layer.pixels[o + 3] >= 128
-                                && layer.pixels[o]
-                                    .max(layer.pixels[o + 1])
-                                    .max(layer.pixels[o + 2])
-                                    < barrier
-                            {
-                                is_open = false;
+                            if o + 3 < layer.pixels.len() {
+                                let px = layer.pixels.get4(o);
+                                if px[3] >= 128
+                                    && px[0].max(px[1]).max(px[2]) < barrier
+                                {
+                                    is_open = false;
+                                }
                             }
                         }
                     }
@@ -2532,14 +2525,10 @@ impl Document {
                     let (nx, ny) = (bx0 + bx as u32, by0 + by as u32);
                     if let Some(o) = slot(nx, ny) {
                         if o + 3 < layer.pixels.len() {
-                            let content = [
-                                layer.pixels[o],
-                                layer.pixels[o + 1],
-                                layer.pixels[o + 2],
-                                layer.pixels[o + 3],
-                            ];
-                            layer.pixels[o..o + 4]
-                                .copy_from_slice(&blend_over(content, color, opacity));
+                            let content = layer.pixels.get4(o);
+                            layer
+                                .pixels
+                                .set4(o, blend_over(content, color, opacity));
                             any = true;
                         }
                     }
@@ -2631,10 +2620,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 0, 5), [0, 0, 255, 255]);
@@ -2656,10 +2645,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 11 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 1, 5), [0, 255, 0, 255]);
@@ -2681,9 +2670,9 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
             ]
         };
         let brush = Brush {
@@ -2744,10 +2733,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         let brush = Brush {
@@ -2786,10 +2775,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         let brush = Brush {
@@ -2821,10 +2810,10 @@ mod tests {
         let at = |x: u32, y: u32| {
             let o = ((y * 21 + x) * 4) as usize;
             [
-                doc.layers[0].pixels[o],
-                doc.layers[0].pixels[o + 1],
-                doc.layers[0].pixels[o + 2],
-                doc.layers[0].pixels[o + 3],
+                doc.layers[0].pixels.get(o),
+                doc.layers[0].pixels.get(o + 1),
+                doc.layers[0].pixels.get(o + 2),
+                doc.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(9, 10), [0, 0, 255, 255]);
@@ -2848,10 +2837,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 3, 5), [0, 0, 255, 255]);
@@ -2875,10 +2864,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 11 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 4, 5), [0, 0, 255, 255]);
@@ -2910,9 +2899,9 @@ mod tests {
                         continue;
                     };
                     let o = ((y * 64 + x) * 4) as usize;
-                    doc.layers[0].pixels[o] = v;
-                    doc.layers[0].pixels[o + 1] = v;
-                    doc.layers[0].pixels[o + 2] = v;
+                    doc.layers[0].pixels.set(o, v);
+                    doc.layers[0].pixels.set(o + 1, v);
+                    doc.layers[0].pixels.set(o + 2, v);
                 }
             }
         };
@@ -2925,22 +2914,19 @@ mod tests {
         // core: it never paints through line art.
         let pale_halo = |d: &Document| {
             d.layers[0]
-                .pixels
-                .chunks(4)
+                .pixels.to_dense().chunks(4)
                 .filter(|p| (153..=222).contains(&p[0]))
                 .count()
         };
         let dark_ramp = |d: &Document| {
             d.layers[0]
-                .pixels
-                .chunks(4)
+                .pixels.to_dense().chunks(4)
                 .filter(|p| (1..=152).contains(&p[0]))
                 .count()
         };
         let black_core = |d: &Document| {
             d.layers[0]
-                .pixels
-                .chunks(4)
+                .pixels.to_dense().chunks(4)
                 .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
                 .count()
         };
@@ -2973,10 +2959,10 @@ mod tests {
                 let o = ((y * 3 + x) * 4) as usize;
                 assert_eq!(
                     [
-                        doc.layers[0].pixels[o],
-                        doc.layers[0].pixels[o + 1],
-                        doc.layers[0].pixels[o + 2],
-                        doc.layers[0].pixels[o + 3],
+                        doc.layers[0].pixels.get(o),
+                        doc.layers[0].pixels.get(o + 1),
+                        doc.layers[0].pixels.get(o + 2),
+                        doc.layers[0].pixels.get(o + 3),
                     ],
                     [0, 0, 255, 255]
                 );
@@ -3003,7 +2989,7 @@ mod tests {
         let mut peak = 0u8;
         for y in 3..=5 {
             for x in 9..=11 {
-                peak = peak.max(doc.layers[0].pixels[((y * 20 + x) * 4) as usize + 3]);
+                peak = peak.max(doc.layers[0].pixels.get(((y * 20 + x) * 4) as usize + 3));
             }
         }
         assert!(peak > 0 && peak < 255, "{peak}");
@@ -3021,7 +3007,7 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 10.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4) as usize + 3];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4) as usize + 3);
         assert!(at(&doc, 2, 10) > 0);
         assert_eq!(at(&doc, 18, 10), 0);
         // Horizontal: mirrored left-right.
@@ -3048,17 +3034,17 @@ mod tests {
             ..Default::default()
         };
         doc.shape_rect(&brush, Color::rgb(255, 0, 0), 4.0, 4.0, 20.0, 20.0);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut doc2 = Document::new(32, 32);
         doc2.shape_ellipse(&brush, Color::rgb(0, 255, 0), 4.0, 4.0, 28.0, 28.0);
-        assert!(doc2.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc2.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut doc3 = Document::new(32, 32);
         doc3.fill_rect(&brush, Color::rgb(0, 0, 255), 2, 2, 6, 6);
         let o = ((4 * 32 + 4) * 4) as usize;
-        assert_eq!(doc3.layers[0].pixels[o + 3], 255);
+        assert_eq!(doc3.layers[0].pixels.get(o + 3), 255);
         let mut doc4 = Document::new(32, 32);
         doc4.fill_ellipse(&brush, Color::rgb(1, 2, 3), 2.0, 2.0, 10.0, 10.0);
-        assert!(doc4.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc4.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -3073,16 +3059,16 @@ mod tests {
             let mut doc = Document::new(48, 48);
             doc.shape_poly(&brush, Color::rgb(255, 0, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
             assert!(
-                doc.layers[0].pixels.iter().any(|&b| b != 0),
+                doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0),
                 "{kind:?} outline"
             );
             // Fill covers the middle but not the far corner.
             let mut doc = Document::new(48, 48);
             doc.fill_poly(&brush, Color::rgb(0, 255, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
             let mid = ((24 * 48 + 24) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels[mid + 3], 255, "{kind:?} fill middle");
+            assert_eq!(doc.layers[0].pixels.get(mid + 3), 255, "{kind:?} fill middle");
             let corner = ((2 * 48 + 2) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels[corner + 3], 0, "{kind:?} fill corner");
+            assert_eq!(doc.layers[0].pixels.get(corner + 3), 0, "{kind:?} fill corner");
         }
         // Polygon sides clamp: 2 behaves like a triangle, 99 like 12.
         let mut doc = Document::new(48, 48);
@@ -3097,14 +3083,14 @@ mod tests {
             2,
         );
         let mid = ((30 * 48 + 24) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[mid + 3], 255);
+        assert_eq!(doc.layers[0].pixels.get(mid + 3), 255);
         // Arrow paints along its drag direction.
         let mut doc = Document::new(48, 48);
         doc.shape_arrow(&brush, Color::rgb(0, 0, 255), 4.0, 24.0, 44.0, 24.0);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let tip = ((24 * 48 + 43) * 4) as usize;
         assert!(
-            doc.layers[0].pixels[tip + 3] > 0,
+            doc.layers[0].pixels.get(tip + 3) > 0,
             "arrowhead lands at the tip"
         );
     }
@@ -3155,7 +3141,7 @@ mod tests {
         let mut s = Stroke::begin(&mut doc, brush, Color::rgb(255, 0, 0));
         s.push(16.0, 16.0);
         drop(s);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut e = Stroke::begin(
             &mut doc,
             Brush {
@@ -3171,8 +3157,7 @@ mod tests {
         // Eraser removes alpha (destination-out); color bytes of fully
         // transparent pixels are intentionally left alone.
         assert!(doc.layers[0]
-            .pixels
-            .iter()
+            .pixels.to_dense().iter()
             .skip(3)
             .step_by(4)
             .all(|&b| b == 0));
@@ -3323,7 +3308,7 @@ mod tests {
             dyn0,
             0.0,
         );
-        let alpha = doc.layers[0].pixels[((6 * doc.w + 6) * 4 + 3) as usize];
+        let alpha = doc.layers[0].pixels.get(((6 * doc.w + 6) * 4 + 3) as usize);
         assert!(alpha > 0, "taper size 0 should keep the tip full width");
     }
 
@@ -3365,7 +3350,7 @@ mod tests {
             DabDynamics::default(),
             0.0,
         );
-        let alpha = |x: u32| doc.layers[0].pixels[((6 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| doc.layers[0].pixels.get(((6 * doc.w + x) * 4 + 3) as usize);
         assert_eq!(alpha(3), 0);
         assert!(alpha(30) > 200, "full-taper alpha {}", alpha(30));
         assert!(alpha(20) > 0 && alpha(20) < alpha(30));
@@ -3381,7 +3366,7 @@ mod tests {
         };
         let mut doc = Document::new(8, 8);
         doc.dab(&brush, Color::rgb(255, 0, 0), 4.5, 4.5);
-        let alpha = doc.layers[0].pixels[((4 * doc.w + 4) * 4 + 3) as usize];
+        let alpha = doc.layers[0].pixels.get(((4 * doc.w + 4) * 4 + 3) as usize);
         assert!(alpha > 0 && alpha < 128, "subpixel alpha {alpha}");
     }
 
@@ -3431,7 +3416,7 @@ mod tests {
         );
         let width = |x: u32| {
             (0..doc.h)
-                .filter(|&y| doc.layers[0].pixels[((y * doc.w + x) * 4 + 3) as usize] > 0)
+                .filter(|&y| doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize) > 0)
                 .count()
         };
         assert!(width(30) < width(60), "{} vs {}", width(30), width(60));
@@ -3472,7 +3457,7 @@ mod tests {
             tail,
             0.0,
         );
-        let alpha = |x: u32| doc.layers[0].pixels[((100 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| doc.layers[0].pixels.get(((100 * doc.w + x) * 4 + 3) as usize);
         let gap = (20..=220).find(|&x| alpha(x) == 0);
         assert_eq!(gap, None, "first tapered-tail gap at x={gap:?}");
     }
@@ -3499,7 +3484,7 @@ mod tests {
             dyn_,
             0.0,
         );
-        let alpha = doc.layers[0].pixels[((16 * doc.w + 28) * 4 + 3) as usize];
+        let alpha = doc.layers[0].pixels.get(((16 * doc.w + 28) * 4 + 3) as usize);
         assert!(alpha > 0, "short segment endpoint alpha {alpha}");
     }
 
@@ -3576,8 +3561,7 @@ mod tests {
 
     fn alpha_sum(doc: &Document) -> u64 {
         doc.layers[0]
-            .pixels
-            .iter()
+            .pixels.to_dense().iter()
             .skip(3)
             .step_by(4)
             .map(|&b| b as u64)
@@ -3590,7 +3574,7 @@ mod tests {
         let mut any = false;
         for y in 0..h {
             for x in 0..w {
-                if doc.layers[0].pixels[((y * w + x) * 4 + 3) as usize] > 0 {
+                if doc.layers[0].pixels.get(((y * w + x) * 4 + 3) as usize) > 0 {
                     any = true;
                     x0 = x0.min(x);
                     y0 = y0.min(y);
@@ -3851,7 +3835,7 @@ mod tests {
         let alpha = |brush: &Brush| {
             let mut doc = Document::new(48, 48);
             doc.dab(brush, Color::rgb(255, 0, 0), 24.0, 24.0);
-            doc.layers[0].pixels[(24 * 48 + 24) * 4 + 3]
+            doc.layers[0].pixels.get((24 * 48 + 24) * 4 + 3)
         };
         assert!(alpha(&multiple) > alpha(&single));
     }
@@ -4193,13 +4177,13 @@ mod tests {
     fn smudge_drags_color_down_the_stroke() {
         let mut doc = Document::new(16, 4);
         // Solid red dot at (2, 1).
-        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
-        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        doc.layers[0].pixels.set(pxo(16, 2, 1), 255);
+        doc.layers[0].pixels.set(pxo(16, 2, 1) + 3, 255);
         let brush = smudge_brush();
         let (last, left) = doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
         assert!(last == Some((2.0, 1.0)) && left == 0.0);
         let (_, _) = doc.smudge_to(&brush, 1.0, 1.0, last, (12.0, 1.0), left);
-        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        let at = |x: u32| doc.layers[0].pixels.get(pxo(16, x, 1));
         // Red travelled right; the source faded as the finger left it.
         assert!(at(8) > 40, "mid-stroke red = {}", at(8));
         assert!(at(2) < 255, "source faded = {}", at(2));
@@ -4208,7 +4192,7 @@ mod tests {
     #[test]
     fn smudge_zero_strength_is_a_noop() {
         let mut doc = Document::new(8, 8);
-        doc.layers[0].pixels[pxo(8, 4, 4)] = 200;
+        doc.layers[0].pixels.set(pxo(8, 4, 4), 200);
         let before = doc.layers[0].pixels.clone();
         let brush = smudge_brush();
         doc.smudge_to(&brush, 0.0, 1.0, None, (4.0, 4.0), 0.0);
@@ -4219,15 +4203,15 @@ mod tests {
     #[test]
     fn smudge_finger_resets_each_stroke() {
         let mut doc = Document::new(16, 4);
-        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
-        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        doc.layers[0].pixels.set(pxo(16, 2, 1), 255);
+        doc.layers[0].pixels.set(pxo(16, 2, 1) + 3, 255);
         let brush = smudge_brush();
         // First stroke picks up red at (2,1).
         doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
         // Second stroke starts on empty black: a shared finger would
         // drag red in from the first stroke.
         doc.smudge_to(&brush, 1.0, 1.0, None, (12.0, 1.0), 0.0);
-        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        let at = |x: u32| doc.layers[0].pixels.get(pxo(16, x, 1));
         assert_eq!(at(12), 0);
     }
 
@@ -4236,8 +4220,8 @@ mod tests {
         let mut doc = Document::new(16, 4);
         // Left half solid red, right half transparent.
         for x in 0..8u32 {
-            doc.layers[0].pixels[pxo(16, x, 1)] = 255;
-            doc.layers[0].pixels[pxo(16, x, 1) + 3] = 255;
+            doc.layers[0].pixels.set(pxo(16, x, 1), 255);
+            doc.layers[0].pixels.set(pxo(16, x, 1) + 3, 255);
         }
         // Only the left half is selected; smudge across the whole row.
         doc.selection = Some((0, 1, 7, 1));
@@ -4247,7 +4231,7 @@ mod tests {
         // Unselected half stays transparent (no red dragged across).
         for x in 8..16u32 {
             let o = pxo(16, x, 1);
-            assert_eq!(doc.layers[0].pixels[o + 3], 0, "x={x}");
+            assert_eq!(doc.layers[0].pixels.get(o + 3), 0, "x={x}");
         }
     }
 
@@ -4274,10 +4258,10 @@ mod tests {
             doc.dab(&brush, Color::rgb(255, 0, 0), 3.5, 3.5);
             let o = ((3 * 8 + 3) * 4) as usize;
             [
-                doc.layers[0].pixels[o],
-                doc.layers[0].pixels[o + 1],
-                doc.layers[0].pixels[o + 2],
-                doc.layers[0].pixels[o + 3],
+                doc.layers[0].pixels.get(o),
+                doc.layers[0].pixels.get(o + 1),
+                doc.layers[0].pixels.get(o + 2),
+                doc.layers[0].pixels.get(o + 3),
             ]
         };
         // Normal covers; Difference(|red - green|) lands on yellow.
@@ -4299,8 +4283,7 @@ mod tests {
             };
             doc.dab(&brush, Color::rgb(255, 255, 255), 11.5, 11.5);
             doc.layers[0]
-                .pixels
-                .iter()
+                .pixels.to_dense().iter()
                 .skip(3)
                 .step_by(4)
                 .map(|&a| a as u32)
@@ -4326,7 +4309,7 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 255, 255), 7.5, 7.5);
-        let on = doc.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        let on = doc.layers[0].pixels.to_dense().iter().filter(|&&b| b != 0).count();
         let mut plain = Document::new(16, 16);
         plain.dab(
             &Brush {
@@ -4339,7 +4322,7 @@ mod tests {
             7.5,
             7.5,
         );
-        let full = plain.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        let full = plain.layers[0].pixels.to_dense().iter().filter(|&&b| b != 0).count();
         assert!(full > 0 && on < full, "full={full} dual={on}");
     }
 

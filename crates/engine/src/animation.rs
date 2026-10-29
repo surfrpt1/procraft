@@ -174,17 +174,18 @@ fn frame_pixel(doc: &Document, src: Option<(&Layer, f32)>, x: u32, y: u32) -> [u
         return out;
     }
     let o = ((ly as u32 * doc.w + lx as u32) * 4) as usize;
-    if o + 3 >= layer.pixels.len() {
+    if o + 4 > layer.pixels.len() {
         return out;
     }
-    let mut a = layer.pixels[o + 3] as f32 / 255.0 * op;
-    if let Some(m) = layer.mask.as_deref() {
-        a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
+    let px = layer.pixels.get4(o);
+    let mut a = px[3] as f32 / 255.0 * op;
+    if let Some(m) = layer.mask.as_ref() {
+        a *= m.get(o / 4) as f32 / 255.0;
     }
     if a <= 0.0 {
         return out;
     }
-    for (dst, src) in out[..3].iter_mut().zip(&layer.pixels[o..o + 3]) {
+    for (dst, src) in out[..3].iter_mut().zip(&px[..3]) {
         *dst = (*src as f32 * a + *dst as f32 * (1.0 - a)).round() as u8;
     }
     out[3] = 255;
@@ -258,20 +259,21 @@ pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
                 continue;
             }
             let o = ((ly as u32 * doc.w + lx as u32) * 4) as usize;
-            if o + 3 >= layer.pixels.len() {
+            if o + 4 > layer.pixels.len() {
                 continue;
             }
-            let mut a = layer.pixels[o + 3] as f32 / 255.0 * op * strength;
-            if let Some(m) = layer.mask.as_deref() {
-                a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
+            let px = layer.pixels.get4(o);
+            let mut a = px[3] as f32 / 255.0 * op * strength;
+            if let Some(m) = layer.mask.as_ref() {
+                a *= m.get(o / 4) as f32 / 255.0;
             }
             if a <= 0.0 {
                 continue;
             }
             let d = ((y * doc.w + x) * 4) as usize;
-            out[d] = layer.pixels[o];
-            out[d + 1] = layer.pixels[o + 1];
-            out[d + 2] = layer.pixels[o + 2];
+            out[d] = px[0];
+            out[d + 1] = px[1];
+            out[d + 2] = px[2];
             out[d + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
@@ -335,7 +337,7 @@ pub fn import_gif_document(bytes: &[u8]) -> Result<(Document, u32), String> {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
-            pixels: img.into_raw(),
+            pixels: crate::Raster::from_dense(w, h, 4, &img.into_raw()),
             mask: None,
             clip: false,
             ox: 0,
@@ -726,9 +728,9 @@ mod tests {
         // First pixels survive the round trip (GIF palette-quantized).
         let at = |d: &Document, i: usize| {
             [
-                d.layers[i].pixels[0],
-                d.layers[i].pixels[1],
-                d.layers[i].pixels[2],
+                d.layers[i].pixels.get(0),
+                d.layers[i].pixels.get(1),
+                d.layers[i].pixels.get(2),
             ]
         };
         assert_eq!(at(&back, 0), [255, 0, 0]);

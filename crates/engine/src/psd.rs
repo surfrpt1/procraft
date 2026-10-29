@@ -360,7 +360,7 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
         if layer.pixels.len() != n * 4 {
             return Err("layer has wrong pixel size".to_string());
         }
-        if let Some(m) = layer.mask.as_deref() {
+        if let Some(m) = layer.mask.as_ref() {
             if m.len() != n {
                 return Err("layer mask has wrong size".to_string());
             }
@@ -464,7 +464,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
-            pixels: rgba,
+            pixels: crate::Raster::from_dense(w, h, 4, &rgba),
             mask: None,
             clip: false,
             ox: 0,
@@ -495,7 +495,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 visible: !pl.visible(),
                 opacity: pl.opacity() as f32 / 255.0,
                 blend: key_blend(&format!("{:?}", pl.blend_mode())),
-                pixels: rgba,
+                pixels: crate::Raster::from_dense(w, h, 4, &rgba),
                 mask: None,
                 clip: !pl.is_clipping_mask(),
                 ox: 0,
@@ -580,7 +580,7 @@ mod tests {
         doc.layers[1].clip = true;
         doc.layers[1].pixels = vec![7; 5 * 3 * 4];
         doc.add_mask(1);
-        doc.layers[1].mask.as_mut().unwrap()[0] = 0;
+        doc.layers[1].mask.as_mut().unwrap().set(0, 0);
         doc
     }
 
@@ -654,26 +654,26 @@ mod tests {
         // A layer moved +2 exports its content at canvas 2 (cropped bake),
         // so Photoshop opens what ProCraft shows.
         let mut doc = Document::new(5, 1);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.layers[0].ox = 2;
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-offset.psd");
         save_psd(&path, &doc).unwrap();
         let back = open_psd(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(&back.layers[0].pixels[0..4], &[0, 0, 0, 0]);
-        assert_eq!(&back.layers[0].pixels[8..12], &[255, 0, 0, 255]);
+        assert_eq!(back.layers[0].pixels.get4(0), [0, 0, 0, 0]);
+        assert_eq!(back.layers[0].pixels.get4(8), [255, 0, 0, 255]);
     }
 
     #[test]
     fn psd_groups_roundtrip_nested() {
         let mut doc = Document::new(4, 2);
         doc.layers[0].name = "base".to_string();
-        doc.layers[0].pixels = [255, 0, 0, 255].repeat(8);
+        doc.layers[0].pixels = px_rgba(&doc, &([255, 0, 0, 255].repeat(8)));
         doc.add_layer("mid".to_string());
-        doc.layers[1].pixels = [0, 255, 0, 255].repeat(8);
+        doc.layers[1].pixels = px_rgba(&doc, &([0, 255, 0, 255].repeat(8)));
         doc.add_layer("top".to_string());
-        doc.layers[2].pixels = [0, 0, 255, 255].repeat(8);
+        doc.layers[2].pixels = px_rgba(&doc, &([0, 0, 255, 255].repeat(8)));
         let inner = doc.new_group("Inner".to_string());
         doc.set_group_opacity(inner, 0.5);
         doc.move_layer_into_group(0, Some(inner)); // base
