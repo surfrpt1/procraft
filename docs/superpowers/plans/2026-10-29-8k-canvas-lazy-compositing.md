@@ -2038,3 +2038,34 @@ runs agreed within ~1.6 % on the tile figures and within ~3 % on the 8K/100L
 - Android tablet: **pending a device run** — canvas-texture feel with per-tile
   `set_partial` (target A) vs forced `PROCRAFT_FORCE_VIEWPORT_CANVAS=1`, plus
   that document's `layer_alloc_bytes()`; controller/project owner close this.
+
+- Controller GUI smoke (2026-10-29, release build, forced
+  `PROCRAFT_FORCE_SHELL=mobile PROCRAFT_FORCE_VIEWPORT_CANVAS=1`, 1433×768
+  window, target B active for the 8K documents):
+  - Painting/zoom/pan: 8K document, strokes land where the brush is dragged at
+    62 % (the zoom restored from storage); at 121 % the canvas stays sharp and
+    unfilled edges stay clean; a Hand drag pans the view without a blank frame
+    (the viewport re-samples the newly visible tiles); Fit returns to the 9 %
+    whole-page view.
+  - Mask: add mask → paint on Mask → View renders the white mask (255). The
+    grey tint visible in panel screenshots is the mobile drawer's
+    black-alpha-110 scrim over the canvas, not the mask texture.
+  - 8K save/reopen/export: `dist/smoke-8k.pcraft` 127,607 B (strokes),
+    `dist/smoke-8k-masked.pcraft` 134,909 B (strokes + mask),
+    `dist/smoke-8k.png` 1,343,911 B (8192×8192 RGBA). Painted 8K layer readout:
+    "66.5 MB cache 12.5 MB".
+  - 100-layer acceptance (8K): "Add layer" until the panel read
+    "105 layer(s), active: Layer 105 · 130.5 MB cache 12.5 MB"; two strokes
+    each on Layers 105/104/103 raised it to 132.2 / 133.5 / 134.8 MB while the
+    cache stayed 12.5 MB — the 102 blank 8K layers allocate 0 B. Saved
+    `dist/smoke-8k-100-painted.pcraft` (279,970 B; `smoke-8k-100.pcraft`,
+    233,742 B, is the same 105 layers before painting). Reopen restores
+    105 layers, active Layer 103 and 134.8 MB; PNG export
+    `dist/smoke-8k-100.png` 1,389,844 B (8192×8192).
+  - Caveat, not yet a verdict: with 105 layers the Layers drawer's settings
+    card (opacity, mask, paint target, readout) is clipped below the panel and
+    neither wheel events nor a drag scrolled it; wheel over the canvas did not
+    zoom either, so the harness cannot separate an input-injection gap from a
+    drawer-scroll bug. The paint target was reset by relaunching (fresh
+    documents default to Color). Manual wheel/trackpad check rides with the
+    device run.
