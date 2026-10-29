@@ -413,6 +413,9 @@ fn plan_update(
     if !key_matches {
         return ViewUpdate::Full;
     }
+    // Dropping the pending dirt here is safe only because the engine sets
+    // `dirty` and bumps `revision` together: no dirty rect is ever marked
+    // without a revision change.
     if rev_matches {
         return ViewUpdate::None;
     }
