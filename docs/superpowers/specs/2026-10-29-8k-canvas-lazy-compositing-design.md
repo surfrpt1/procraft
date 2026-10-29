@@ -87,7 +87,8 @@ materialised by dense loads.
 - Building a composite tile precomputes the stack plan once (visible layers,
   effective group opacity, clip flags), then blends rows — no per-pixel
   `is_layer_shown` or `group_opacity` calls.
-- `Document` gains `composite_tile(&self, plan: &StackPlan, tx, ty) -> Tile` so
+- `Document` gains `composite_tile(&self, plan: &StackPlan, tx, ty) -> Vec<u8>`
+  (always `TILE * TILE * 4` bytes, zero outside the canvas) so
   blending stays in the engine; the app owns the cache, the GPU texture and the
   dirty-tile bookkeeping.
 - `Document::take_dirty` keeps returning the rect the app already consumes; the
