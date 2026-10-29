@@ -5,12 +5,17 @@
 //! an untouched 8K layer costs one `Vec` of `Option` pointers, and undo
 //! and duplicate share every untouched tile through `Arc`.
 
+use std::fmt;
 use std::sync::Arc;
 
 /// Tile side in pixels. 256² RGBA is 256 KiB; 256² masks are 64 KiB.
 pub const TILE: u32 = 256;
 
-#[derive(Clone, Debug, Default)]
+/// Largest canvas side the project-file reader accepts. `new` trips a
+/// `debug_assert` past it so misuse fails legibly in debug builds.
+const MAX_SIDE: u32 = 16384;
+
+#[derive(Clone)]
 pub struct Raster {
     w: u32,
     h: u32,
@@ -22,6 +27,10 @@ pub struct Raster {
 
 impl Raster {
     pub fn new(w: u32, h: u32, bpp: u8) -> Self {
+        debug_assert!(
+            w <= MAX_SIDE && h <= MAX_SIDE,
+            "canvas {w}x{h} exceeds the {MAX_SIDE}px side cap"
+        );
         let tiles_x = w.div_ceil(TILE);
         let tiles_y = h.div_ceil(TILE);
         Self {
@@ -88,7 +97,19 @@ impl Raster {
 
     /// Mutable tile access; materialises the tile on first write and
     /// copies it when it is still shared with a snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tx >= tiles_x` or `ty >= tiles_y`. Out-of-range indices
+    /// are rejected rather than wrapped: `tx == tiles_x` would otherwise
+    /// alias the first tile of the next row.
     pub fn tile_mut(&mut self, tx: u32, ty: u32) -> &mut [u8] {
+        assert!(
+            tx < self.tiles_x && ty < self.tiles_y,
+            "tile ({tx},{ty}) outside {}x{}",
+            self.tiles_x,
+            self.tiles_y
+        );
         let len = self.tile_len();
         let idx = (ty * self.tiles_x + tx) as usize;
         let arc = self.tiles[idx].get_or_insert_with(|| Arc::new(vec![0u8; len]));
@@ -130,15 +151,25 @@ impl Raster {
         self.tiles[slot].as_deref().map_or(0, |t| t[off])
     }
 
+    /// Write one dense byte. A zero written into a `None` slot is a no-op
+    /// and allocates nothing; a zero written into an allocated tile still
+    /// goes through `Arc::make_mut`, so a shared snapshot keeps its byte.
     pub fn set(&mut self, i: usize, v: u8) {
         let Some((slot, off)) = self.locate(i) else {
             return;
         };
-        let len = self.tile_len();
-        let arc = self.tiles[slot].get_or_insert_with(|| Arc::new(vec![0u8; len]));
-        Arc::make_mut(arc)[off] = v;
+        if let Some(arc) = self.tiles[slot].as_mut() {
+            Arc::make_mut(arc)[off] = v;
+        } else if v != 0 {
+            let mut tile = vec![0u8; self.tile_len()];
+            tile[off] = v;
+            self.tiles[slot] = Some(Arc::new(tile));
+        }
     }
 
+    /// Read four consecutive dense *bytes* at byte offset `i` (the engine's
+    /// existing convention), not four pixels. On a `bpp == 1` mask this
+    /// spans four pixels.
     pub fn get4(&self, i: usize) -> [u8; 4] {
         [
             self.get(i),
@@ -148,6 +179,9 @@ impl Raster {
         ]
     }
 
+    /// Write four consecutive dense *bytes* at byte offset `i`. Like `get4`
+    /// this always spans 4 bytes, so on a `bpp == 1` mask it touches four
+    /// pixels; a byte outside the canvas is dropped.
     pub fn set4(&mut self, i: usize, px: [u8; 4]) {
         for (k, v) in px.into_iter().enumerate() {
             self.set(i + k, v);
@@ -227,10 +261,22 @@ impl Raster {
         }
     }
 
-    /// Cheap content fingerprint for preview-guard comparisons: samples
-    /// every allocated tile, never materialises dense bytes.
+    /// Cheap content fingerprint for preview-guard comparisons: never
+    /// materialises dense bytes.
+    ///
+    /// Sampling: one byte per 4096 bytes of *each allocated tile*. An
+    /// already-allocated tile whose edited byte falls between two samples
+    /// is not noticed, so equal fingerprints do not prove equal content.
+    /// This is a preview guard, never a correctness oracle.
+    ///
+    /// `w`, `h` and `bpp` are mixed into the seed, so equal-length rasters
+    /// of different geometry cannot collide.
     pub fn fingerprint(&self) -> u64 {
         let mut h = 0xcbf29ce484222325u64 ^ (self.len() as u64);
+        for v in [self.w as u64, self.h as u64, self.bpp as u64] {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        }
         for (i, t) in self.tiles.iter().enumerate() {
             let Some(t) = t else {
                 continue;
@@ -252,6 +298,31 @@ impl Raster {
             (None, None) => true,
             _ => false,
         }
+    }
+}
+
+/// A zero-size RGBA canvas, i.e. the same value as `Raster::rgba(0, 0)`.
+/// The derived `Default` left `bpp == 0`, a geometry no constructor makes
+/// (`new` clamps `0` up to `1`); picking `4` keeps the default RGBA-shaped.
+impl Default for Raster {
+    fn default() -> Self {
+        Self::new(0, 0, 4)
+    }
+}
+
+/// Geometry and allocation only, never the bytes: an 8K raster in an
+/// `assert_eq!` failure message must not print hundreds of megabytes.
+impl fmt::Debug for Raster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let allocated = self.tiles.iter().filter(|t| t.is_some()).count();
+        f.debug_struct("Raster")
+            .field("w", &self.w)
+            .field("h", &self.h)
+            .field("bpp", &self.bpp)
+            .field("tiles_x", &self.tiles_x)
+            .field("tiles_y", &self.tiles_y)
+            .field("allocated_tiles", &allocated)
+            .finish()
     }
 }
 
@@ -367,5 +438,105 @@ mod tests {
         assert_eq!(a.fingerprint(), before);
         a.set4(((590 * 600 + 590) * 4) as usize, [1, 2, 3, 255]);
         assert_ne!(a.fingerprint(), before);
+    }
+
+    #[test]
+    fn fingerprint_mixes_geometry_into_its_seed() {
+        let wide = Raster::rgba(600, 1); // 2400 dense bytes
+        let tall = Raster::rgba(300, 2); // 2400 dense bytes, other geometry
+        let deep = Raster::new(300, 1, 8); // 2400 dense bytes, other bpp
+        assert_eq!(wide.len(), tall.len());
+        assert_eq!(wide.len(), deep.len());
+        assert_ne!(
+            wide.fingerprint(),
+            tall.fingerprint(),
+            "w/h are mixed into the seed"
+        );
+        assert_ne!(
+            wide.fingerprint(),
+            deep.fingerprint(),
+            "bpp is mixed into the seed"
+        );
+    }
+
+    #[test]
+    fn truncated_dense_leaves_the_tail_zero_and_unallocated() {
+        let bytes = vec![1u8; 300 * 4 * 2]; // two of five rows
+        let r = Raster::from_dense(300, 5, 4, &bytes);
+        assert_eq!(r.get(0), 1);
+        assert_eq!(r.get((299 * 4) as usize), 1);
+        assert_eq!(r.get((300 * 4) as usize), 1);
+        assert_eq!(r.get((2 * 300 * 4 - 1) as usize), 1);
+        assert_eq!(r.get((2 * 300 * 4) as usize), 0, "the tail reads as zero");
+        assert_eq!(r.get((5 * 300 * 4 - 1) as usize), 0);
+        let mut expected = vec![0u8; 300 * 5 * 4];
+        expected[..bytes.len()].copy_from_slice(&bytes);
+        assert_eq!(r.to_dense(), expected);
+        assert_eq!(
+            r.allocated_tiles()
+                .map(|(tx, ty, _)| (tx, ty))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0)],
+            "rows 0-1 span both tile columns of the single tile row"
+        );
+        assert_eq!(r.allocated_tiles().count(), 2);
+    }
+
+    #[test]
+    fn zero_writes_do_not_materialise_tiles() {
+        let mut r = Raster::rgba(600, 600);
+        r.set(0, 0);
+        r.set4(0, [0, 0, 0, 0]);
+        r.set(((300 * 600 + 300) * 4) as usize, 0);
+        assert_eq!(
+            r.allocated_tiles().count(),
+            0,
+            "zero into a None slot allocates nothing"
+        );
+        assert_eq!(r.alloc_bytes(), 0);
+
+        r.set(0, 9);
+        let mut copy = r.clone();
+        copy.set(0, 0);
+        assert_eq!(r.get(0), 9, "CoW: the snapshot keeps the old byte");
+        assert_eq!(copy.get(0), 0);
+        assert_eq!(
+            copy.allocated_tiles().count(),
+            1,
+            "a zero write keeps the allocated tile"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tile (3,0) outside 3x3")]
+    fn tile_mut_rejects_a_column_past_the_grid() {
+        let mut r = Raster::rgba(600, 600); // 3x3 tiles
+        r.tile_mut(3, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "tile (0,3) outside 3x3")]
+    fn tile_mut_rejects_a_row_past_the_grid() {
+        let mut r = Raster::rgba(600, 600); // 3x3 tiles
+        r.tile_mut(0, 3);
+    }
+
+    #[test]
+    fn debug_prints_geometry_not_bytes() {
+        let mut r = Raster::rgba(300, 200);
+        r.set(0, 7);
+        assert_eq!(
+            format!("{r:?}"),
+            "Raster { w: 300, h: 200, bpp: 4, tiles_x: 2, tiles_y: 1, allocated_tiles: 1 }"
+        );
+    }
+
+    #[test]
+    fn default_is_a_zero_size_rgba_canvas() {
+        let d = Raster::default();
+        assert_eq!(d.bpp(), 4, "not the derived bpp == 0");
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.tiles_x(), 0);
+        assert_eq!(d, Raster::rgba(0, 0), "default is the RGBA canvas");
     }
 }
