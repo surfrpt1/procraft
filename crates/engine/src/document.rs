@@ -2,16 +2,29 @@
 
 use crate::raster::{Raster, TILE};
 
-/// Write one raster as a v12 tile table: `u32 count`, then per allocated
+/// Write one raster as a v12 tile table: `u32 count`, then per listed
 /// tile `u16 tx, u16 ty, u32 len, len bytes` of zlib-compressed raw tile
-/// bytes. Empty (unallocated) tiles are omitted, so a sparse 8K layer
-/// saves only the tiles that hold content.
+/// bytes. Unallocated tiles are omitted, and so are allocated-but-all-zero
+/// tiles: an eraser flow zeroes an allocated tile without freeing the slot,
+/// so it is visually empty and would otherwise cost its payload on save
+/// plus a fresh 256 KiB (64 KiB for masks) on load. A sparse 8K layer
+/// therefore saves only tiles that actually hold content.
+///
+/// The count precedes the records, so it is reserved as a placeholder and
+/// patched afterwards: that keeps the write a single streaming pass over
+/// every tile (the deflate already touches the bytes) instead of buffering
+/// a whole layer's compressed payloads in memory.
 fn write_tile_table(f: &mut std::fs::File, raster: &Raster) -> Result<(), String> {
-    use std::io::Write;
-    let count = raster.allocated_tiles().count() as u32;
-    f.write_all(&count.to_le_bytes())
+    use std::io::{Seek, SeekFrom, Write};
+    let count_at = f.stream_position().map_err(|e| e.to_string())?;
+    f.write_all(&0u32.to_le_bytes())
         .map_err(|e| e.to_string())?;
+    let mut count = 0u32;
     for (tx, ty, tile) in raster.allocated_tiles() {
+        // One scan decides both omission and whether to deflate.
+        if !tile.iter().any(|&b| b != 0) {
+            continue;
+        }
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(tile).map_err(|e| e.to_string())?;
         let packed = enc.finish().map_err(|e| e.to_string())?;
@@ -22,7 +35,14 @@ fn write_tile_table(f: &mut std::fs::File, raster: &Raster) -> Result<(), String
         f.write_all(&(packed.len() as u32).to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&packed).map_err(|e| e.to_string())?;
+        count += 1;
     }
+    let end = f.stream_position().map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(count_at))
+        .map_err(|e| e.to_string())?;
+    f.write_all(&count.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(end)).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -4342,6 +4362,48 @@ mod tests {
         assert_eq!(back.layers[0].pixels.alloc_bytes(), 256 * 1024);
         assert_eq!(back.layers[1].pixels.alloc_bytes(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v12_roundtrip_omits_fully_erased_tiles() {
+        use crate::brush::{Brush, Color};
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-erased.procraft");
+        let mut doc = Document::new(8192, 8192);
+        // Paint black, then erase it: the eraser only zeroes alpha, so the
+        // tile stays allocated (allocated-but-empty), which is the case the
+        // writer must drop.
+        let paint = Brush {
+            size: 16.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&paint, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert_eq!(doc.layers[0].pixels.allocated_tiles().count(), 1);
+        let eraser = Brush {
+            eraser: true,
+            size: 32.0,
+            ..paint
+        };
+        doc.dab(&eraser, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert_eq!(
+            doc.layers[0].pixels.allocated_tiles().count(),
+            1,
+            "the erased tile stays allocated"
+        );
+        assert!(
+            doc.layers[0]
+                .pixels
+                .allocated_tiles()
+                .all(|(_, _, t)| t.iter().all(|&b| b == 0)),
+            "the erased tile is all zero"
+        );
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "fully erased 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 0);
     }
 
     #[test]
