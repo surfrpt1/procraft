@@ -46,6 +46,14 @@ pub fn viewport_active(
         || side > MAX_CANVAS_SIDE
 }
 
+/// Whether a canvas-sized texture can be allocated at all: within the GPU's
+/// texture limit and within the app's own 8K cap. Unlike
+/// [`viewport_active`], a GPU that cannot hold the 8K cap is not
+/// disqualifying here — a 1K canvas fits a 4K-limit GPU fine.
+pub fn canvas_texture_fits(side: u32, max_texture_side: usize) -> bool {
+    side as usize <= max_texture_side && side <= MAX_CANVAS_SIDE
+}
+
 /// A mask view with nothing to show must not suppress the fallback when the
 /// document needs it; with Animation Assist on the viewport is not taken, so
 /// leaving the user's View alone is correct.
@@ -878,6 +886,24 @@ mod tests {
         assert!(
             viewport_active(false, false, 16384, 16384),
             "a legacy oversized canvas never asks for a too-large texture"
+        );
+    }
+
+    #[test]
+    fn canvas_texture_fit_ignores_a_cap_the_canvas_does_not_reach() {
+        assert!(
+            canvas_texture_fits(1024, 4096),
+            "a small canvas fits a 4K GPU"
+        );
+        assert!(canvas_texture_fits(4096, 4096));
+        assert!(
+            !canvas_texture_fits(8192, 4096),
+            "the canvas itself is too big"
+        );
+        assert!(canvas_texture_fits(8192, 8192));
+        assert!(
+            !canvas_texture_fits(16384, 16384),
+            "legacy document above the app's own cap"
         );
     }
 

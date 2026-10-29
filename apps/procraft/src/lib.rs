@@ -2083,9 +2083,7 @@ impl ProCraftApp {
                 // — or a document above the 8K cap this GPU-backed path was
                 // sized for — would reject the upload in the backend: say so
                 // instead.
-                if canvas::viewport_active(
-                    false,
-                    false,
+                if !canvas::canvas_texture_fits(
                     self.doc.w.max(self.doc.h),
                     ctx.input(|i| i.max_texture_side),
                 ) {
@@ -2157,9 +2155,7 @@ impl ProCraftApp {
             // one — or a document above the 8K cap — would reject the upload
             // in the backend (a legacy 16384² document asks for ~1 GiB), so
             // say so instead of building it.
-            if canvas::viewport_active(
-                false,
-                false,
+            if !canvas::canvas_texture_fits(
                 self.doc.w.max(self.doc.h),
                 ctx.input(|i| i.max_texture_side),
             ) {
