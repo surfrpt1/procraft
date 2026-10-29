@@ -667,6 +667,42 @@ fn take_shortcut_action(shortcuts: &Shortcuts, ctx: &egui::Context) -> Option<Ac
     })
 }
 
+/// Toolbar order, shared by the tools panel list and its mobile grid.
+const TOOL_ORDER: [Tool; 13] = [
+    Tool::Brush,
+    Tool::Eraser,
+    Tool::Smudge,
+    Tool::Select,
+    Tool::Lasso,
+    Tool::Fill,
+    Tool::Picker,
+    Tool::Move,
+    Tool::Hand,
+    Tool::Liquify,
+    Tool::Crop,
+    Tool::Shapes,
+    Tool::Text,
+];
+
+/// M49: shortcut id for an app tool (mirror of `tool_from_id`).
+fn tool_id_for(tool: Tool) -> ToolId {
+    match tool {
+        Tool::Brush => ToolId::Brush,
+        Tool::Eraser => ToolId::Eraser,
+        Tool::Smudge => ToolId::Smudge,
+        Tool::Select => ToolId::Select,
+        Tool::Lasso => ToolId::Lasso,
+        Tool::Fill => ToolId::Fill,
+        Tool::Picker => ToolId::Picker,
+        Tool::Move => ToolId::Move,
+        Tool::Hand => ToolId::Hand,
+        Tool::Liquify => ToolId::Liquify,
+        Tool::Crop => ToolId::Crop,
+        Tool::Shapes => ToolId::Shapes,
+        Tool::Text => ToolId::Text,
+    }
+}
+
 /// M49: the app's Tool enum for a shortcut ToolId (toolbar order).
 fn tool_from_id(id: ToolId) -> Tool {
     match id {
@@ -1661,14 +1697,15 @@ impl ProCraftApp {
     /// arms capture for that row.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
-        let fit = self.mobile_modal_fit(ctx);
+        let sheet = self.mobile_modal_frame(ctx);
+        let scrim = self.mobile_scrim(ctx, "mobile-scrim-shortcuts");
         fitted_modal(
             egui::Window::new("Shortcuts")
                 .open(&mut open)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .resizable(false)
                 .collapsible(false),
-            fit,
+            sheet.as_ref(),
         )
         .show(ctx, |ui| {
             for note in [&self.save_note, &self.settings_note].into_iter().flatten() {
@@ -1686,7 +1723,9 @@ impl ProCraftApp {
             }
             ui.label("Click a binding, then press the keys you want.");
             // Touch screens clamp the list to the fitted dialog height.
-            let list_h = fit.map_or(420.0, |f| (f.y - 200.0).clamp(160.0, 420.0));
+            let list_h = sheet
+                .as_ref()
+                .map_or(420.0, |s| (s.fit.y - 200.0).clamp(160.0, 420.0));
             egui::ScrollArea::vertical()
                 .max_height(list_h)
                 .show(ui, |ui| {
@@ -1764,7 +1803,7 @@ impl ProCraftApp {
                 self.status = "Shortcuts reset to defaults.".to_string();
             }
         });
-        self.show_shortcuts = open;
+        self.show_shortcuts = open && !scrim;
     }
 
     fn base_brush(&self) -> Brush {
@@ -2410,7 +2449,7 @@ impl ProCraftApp {
     }
 
     /// Tools panel body shared by the desktop dock and the mobile drawer.
-    fn tools_panel_body(&mut self, ui: &mut egui::Ui) {
+    fn tools_panel_body(&mut self, ui: &mut egui::Ui, compact: bool) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let t = self.tokens(ui);
             let mut close_tools = false;
@@ -2426,32 +2465,47 @@ impl ProCraftApp {
                 },
                 |ui| {
                 let was_fill = self.tool == Tool::Fill;
-                ui.radio_value(&mut self.tool, Tool::Brush, tool_label(Tool::Brush, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Brush));
-                ui.radio_value(&mut self.tool, Tool::Eraser, tool_label(Tool::Eraser, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Eraser));
-                ui.radio_value(&mut self.tool, Tool::Smudge, tool_label(Tool::Smudge, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Smudge));
-                ui.radio_value(&mut self.tool, Tool::Select, tool_label(Tool::Select, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Select));
-                ui.radio_value(&mut self.tool, Tool::Lasso, tool_label(Tool::Lasso, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Lasso));
-                ui.radio_value(&mut self.tool, Tool::Fill, tool_label(Tool::Fill, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Fill));
-                ui.radio_value(&mut self.tool, Tool::Picker, tool_label(Tool::Picker, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Picker));
-                ui.radio_value(&mut self.tool, Tool::Move, tool_label(Tool::Move, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Move));
-                ui.radio_value(&mut self.tool, Tool::Hand, tool_label(Tool::Hand, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Hand));
-                ui.radio_value(&mut self.tool, Tool::Liquify, tool_label(Tool::Liquify, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Liquify));
-                ui.radio_value(&mut self.tool, Tool::Crop, tool_label(Tool::Crop, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Crop));
-                ui.radio_value(&mut self.tool, Tool::Shapes, tool_label(Tool::Shapes, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Shapes));
-                ui.radio_value(&mut self.tool, Tool::Text, tool_label(Tool::Text, self.has_symbols))
-                    .on_hover_text(self.tool_hint(ToolId::Text));
+                // A one-column list on the dock; the mobile drawer packs two
+                // columns, or three when it is shot (landscape) so every tool
+                // fits without scrolling through a half-empty sheet.
+                let cols = tool_grid_columns(ui.available_width(), compact, mobile_shell());
+                let entries: Vec<(Tool, &'static str, String)> = TOOL_ORDER
+                    .iter()
+                    .map(|&tool| {
+                        (
+                            tool,
+                            tool_label(tool, self.has_symbols),
+                            self.tool_hint(tool_id_for(tool)),
+                        )
+                    })
+                    .collect();
+                if cols > 1 {
+                    let gap = ui.spacing().item_spacing.x;
+                    let cell_w =
+                        ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32)
+                            .max(96.0);
+                    let row_h = t.control_h;
+                    for row in entries.chunks(cols) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for (tool, label, hint) in row {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(cell_w, row_h),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.radio_value(&mut self.tool, *tool, *label)
+                                            .on_hover_text(hint);
+                                    },
+                                );
+                            }
+                        });
+                    }
+                } else {
+                    for (tool, label, hint) in entries {
+                        ui.radio_value(&mut self.tool, tool, label)
+                            .on_hover_text(hint);
+                    }
+                }
                 if was_fill && self.tool != Tool::Fill {
                     self.fill_preview = None;
                 }
@@ -4547,214 +4601,232 @@ impl ProCraftApp {
     }
 
     /// File menu items shared by the top bar and the mobile cluster.
-    fn file_menu_ui(&mut self, ui: &mut egui::Ui, layout: BarLayout, bar_t: &design::Tokens) {
+    fn file_menu_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: BarLayout,
+        bar_t: &design::Tokens,
+        max_h: Option<f32>,
+    ) {
         if layout == BarLayout::Tablet {
             ui.spacing_mut().interact_size.y = bar_t.control_h;
         }
-        if ui.button("Save PNG").clicked() {
-            ui.close();
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("PNG", &["png"])
-                .save_file()
-            {
-                // The dialog may return an extensionless path (always
-                // on iOS); the encoder needs the suffix to pick PNG.
-                let path = ensure_extension(path, "png");
-                match self.doc.save_png(&path) {
-                    Ok(()) => {
-                        self.status = format!("Saved {}", path.display());
-                        #[cfg(target_os = "ios")]
-                        rfd::ios_share_file(&path);
-                        #[cfg(target_os = "android")]
-                        rfd::android_scan_file(&path);
+        // A landscape phone cannot show Save/Open/PSD in one popup: cap it
+        // above the bar and scroll instead of clipping the last rows.
+        egui::ScrollArea::vertical()
+            .id_salt("file-menu-scroll")
+            .max_height(max_h.unwrap_or(f32::INFINITY))
+            .show(ui, |ui| {
+                if ui.button("Save PNG").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG", &["png"])
+                        .save_file()
+                    {
+                        // The dialog may return an extensionless path (always
+                        // on iOS); the encoder needs the suffix to pick PNG.
+                        let path = ensure_extension(path, "png");
+                        match self.doc.save_png(&path) {
+                            Ok(()) => {
+                                self.status = format!("Saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
+                            }
+                            Err(e) => self.status = format!("Save failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
-            }
-        }
-        stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
-        if ui.button("Save JPEG").clicked() {
-            ui.close();
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("JPEG", &["jpg", "jpeg"])
-                .save_file()
-            {
-                let path = ensure_extension(path, "jpg");
-                match self.doc.save_jpeg(&path, self.jpeg_quality) {
-                    Ok(()) => {
-                        self.status =
-                            format!("Saved {} (quality {})", path.display(), self.jpeg_quality);
-                        #[cfg(target_os = "ios")]
-                        rfd::ios_share_file(&path);
-                        #[cfg(target_os = "android")]
-                        rfd::android_scan_file(&path);
+                stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
+                if ui.button("Save JPEG").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JPEG", &["jpg", "jpeg"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "jpg");
+                        match self.doc.save_jpeg(&path, self.jpeg_quality) {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "Saved {} (quality {})",
+                                    path.display(),
+                                    self.jpeg_quality
+                                );
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
+                            }
+                            Err(e) => self.status = format!("Save failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
-            }
-        }
-        if ui.button("Save TIFF").clicked() {
-            ui.close();
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("TIFF", &["tif", "tiff"])
-                .save_file()
-            {
-                let path = ensure_extension(path, "tiff");
-                match self.doc.save_tiff(&path) {
-                    Ok(()) => {
-                        self.status = format!("Saved {}", path.display());
-                        #[cfg(target_os = "ios")]
-                        rfd::ios_share_file(&path);
-                        #[cfg(target_os = "android")]
-                        rfd::android_scan_file(&path);
+                if ui.button("Save TIFF").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("TIFF", &["tif", "tiff"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "tiff");
+                        match self.doc.save_tiff(&path) {
+                            Ok(()) => {
+                                self.status = format!("Saved {}", path.display());
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
+                            }
+                            Err(e) => self.status = format!("Save failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("Save failed: {e}"),
                 }
-            }
-        }
-        if ui.button("Open image").clicked() {
-            ui.close();
-            #[cfg(not(target_os = "ios"))]
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter(
-                    "Images",
-                    &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
-                )
-                .pick_file()
-            {
-                match self.doc.load_background(&path) {
-                    Ok(()) => {
-                        self.texture = None;
-                        self.lasso_points.clear();
-                        self.lasso_poly.clear();
-                        self.status = format!("Opened {}", path.display());
+                if ui.button("Open image").clicked() {
+                    ui.close();
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(
+                            "Images",
+                            &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                        )
+                        .pick_file()
+                    {
+                        match self.doc.load_background(&path) {
+                            Ok(()) => {
+                                self.texture = None;
+                                self.lasso_points.clear();
+                                self.lasso_poly.clear();
+                                self.status = format!("Opened {}", path.display());
+                            }
+                            Err(e) => self.status = format!("Open failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("Open failed: {e}"),
-                }
-            }
-            // iOS: presents the picker; open_picked() loads on resolve.
-            #[cfg(target_os = "ios")]
-            {
-                let _ = rfd::FileDialog::new()
-                    .add_filter(
-                        "Images",
-                        &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
-                    )
-                    .pick_file();
-                self.pending_open = Some(PendingOpen::Image);
-                self.status = "Pick an image…".to_string();
-            }
-            #[cfg(target_os = "android")]
-            {
-                self.android_browse = Some(PendingOpen::Image);
-            }
-        }
-        ui.separator();
-        if ui.button("Save project").clicked() {
-            ui.close();
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("ProCraft project", &["procraft"])
-                .save_file()
-            {
-                let path = ensure_extension(path, "procraft");
-                match self.doc.save_project(&path) {
-                    Ok(()) => {
-                        let s = path.to_string_lossy().to_string();
-                        push_recent(&mut self.recent, &s);
-                        self.gallery_keys.clear();
-                        self.status = format!("Project saved {}", path.display());
-                        self.clear_recovery();
-                        #[cfg(target_os = "ios")]
-                        rfd::ios_share_file(&path);
-                        #[cfg(target_os = "android")]
-                        rfd::android_scan_file(&path);
+                    // iOS: presents the picker; open_picked() loads on resolve.
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                            )
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Image);
+                        self.status = "Pick an image…".to_string();
                     }
-                    Err(e) => self.status = format!("Project save failed: {e}"),
-                }
-            }
-        }
-        if ui.button("Open project").clicked() {
-            ui.close();
-            #[cfg(not(target_os = "ios"))]
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("ProCraft project", &["procraft"])
-                .pick_file()
-            {
-                match Document::open_project(&path) {
-                    Ok(doc) => {
-                        let s = path.to_string_lossy().to_string();
-                        self.adopt_project(doc, &s, "Project opened");
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Image);
                     }
-                    Err(e) => self.status = format!("Project open failed: {e}"),
                 }
-            }
-            #[cfg(target_os = "ios")]
-            {
-                let _ = rfd::FileDialog::new()
-                    .add_filter("ProCraft project", &["procraft"])
-                    .pick_file();
-                self.pending_open = Some(PendingOpen::Project);
-                self.status = "Pick a project…".to_string();
-            }
-            #[cfg(target_os = "android")]
-            {
-                self.android_browse = Some(PendingOpen::Project);
-            }
-        }
-        ui.separator();
-        if ui.button("PSD export").clicked() {
-            ui.close();
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Photoshop document", &["psd"])
-                .save_file()
-            {
-                let path = ensure_extension(path, "psd");
-                match save_psd(&path, &self.doc) {
-                    Ok(()) => {
-                        self.status =
-                            format!("PSD saved {} (masks do not round-trip)", path.display());
-                        #[cfg(target_os = "ios")]
-                        rfd::ios_share_file(&path);
-                        #[cfg(target_os = "android")]
-                        rfd::android_scan_file(&path);
+                ui.separator();
+                if ui.button("Save project").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft project", &["procraft"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "procraft");
+                        match self.doc.save_project(&path) {
+                            Ok(()) => {
+                                let s = path.to_string_lossy().to_string();
+                                push_recent(&mut self.recent, &s);
+                                self.gallery_keys.clear();
+                                self.status = format!("Project saved {}", path.display());
+                                self.clear_recovery();
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
+                            }
+                            Err(e) => self.status = format!("Project save failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("PSD save failed: {e}"),
                 }
-            }
-        }
-        if ui.button("Open PSD").clicked() {
-            ui.close();
-            #[cfg(not(target_os = "ios"))]
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Photoshop document", &["psd"])
-                .pick_file()
-            {
-                match open_psd(&path) {
-                    Ok(doc) => {
-                        self.doc = doc;
-                        self.clear_recovery();
-                        self.texture = None;
-                        self.lasso_points.clear();
-                        self.lasso_poly.clear();
-                        self.status =
-                            format!("PSD opened {} (masks do not import)", path.display());
+                if ui.button("Open project").clicked() {
+                    ui.close();
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ProCraft project", &["procraft"])
+                        .pick_file()
+                    {
+                        match Document::open_project(&path) {
+                            Ok(doc) => {
+                                let s = path.to_string_lossy().to_string();
+                                self.adopt_project(doc, &s, "Project opened");
+                            }
+                            Err(e) => self.status = format!("Project open failed: {e}"),
+                        }
                     }
-                    Err(e) => self.status = format!("PSD open failed: {e}"),
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("ProCraft project", &["procraft"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Project);
+                        self.status = "Pick a project…".to_string();
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Project);
+                    }
                 }
-            }
-            #[cfg(target_os = "ios")]
-            {
-                let _ = rfd::FileDialog::new()
-                    .add_filter("Photoshop document", &["psd"])
-                    .pick_file();
-                self.pending_open = Some(PendingOpen::Psd);
-                self.status = "Pick a PSD…".to_string();
-            }
-            #[cfg(target_os = "android")]
-            {
-                self.android_browse = Some(PendingOpen::Psd);
-            }
-        }
+                ui.separator();
+                if ui.button("PSD export").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Photoshop document", &["psd"])
+                        .save_file()
+                    {
+                        let path = ensure_extension(path, "psd");
+                        match save_psd(&path, &self.doc) {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "PSD saved {} (masks do not round-trip)",
+                                    path.display()
+                                );
+                                #[cfg(target_os = "ios")]
+                                rfd::ios_share_file(&path);
+                                #[cfg(target_os = "android")]
+                                rfd::android_scan_file(&path);
+                            }
+                            Err(e) => self.status = format!("PSD save failed: {e}"),
+                        }
+                    }
+                }
+                if ui.button("Open PSD").clicked() {
+                    ui.close();
+                    #[cfg(not(target_os = "ios"))]
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Photoshop document", &["psd"])
+                        .pick_file()
+                    {
+                        match open_psd(&path) {
+                            Ok(doc) => {
+                                self.doc = doc;
+                                self.clear_recovery();
+                                self.texture = None;
+                                self.lasso_points.clear();
+                                self.lasso_poly.clear();
+                                self.status =
+                                    format!("PSD opened {} (masks do not import)", path.display());
+                            }
+                            Err(e) => self.status = format!("PSD open failed: {e}"),
+                        }
+                    }
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = rfd::FileDialog::new()
+                            .add_filter("Photoshop document", &["psd"])
+                            .pick_file();
+                        self.pending_open = Some(PendingOpen::Psd);
+                        self.status = "Pick a PSD…".to_string();
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        self.android_browse = Some(PendingOpen::Psd);
+                    }
+                }
+            });
     }
 
     /// Top safe inset for the mobile shell: the status bar/notch strip the
@@ -4784,16 +4856,61 @@ impl ProCraftApp {
         }
     }
 
-    /// Fitted dialog size on the mobile shell; `None` on desktop.
-    fn mobile_modal_fit(&mut self, ctx: &egui::Context) -> Option<egui::Vec2> {
-        let mobile = mobile_shell();
-        let safe_top = if mobile { self.status_inset_top() } else { 0.0 };
-        modal_fit(
-            ctx.viewport_rect().size(),
+    /// Fitted dialog presentation on the mobile shell; `None` on desktop.
+    fn mobile_modal_frame(&mut self, ctx: &egui::Context) -> Option<MobileModal> {
+        if !mobile_shell() {
+            return None;
+        }
+        let vp = ctx.viewport_rect();
+        let safe_top = self.status_inset_top();
+        let safe_bottom = safe_bottom(true);
+        let class = effective_layout(
+            vp.width(),
+            cfg!(any(target_os = "ios", target_os = "android")),
+        );
+        let t = design::tokens(self.theme, class);
+        let fit = modal_fit(vp.size(), safe_top, safe_bottom, true)?;
+        let anchor = mobile_modal_anchor(
+            vp,
             safe_top,
-            safe_bottom(mobile),
-            mobile,
-        )
+            safe_bottom,
+            class,
+            mobile_island_height(t.control_h),
+            t.gap,
+            !quick_controls(self.tool).is_empty(),
+        );
+        let frame = egui::Frame::NONE
+            .fill(t.surface_1)
+            .stroke(egui::Stroke::new(1.0, t.stroke))
+            .corner_radius(egui::CornerRadius::same(t.radius_card))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(90),
+            })
+            .inner_margin(egui::Margin::same(12));
+        Some(MobileModal { fit, anchor, frame })
+    }
+
+    /// Dim layer under a mobile sheet. Tapping it dismisses; it swallows
+    /// canvas taps while a sheet is up. No-op on the desktop shell.
+    fn mobile_scrim(&mut self, ctx: &egui::Context, id: &str) -> bool {
+        if !mobile_shell() {
+            return false;
+        }
+        let vp = ctx.viewport_rect();
+        let mut clicked = false;
+        egui::Area::new(egui::Id::new(id))
+            .order(egui::Order::Middle)
+            .fixed_pos(vp.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(110));
+                clicked = resp.clicked();
+            });
+        clicked
     }
 
     /// Mobile chrome: floating clusters over a full-screen canvas, with the
@@ -4948,6 +5065,17 @@ impl ProCraftApp {
         }
 
         if !phone {
+            // The File popup hangs off a top island, so it must stop before
+            // the options capsule (or the bottom inset when there is none).
+            let menu_floor = vp.bottom()
+                - safe_bottom
+                - pad
+                - if capsule_visible {
+                    island_h + t.gap
+                } else {
+                    0.0
+                };
+            let menu_room = menu_popup_room(safe_top + pad + island_h + t.gap, menu_floor);
             egui::Area::new(egui::Id::new("mobile-top-left"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::LEFT_TOP, [pad, safe_top + pad])
@@ -4966,7 +5094,7 @@ impl ProCraftApp {
                                 )
                                 .ui(ui, |ui| {
                                     ui.spacing_mut().interact_size.y = t.control_h;
-                                    self.file_menu_ui(ui, class, &t);
+                                    self.file_menu_ui(ui, class, &t, Some(menu_room));
                                 });
                             if self.pill(ui, "Reference") {
                                 self.ref_open = !self.ref_open;
@@ -5044,6 +5172,10 @@ impl ProCraftApp {
                 strip_mini_width(vp.width(), pad)
             };
             let left = strip_left_now(self.strip_dock, self.strip_offset, vp.width(), pad, strip_w);
+            // A File popup opened from the strip gets the room between the
+            // safe top and the strip, so it never slides under the bar.
+            let strip_floor = vp.bottom() - safe_bottom - pad - strip_h - t.gap;
+            let menu_room = menu_popup_room(safe_top + pad, strip_floor);
             egui::Area::new(egui::Id::new("mobile-strip"))
                 .order(egui::Order::Foreground)
                 .anchor(
@@ -5162,7 +5294,12 @@ impl ProCraftApp {
                                                 )
                                                 .ui(ui, |ui| {
                                                     ui.spacing_mut().interact_size.y = t.control_h;
-                                                    self.file_menu_ui(ui, class, &t);
+                                                    self.file_menu_ui(
+                                                        ui,
+                                                        class,
+                                                        &t,
+                                                        Some(menu_room),
+                                                    );
                                                 });
                                             if self.pill(ui, "Reference") {
                                                 self.ref_open = !self.ref_open;
@@ -5261,7 +5398,7 @@ impl ProCraftApp {
                     island_h,
                     gap: t.gap,
                 };
-                phone_drawer_span(vp.bottom(), room, capsule_visible)
+                phone_drawer_span(vp.bottom(), room)
             } else {
                 mobile_drawer_span(
                     vp.bottom(),
@@ -5307,7 +5444,7 @@ impl ProCraftApp {
                         drawer_frame().show(ui, |ui| {
                             ui.set_width(w - 2.0 * 6.0);
                             if tools {
-                                self.tools_panel_body(ui);
+                                self.tools_panel_body(ui, h < 400.0);
                             } else {
                                 self.layers_panel_body(ui);
                             }
@@ -6876,6 +7013,19 @@ fn phone_drawer_width(viewport_w: f32) -> f32 {
 /// Paint tools that stay one tap away in the phone strip.
 const PHONE_STRIP_TOOLS: [Tool; 3] = [Tool::Brush, Tool::Eraser, Tool::Smudge];
 
+/// Columns for the tools panel: the mobile drawer packs two, and three when
+/// the drawer is shot (landscape) so every tool fits without scrolling; the
+/// desktop dock is always a list.
+fn tool_grid_columns(width: f32, compact: bool, mobile: bool) -> usize {
+    if !mobile || width < 300.0 {
+        1
+    } else if compact {
+        3
+    } else {
+        2
+    }
+}
+
 /// Bottom safe inset in points. iOS reports the home indicator; Android
 /// hosts keep 0 until the platform bridge exposes one.
 fn safe_bottom(mobile: bool) -> f32 {
@@ -6996,20 +7146,24 @@ struct PhoneRoom {
     gap: f32,
 }
 
+/// Below this span the phone drawer drops its strip gap and runs to the
+/// bottom inset, so landscape keeps a usable panel height.
+const DRAWER_TIGHT_SPAN: f32 = 320.0;
+
 /// Drawer window `(top, height)` on phones: no top island, bottom clamped
-/// above the strip (and the capsule when it is showing).
-fn phone_drawer_span(viewport_bottom: f32, room: PhoneRoom, has_capsule: bool) -> (f32, f32) {
+/// above the strip unless the drawer is too short to fit there.
+fn phone_drawer_span(viewport_bottom: f32, room: PhoneRoom) -> (f32, f32) {
     let top = room.safe_top + room.pad;
-    let bottom = viewport_bottom
-        - room.safe_bottom
-        - room.pad
-        - room.strip_h
-        - room.gap
-        - if has_capsule {
-            room.island_h + room.gap
-        } else {
-            0.0
-        };
+    let above_strip = viewport_bottom - room.safe_bottom - room.pad - room.strip_h - room.gap;
+    // A short (landscape) drawer keeps the strip's room only when that still
+    // leaves a usable panel; otherwise it runs to the bottom inset and covers
+    // the strip while open — a slide-over is an overlay, not a dock.
+    let full = viewport_bottom - room.safe_bottom - room.pad;
+    let bottom = if above_strip - top >= DRAWER_TIGHT_SPAN {
+        above_strip
+    } else {
+        full
+    };
     (top, (bottom - top).max(200.0))
 }
 
@@ -7081,6 +7235,14 @@ fn drawer_slide_distance(progress: f32, width: f32, pad: f32) -> f32 {
 /// Mobile dialogs: at most 92% of the viewport in either axis, and short
 /// enough that centring it still clears the status-bar strip. Desktop
 /// windows keep their own sizing.
+/// How a mobile sheet is presented: fitted size, the anchor that centres it
+/// in the canvas area above the bottom chrome, and the drawer card frame.
+struct MobileModal {
+    fit: egui::Vec2,
+    anchor: egui::Vec2,
+    frame: egui::Frame,
+}
+
 fn modal_fit(
     viewport: egui::Vec2,
     safe_top: f32,
@@ -7097,23 +7259,68 @@ fn modal_fit(
     ))
 }
 
-/// Apply the mobile fit to a dialog; desktop windows keep their own size.
-fn fitted_modal<'a>(win: egui::Window<'a>, fit: Option<egui::Vec2>) -> egui::Window<'a> {
-    match fit {
-        Some(fit) => win.max_width(fit.x),
+/// Vertical anchor offset (from the viewport centre) that centres a sheet in
+/// the free canvas area: below the status inset and top islands, above the
+/// phone strip or the tablet options capsule. Falls back to dead centre when
+/// that area is too short to be a fair target.
+fn mobile_modal_anchor(
+    viewport: egui::Rect,
+    safe_top: f32,
+    safe_bottom: f32,
+    class: BarLayout,
+    island_h: f32,
+    gap: f32,
+    has_capsule: bool,
+) -> egui::Vec2 {
+    let pad = 12.0;
+    let (free_top, free_bottom) = if class == BarLayout::Narrow {
+        (
+            safe_top + pad,
+            viewport.bottom() - safe_bottom - pad - island_h - gap,
+        )
+    } else {
+        (
+            safe_top + pad + island_h + gap,
+            viewport.bottom() - safe_bottom - pad - if has_capsule { island_h + gap } else { 0.0 },
+        )
+    };
+    if free_bottom - free_top < 240.0 {
+        return egui::Vec2::ZERO;
+    }
+    egui::vec2(0.0, (free_top + free_bottom) * 0.5 - viewport.center().y)
+}
+
+/// Apply the mobile sheet treatment to a dialog; desktop windows keep their
+/// own size, position and frame.
+fn fitted_modal<'a>(win: egui::Window<'a>, sheet: Option<&MobileModal>) -> egui::Window<'a> {
+    match sheet {
+        Some(s) => win
+            .max_width(s.fit.x)
+            .anchor(egui::Align2::CENTER_CENTER, s.anchor)
+            .frame(s.frame),
         None => win,
     }
 }
 
 /// Mobile dialog body: scrolls within the fitted height so content never
 /// clips below the fold. Desktop bodies stay unwrapped.
-fn modal_scroll(ui: &mut egui::Ui, fit: Option<egui::Vec2>, body: impl FnOnce(&mut egui::Ui)) {
-    let Some(fit) = fit else {
+fn modal_scroll(ui: &mut egui::Ui, sheet: Option<&MobileModal>, body: impl FnOnce(&mut egui::Ui)) {
+    let Some(s) = sheet else {
         return body(ui);
     };
     egui::ScrollArea::vertical()
-        .max_height((fit.y - 56.0).max(160.0))
+        .max_height((s.fit.y - 56.0).max(160.0))
         .show(ui, body);
+}
+
+/// Cap for the File menu popup's scroll area: touch shells only, so on a
+/// landscape phone the tail of the menu scrolls into reach instead of
+/// running off the bottom edge.
+/// Room for the File popup body between the bar it hangs from and the
+/// opposite edge. Derived from bar geometry, never from the popup's own
+/// rect: a cap that moved with the popup made it grow every frame.
+fn menu_popup_room(from: f32, to: f32) -> f32 {
+    (to - from - 16.0).max(200.0)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -9404,7 +9611,7 @@ impl eframe::App for ProCraftApp {
                     egui::containers::menu::MenuButton::new("File")
                         .config(menu_config())
                         .ui(ui, |ui| {
-                            self.file_menu_ui(ui, layout, &bar_t);
+                            self.file_menu_ui(ui, layout, &bar_t, None);
                         });
                     if self.pill(ui, "Undo") && self.doc.undo() {
                         self.status = "Undone.".to_string();
@@ -9460,17 +9667,18 @@ impl eframe::App for ProCraftApp {
             let mut dup_idx: Option<usize> = None;
             let mut remove_idx: Option<usize> = None;
             let mut clear_all = false;
-            let fit = self.mobile_modal_fit(ui.ctx());
+            let sheet = self.mobile_modal_frame(ui.ctx());
+            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-gallery");
             fitted_modal(
                 egui::Window::new("Gallery")
                     .open(&mut open)
                     .resizable(true)
                     .collapsible(false)
                     .min_width(280.0),
-                fit,
+                sheet.as_ref(),
             )
             .show(ui.ctx(), |ui| {
-                modal_scroll(ui, fit, |ui| {
+                modal_scroll(ui, sheet.as_ref(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.gallery_new_w)
@@ -9557,7 +9765,7 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
-            self.gallery_open = open;
+            self.gallery_open = open && !scrim;
             if create {
                 let (w, h) = (self.gallery_new_w, self.gallery_new_h);
                 self.new_canvas(w, h);
@@ -9627,17 +9835,18 @@ impl eframe::App for ProCraftApp {
             let mut open = self.ref_open;
             let mut load = false;
             let mut clear = false;
-            let fit = self.mobile_modal_fit(ui.ctx());
+            let sheet = self.mobile_modal_frame(ui.ctx());
+            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-reference");
             fitted_modal(
                 egui::Window::new("Reference")
                     .open(&mut open)
                     .resizable(true)
                     .collapsible(false)
                     .min_width(200.0),
-                fit,
+                sheet.as_ref(),
             )
             .show(ui.ctx(), |ui| {
-                modal_scroll(ui, fit, |ui| {
+                modal_scroll(ui, sheet.as_ref(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_sized([70.0, 28.0], egui::Button::new("Load…"))
@@ -9661,7 +9870,9 @@ impl eframe::App for ProCraftApp {
                         let z = fit_px * self.ref_scale;
                         // The mobile frame is narrower than the 640px pin:
                         // cap the image to the dialog instead of clipping it.
-                        let cap = fit.map_or(640.0, |f| (f.x - 56.0).min(f.y - 160.0).max(120.0));
+                        let cap = sheet
+                            .as_ref()
+                            .map_or(640.0, |s| (s.fit.x - 56.0).min(s.fit.y - 160.0).max(120.0));
                         let dw = (*w as f32 * z).clamp(32.0, cap);
                         let dh = (*h as f32 * z).clamp(32.0, cap);
                         ui.image((tex.id(), egui::Vec2::new(dw, dh)));
@@ -9671,7 +9882,7 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
-            self.ref_open = open;
+            self.ref_open = open && !scrim;
             if clear {
                 self.ref_image = None;
                 self.ref_tex = None;
@@ -9716,17 +9927,18 @@ impl eframe::App for ProCraftApp {
         // Recovery prompt: a previous session died with unsaved work.
         if self.recovery_offer {
             let mut open = self.recovery_offer;
-            let fit = self.mobile_modal_fit(ui.ctx());
+            let sheet = self.mobile_modal_frame(ui.ctx());
+            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-recovery");
             fitted_modal(
                 egui::Window::new("Unsaved work found")
                     .open(&mut open)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .resizable(false)
                     .collapsible(false),
-                fit,
+                sheet.as_ref(),
             )
             .show(ui.ctx(), |ui| {
-                modal_scroll(ui, fit, |ui| {
+                modal_scroll(ui, sheet.as_ref(), |ui| {
                     ui.label("The last session ended without saving. Recover the autosave?");
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Recover").clicked() {
@@ -9759,7 +9971,7 @@ impl eframe::App for ProCraftApp {
             });
             // The X button snoozes (file kept, offered again next launch);
             // Recover/Discard already dismissed above and must stick.
-            if !open {
+            if !open || scrim {
                 self.recovery_offer = false;
             }
         }
@@ -9768,17 +9980,19 @@ impl eframe::App for ProCraftApp {
         // from the workspace Cargo.toml at compile time, so release bumps
         // show up here with no code changes.
         if self.show_about {
-            let fit = self.mobile_modal_fit(ui.ctx());
+            let mut open = self.show_about;
+            let sheet = self.mobile_modal_frame(ui.ctx());
+            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-about");
             fitted_modal(
                 egui::Window::new("About ProCraft")
-                    .open(&mut self.show_about)
+                    .open(&mut open)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .resizable(false)
                     .collapsible(false),
-                fit,
+                sheet.as_ref(),
             )
             .show(ui.ctx(), |ui| {
-                modal_scroll(ui, fit, |ui| {
+                modal_scroll(ui, sheet.as_ref(), |ui| {
                     ui.heading("ProCraft");
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.label("Painting studio by surfrpt1.");
@@ -9794,6 +10008,7 @@ impl eframe::App for ProCraftApp {
                     ui.label("Original code, MIT licensed.");
                 });
             });
+            self.show_about = open && !scrim;
         }
 
         // M49: shortcuts editor window.
@@ -9805,19 +10020,22 @@ impl eframe::App for ProCraftApp {
         // Done re-renders the one being edited in place; one undo step).
         if self.text_open {
             let mut open = self.text_open;
-            let fit = self.mobile_modal_fit(ui.ctx());
+            let sheet = self.mobile_modal_frame(ui.ctx());
+            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-text");
             fitted_modal(
                 egui::Window::new("Text")
                     .open(&mut open)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .resizable(true)
                     .collapsible(false),
-                fit,
+                sheet.as_ref(),
             )
             .show(ui.ctx(), |ui| {
                 // Scrollable: on small screens (iPad keyboard up) the
                 // tall dialog clips Import/Render below the fold.
-                let scroll_h = fit.map_or(f32::INFINITY, |f| (f.y - 96.0).max(160.0));
+                let scroll_h = sheet
+                    .as_ref()
+                    .map_or(f32::INFINITY, |s| (s.fit.y - 96.0).max(160.0));
                 egui::ScrollArea::vertical()
                     .max_height(scroll_h)
                     .show(ui, |ui| {
@@ -10047,7 +10265,7 @@ impl eframe::App for ProCraftApp {
             // A button inside the dialog may have set `text_open = false`
             // (Render/Done/Cancel); the window ✕ flips `open`. Honor both —
             // and any close clears the edit session.
-            self.text_open = self.text_open && open;
+            self.text_open = self.text_open && open && !scrim;
             if !self.text_open {
                 self.editing_text = None;
                 self.editing_loaded = None;
@@ -10070,7 +10288,7 @@ impl eframe::App for ProCraftApp {
                 .default_size(240.0)
                 .drag_to_open(false)
                 .show_collapsible(ui, &mut tools_open, |ui| {
-                    self.tools_panel_body(ui);
+                    self.tools_panel_body(ui, false);
                 });
             // Either the ◀ button (inside) or a drag past the minimum (panel)
             // can close; reopening is only via ▶/persistence, never a drag.
@@ -12606,6 +12824,77 @@ mod tests {
     }
 
     #[test]
+    fn sheets_centre_between_the_islands_and_the_bottom_bar() {
+        let phone_landscape =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(844.0, 390.0));
+        let off = mobile_modal_anchor(
+            phone_landscape,
+            0.0,
+            0.0,
+            BarLayout::Narrow,
+            56.0,
+            8.0,
+            true,
+        );
+        // Free area 12..314 centres at 163; the viewport centre is 195.
+        assert!((off.y - (-32.0)).abs() < 0.01);
+
+        let phone_portrait =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(390.0, 844.0));
+        let off = mobile_modal_anchor(
+            phone_portrait,
+            47.0,
+            34.0,
+            BarLayout::Narrow,
+            56.0,
+            8.0,
+            true,
+        );
+        assert!((off.y - (-25.5)).abs() < 0.01);
+
+        let tablet = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 768.0));
+        assert!(
+            (mobile_modal_anchor(tablet, 24.0, 20.0, BarLayout::Tablet, 56.0, 8.0, true).y - 2.0)
+                .abs()
+                < 0.01
+        );
+        assert!(
+            (mobile_modal_anchor(tablet, 24.0, 20.0, BarLayout::Tablet, 56.0, 8.0, false).y - 34.0)
+                .abs()
+                < 0.01
+        );
+
+        // Too little free height to be a fair target: stay dead centre.
+        let short = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(844.0, 300.0));
+        assert_eq!(
+            mobile_modal_anchor(short, 0.0, 0.0, BarLayout::Narrow, 56.0, 8.0, true),
+            egui::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn file_menu_room_stops_short_of_the_bar() {
+        // Phone landscape: safe top 12 -> strip top 324 leaves ~296 for rows.
+        assert_eq!(menu_popup_room(12.0, 324.0), 296.0);
+        // Portrait has plenty of room, so no scrolling.
+        assert_eq!(menu_popup_room(59.0, 734.0), 659.0);
+        // Never smaller than a couple of rows, even if the popup opens low.
+        assert_eq!(menu_popup_room(300.0, 390.0), 200.0);
+    }
+
+    #[test]
+    fn tool_grid_packs_columns_only_in_the_mobile_drawer() {
+        assert_eq!(tool_grid_columns(326.0, false, true), 2);
+        assert_eq!(tool_grid_columns(300.0, false, true), 2);
+        assert_eq!(tool_grid_columns(299.0, false, true), 1);
+        // A shot drawer (landscape) adds a third column so all tools fit.
+        assert_eq!(tool_grid_columns(326.0, true, true), 3);
+        // The desktop dock keeps its single-column list at any width.
+        assert_eq!(tool_grid_columns(326.0, false, false), 1);
+        assert_eq!(tool_grid_columns(600.0, true, false), 1);
+    }
+
+    #[test]
     fn drawer_span_clears_clusters_and_options_capsule() {
         let (top, h) = mobile_drawer_span(820.0, 24.0, 20.0, 12.0, 56.0, 8.0, true);
         assert_eq!(top, 100.0);
@@ -12618,7 +12907,7 @@ mod tests {
     }
 
     #[test]
-    fn phone_drawer_is_wider_and_has_no_top_island() {
+    fn phone_drawer_is_wider_and_keeps_the_strip_only_when_tall() {
         assert!((phone_drawer_width(390.0) - 358.8).abs() < 0.01);
         assert_eq!(phone_drawer_width(844.0), 360.0);
         assert_eq!(phone_drawer_width(240.0), 240.0);
@@ -12630,12 +12919,15 @@ mod tests {
             island_h: 56.0,
             gap: 8.0,
         };
-        let (top, h) = phone_drawer_span(844.0, room, true);
+        // Portrait: the strip stays visible, so the drawer stops above it.
+        let (top, h) = phone_drawer_span(844.0, room);
         assert_eq!(top, 36.0);
-        assert_eq!(h, 844.0 - 20.0 - 12.0 - 56.0 - 8.0 - 56.0 - 8.0 - top);
-        let (_, taller) = phone_drawer_span(844.0, room, false);
-        assert_eq!(taller - h, 64.0);
-        assert_eq!(phone_drawer_span(300.0, room, true).1, 200.0);
+        assert_eq!(h, 844.0 - 20.0 - 12.0 - 56.0 - 8.0 - 36.0);
+        // Landscape: too little room above the strip, so the drawer runs to
+        // the bottom inset and covers the strip while it is open.
+        let (_, tight) = phone_drawer_span(400.0, room);
+        assert_eq!(tight, 400.0 - 20.0 - 12.0 - 36.0);
+        assert_eq!(phone_drawer_span(200.0, room).1, 200.0);
     }
 
     #[test]
