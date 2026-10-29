@@ -3940,7 +3940,7 @@ mod tests {
     fn undo_restores_pixels() {
         let mut doc = Document::new(1, 1);
         doc.checkpoint();
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![9, 9, 9, 9]));
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(!doc.undo());
@@ -3951,7 +3951,7 @@ mod tests {
         let mut doc = Document::new(1, 1);
         assert!(!doc.restore_last_checkpoint());
         doc.checkpoint();
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![9, 9, 9, 9]));
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.restore_last_checkpoint());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         // The checkpoint survives the rewind and still undoes normally.
@@ -3964,7 +3964,7 @@ mod tests {
         let mut doc = Document::new(1, 1);
         assert!(!doc.redo());
         doc.checkpoint();
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![9, 9, 9, 9]));
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(doc.redo());
@@ -3978,9 +3978,9 @@ mod tests {
     #[test]
     fn group_hide_conceals_members_in_flatten() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![255, 0, 0, 255, 255, 0, 0, 255]));
+        doc.layers[0].pixels = px_rgba(&doc, &[255, 0, 0, 255, 255, 0, 0, 255]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = px_rgba(&doc, &(vec![0, 0, 255, 255, 0, 0, 255, 255]));
+        doc.layers[1].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 255, 255]);
         let g = doc.new_group("G".to_string());
         doc.move_layer_into_group(1, Some(g));
         assert!(doc.is_layer_shown(1));
@@ -5027,13 +5027,13 @@ mod tests {
     fn v6_roundtrip_keeps_masks_clips_and_blends() {
         let mut doc = Document::new(4, 2);
         doc.layers[0].blend = BlendMode::Difference;
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![200; 4 * 2 * 4]));
+        doc.layers[0].pixels = px_rgba(&doc, &[200; 4 * 2 * 4]);
         doc.add_mask(0);
         doc.layers[0].mask.as_mut().unwrap().set(3, 0);
         doc.add_layer("clipped".to_string());
         doc.layers[1].blend = BlendMode::SoftLight;
         doc.layers[1].clip = true;
-        doc.layers[1].pixels = px_rgba(&doc, &(vec![7; 4 * 2 * 4]));
+        doc.layers[1].pixels = px_rgba(&doc, &[7; 4 * 2 * 4]);
         doc.layers[1].ox = -3;
         doc.layers[1].oy = 2;
         let dir = std::env::temp_dir();
@@ -5130,9 +5130,9 @@ mod tests {
     fn merge_bakes_mask_and_clip() {
         let mut doc = Document::new(2, 1);
         // Below: blue, left pixel only.
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![0, 0, 255, 255, 0, 0, 0, 0]));
+        doc.layers[0].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 0, 0]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = px_rgba(&doc, &(vec![255, 0, 0, 255, 255, 0, 0, 255]));
+        doc.layers[1].pixels = px_rgba(&doc, &[255, 0, 0, 255, 255, 0, 0, 255]);
         doc.add_mask(1);
         // Mask hides the right pixel of the top layer.
         doc.layers[1].mask.as_mut().unwrap().set(1, 0);
@@ -5167,10 +5167,10 @@ mod tests {
     fn new_stroke_clears_redo() {
         let mut doc = Document::new(1, 1);
         doc.checkpoint();
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![1, 1, 1, 1]));
+        doc.layers[0].pixels = px_rgba(&doc, &[1, 1, 1, 1]);
         assert!(doc.undo());
         doc.checkpoint();
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![2, 2, 2, 2]));
+        doc.layers[0].pixels = px_rgba(&doc, &[2, 2, 2, 2]);
         assert!(!doc.redo());
     }
 
@@ -5178,7 +5178,7 @@ mod tests {
     fn multiply_blends_channels() {
         let mut doc = Document::new(1, 1);
         doc.background = [255, 255, 255, 255];
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![128, 200, 64, 255]));
+        doc.layers[0].pixels = px_rgba(&doc, &[128, 200, 64, 255]);
         doc.layers[0].blend = BlendMode::Multiply;
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[128, 200, 64, 255]);
@@ -5197,7 +5197,7 @@ mod tests {
     fn project_roundtrip_keeps_everything() {
         let mut doc = Document::new(4, 3);
         doc.background = [10, 20, 30, 255];
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![7; 4 * 3 * 4]));
+        doc.layers[0].pixels = px_rgba(&doc, &[7; 4 * 3 * 4]);
         doc.layers[0].opacity = 0.5;
         doc.layers[0].blend = BlendMode::Overlay;
         doc.symmetry = SymmetryMode::Both;
@@ -5781,7 +5781,7 @@ mod tests {
     #[test]
     fn tone_brightness_contrast_and_alpha() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![100, 100, 100, 200, 100, 100, 100, 200]));
+        doc.layers[0].pixels = px_rgba(&doc, &[100, 100, 100, 200, 100, 100, 100, 200]);
         doc.adjust_tone(0, 10, 1.0);
         assert_eq!(doc.layers[0].pixels.get4(0), [110, 110, 110, 200]);
         // Zero contrast flattens to mid-gray; alpha still untouched.
@@ -5928,9 +5928,9 @@ mod tests {
     #[test]
     fn merge_down_composites_and_removes() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![0, 0, 255, 255, 0, 0, 255, 255]));
+        doc.layers[0].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 255, 255]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = px_rgba(&doc, &(vec![255, 0, 0, 255, 0, 0, 0, 0]));
+        doc.layers[1].pixels = px_rgba(&doc, &[255, 0, 0, 255, 0, 0, 0, 0]);
         assert!(doc.merge_down(1));
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.active, 0);
@@ -5941,7 +5941,7 @@ mod tests {
         // Invisible top contributes nothing but still merges away.
         doc.add_layer("ghost".to_string());
         doc.layers[1].visible = false;
-        doc.layers[1].pixels = px_rgba(&doc, &(vec![0, 255, 0, 255, 0, 255, 0, 255]));
+        doc.layers[1].pixels = px_rgba(&doc, &[0, 255, 0, 255, 0, 255, 0, 255]);
         assert!(doc.merge_down(1));
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
@@ -5949,7 +5949,7 @@ mod tests {
     #[test]
     fn duplicate_copies_layer() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![7; 8]));
+        doc.layers[0].pixels = px_rgba(&doc, &[7; 8]);
         doc.duplicate_layer(0);
         assert_eq!(doc.layers.len(), 2);
         assert_eq!(doc.active, 1);
@@ -5962,7 +5962,7 @@ mod tests {
     #[test]
     fn sample_reads_composite() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![10, 20, 30, 255, 0, 0, 0, 0]));
+        doc.layers[0].pixels = px_rgba(&doc, &[10, 20, 30, 255, 0, 0, 0, 0]);
         assert_eq!(doc.sample(0, 0), Some([10, 20, 30]));
         assert_eq!(doc.sample(9, 9), None);
     }

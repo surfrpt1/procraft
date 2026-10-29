@@ -2018,16 +2018,23 @@ git commit -m "perf(engine): tilebench and 8K measurements"
 ## Measurement log
 
 `cargo run --release -p procraft-engine --example tilebench` (release build). Tile
-figures are one 256² centre tile, 20 repetitions averaged; every layer holds a
-loaded patch in that tile, so 100L measures 100 blended layers, not empty-tile
-fast paths.
+figures are one 256² centre tile, 20 repetitions averaged; `flatten` is a single
+full pass (n = 1). Every layer holds a full 256² patch in that tile — the fill is
+dense on purpose, because the compositor skips pixels whose accumulated alpha is
+0, so a sparse patch would measure fast paths rather than a solid tile. 100L
+therefore measures 100 blended layers, not empty-tile fast paths. Two consecutive
+runs agreed within ~1.6 % on the tile figures and within ~3 % on the 8K/100L
+`flatten` (a single pass, so it moves more: 22.0–23.5 s across consecutive runs on
+this 15 W host).
 
 | Date | Host | 4K / 1L tile | 4K / 100L tile | 8K / 1L tile | 8K / 100L tile | 8K flatten (100L) |
 |---|---|---|---|---|---|---|
-| 2026-10-29 | Windows 11 (x86_64), Intel Core i5-8250U @ 1.60 GHz, 8 GiB — desktop | 1.28 ms | 77.70 ms | 1.27 ms | 81.98 ms | 25438 ms (25.4 s) |
+| 2026-10-29 | Windows 11 (x86_64), Intel Core i5-8250U @ 1.60 GHz, ~7.9 GiB (8 GiB installed) — desktop | 1.83 ms | 102.68 ms | 1.84 ms | 108.35 ms | 21963 ms (22.0 s) |
 
 - Host `layer_alloc_bytes()` for the 8K/100-layer document: 26,214,400 bytes
-  (100 loaded tiles, 25.0 MiB) — the tile column above is that memory's cost.
+  (100 loaded tiles, 25.0 MiB). That is a floor for this benchmark shape (one
+  tile per layer), not a typical 100-layer document's footprint; the tile column
+  above is that memory's cost.
 - Android tablet: **pending a device run** — canvas-texture feel with per-tile
   `set_partial` (target A) vs forced `PROCRAFT_FORCE_VIEWPORT_CANVAS=1`, plus
   that document's `layer_alloc_bytes()`; controller/project owner close this.
