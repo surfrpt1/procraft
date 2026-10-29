@@ -357,11 +357,13 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
     }
     let n = (w * h) as usize;
     for layer in &doc.layers {
-        if layer.pixels.len() != n * 4 {
+        // Geometry first: `len()` alone lets a 4x1 raster stand in for a
+        // 2x2 canvas, which would bake the wrong slots.
+        if layer.pixels.w() != w || layer.pixels.h() != h || layer.pixels.len() != n * 4 {
             return Err("layer has wrong pixel size".to_string());
         }
         if let Some(m) = layer.mask.as_ref() {
-            if m.len() != n {
+            if m.w() != w || m.h() != h || m.len() != n {
                 return Err("layer mask has wrong size".to_string());
             }
         }
@@ -767,5 +769,26 @@ mod tests {
         // Wrong geometry (not a 2x2 RGBA raster) exercises the size guard.
         doc.layers[0].pixels = Raster::new(1, 1, 4);
         assert!(save_psd(&dir.join("procraft-badsize.psd"), &doc).is_err());
+    }
+
+    #[test]
+    fn psd_guard_checks_geometry_not_byte_length() {
+        let dir = std::env::temp_dir();
+        // 4x1 RGBA holds the same 16 bytes as a 2x2 canvas but is not its
+        // geometry: the guard must reject it before any baking.
+        let mut doc = Document::new(2, 2);
+        doc.layers[0].pixels = Raster::rgba(4, 1);
+        assert_eq!(
+            save_psd(&dir.join("procraft-badshape.psd"), &doc),
+            Err("layer has wrong pixel size".to_string())
+        );
+        // 4x1 mask holds the canvas pixel count (4) but not its shape; the
+        // old byte-length guard accepted it and dropped the mask.
+        let mut doc = Document::new(2, 2);
+        doc.layers[0].mask = Some(Raster::mask(4, 1));
+        assert_eq!(
+            save_psd(&dir.join("procraft-badmask.psd"), &doc),
+            Err("layer mask has wrong size".to_string())
+        );
     }
 }
