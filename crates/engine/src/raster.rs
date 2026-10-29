@@ -270,7 +270,7 @@ impl Raster {
     /// This is a preview guard, never a correctness oracle.
     ///
     /// `w`, `h` and `bpp` are mixed into the seed, so equal-length rasters
-    /// of different geometry cannot collide.
+    /// of different geometry do not share a seed.
     pub fn fingerprint(&self) -> u64 {
         let mut h = 0xcbf29ce484222325u64 ^ (self.len() as u64);
         for v in [self.w as u64, self.h as u64, self.bpp as u64] {
