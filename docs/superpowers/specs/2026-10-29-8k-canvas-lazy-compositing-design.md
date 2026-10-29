@@ -162,9 +162,11 @@ colour and an all-zero tile is exactly an invisible tile.
 6. **Measurement.** `cargo run --release -p procraft-engine --example tilebench`
    reports composite time per tile for 1/10/100 layers at 4K and 8K; on-device
    numbers recorded in the plan log. Measured caveat: `flatten` at 8K/100 layers
-   takes ~22 s on the 15 W host and that figure is a floor, because the
-   compositor does not skip empty layers — export at that size is a batch
-   operation, not interactive.
+   takes ~22 s on the 15 W host. That is the measured single-pass cost
+   (n = 1) on the logged host for that document shape — 1024 tiles by 100
+   layers — and the compositor does skip unallocated tiles and layers whose
+   effective alpha is zero. Export at that size is a batch operation, not
+   interactive.
 
 Phases 1–4 complete the milestone; 5 is the VRAM escape hatch and 6 gates a
 "done" claim. If the schedule slips, 5 is the piece to cut.

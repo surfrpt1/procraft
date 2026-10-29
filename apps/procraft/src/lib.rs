@@ -1028,6 +1028,10 @@ struct ProCraftApp {
     group_name_edit: String,
     preset_textures: Vec<TextureHandle>,
     view_mask: bool,
+    /// The mask viewer owns the canvas texture slot (it holds mask pixels,
+    /// or was cleared for one), so leaving the view must drop it once
+    /// instead of patching composite tiles over it.
+    mask_shown: bool,
     show_tools: bool,
     show_layers: bool,
     drawer: MobileDrawer,
@@ -1297,6 +1301,7 @@ impl ProCraftApp {
             group_name_edit: String::new(),
             preset_textures: Vec::new(),
             view_mask: false,
+            mask_shown: false,
             show_tools: true,
             show_layers: true,
             drawer: MobileDrawer::None,
@@ -2017,63 +2022,123 @@ impl ProCraftApp {
         if self.view_tex.texture().is_some() {
             self.view_tex.clear();
         }
-        // Mask viewer: grayscale of the active layer's mask. Draining the
-        // dirty rect first means a mask dab re-reads and re-uploads only
-        // that rect; the full canvas is built once per texture (open,
-        // resize, view toggle), never per frame.
-        if self.view_mask {
-            let dirty = self.doc.take_dirty();
-            // The texture is canvas-sized, so a GPU that cannot hold one
-            // would reject the upload in the backend: say so instead.
-            if self.doc.w.max(self.doc.h) as usize > ctx.input(|i| i.max_texture_side) {
-                self.status =
-                    "Mask view needs a canvas texture this GPU cannot allocate.".to_string();
+        // Mask viewer: grayscale of the active layer's mask. The decision
+        // comes first because `take_dirty` is destructive: with the view on
+        // and no mask on the layer, the dirty rect must reach the composite
+        // path below (which patches tiles) instead of being drained here and
+        // leaving the composite to flatten the whole canvas.
+        let has_mask = self
+            .doc
+            .layers
+            .get(self.doc.active)
+            .is_some_and(|l| l.mask.is_some());
+        match mask_action(self.view_mask, has_mask, self.mask_shown) {
+            // The canvas texture holds mask pixels that no longer apply:
+            // drop it once so the composite path starts from a clean
+            // `texture == None` instead of patching tiles over mask pixels.
+            MaskAction::Drop => {
+                self.mask_shown = false;
                 self.texture = None;
                 self.composite.invalidate();
-                return;
+                // Fall through: the composite / assist path rebuilds.
             }
-            // The canvas texture is not the composite here, so no composite
-            // tile can be trusted when the view returns.
-            self.composite.invalidate();
-            if self.texture.is_none() {
-                if let Some(mv) = self.doc.mask_view() {
-                    let img = ColorImage::from_rgba_unmultiplied(
-                        [self.doc.w as usize, self.doc.h as usize],
-                        &mv,
-                    );
-                    self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+            // Nothing mask-specific this frame: the dirty rect is *not*
+            // drained — the composite / assist path owns it.
+            MaskAction::Idle => {
+                if self.view_mask {
+                    let msg = "This layer has no mask.";
+                    if self.status != msg {
+                        self.status = msg.to_string();
+                    }
+                }
+            }
+            // The layer has a mask and the view is on: build or patch the
+            // mask texture. Draining the dirty rect means a mask dab re-reads
+            // and re-uploads only that rect; the full canvas is built once
+            // per texture (open, resize, view toggle), never per frame.
+            MaskAction::Show => {
+                let dirty = self.doc.take_dirty();
+                // The texture is canvas-sized, so a GPU that cannot hold one
+                // would reject the upload in the backend: say so instead.
+                if self.doc.w.max(self.doc.h) as usize > ctx.input(|i| i.max_texture_side) {
+                    let msg = "Mask view needs a canvas texture this GPU cannot allocate.";
+                    if self.status != msg {
+                        self.status = msg.to_string();
+                    }
+                    self.texture = None;
+                    self.mask_shown = true;
+                    self.composite.invalidate();
                     return;
                 }
-            } else {
-                match dirty {
-                    Some((x0, y0, x1, y1)) => match self.doc.mask_view_region(x0, y0, x1, y1) {
-                        Some(bytes) => {
-                            let img = ColorImage::from_rgba_unmultiplied(
-                                [(x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize],
-                                &bytes,
-                            );
-                            if let Some(handle) = &mut self.texture {
-                                handle.set_partial(
-                                    [x0 as usize, y0 as usize],
-                                    img,
-                                    TextureOptions::LINEAR,
+                // The canvas texture is not the composite here, so no composite
+                // tile can be trusted when the view returns.
+                self.composite.invalidate();
+                if self.texture.is_none() {
+                    if let Some(mv) = self.doc.mask_view() {
+                        let img = ColorImage::from_rgba_unmultiplied(
+                            [self.doc.w as usize, self.doc.h as usize],
+                            &mv,
+                        );
+                        self.texture =
+                            Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                        self.mask_shown = true;
+                        return;
+                    }
+                    // No mask to build from after all (mid-state): the slot
+                    // does not hold mask pixels, so leaving the view must
+                    // not drop the composite texture a second time.
+                    self.mask_shown = false;
+                } else {
+                    match dirty {
+                        Some((x0, y0, x1, y1)) => match self.doc.mask_view_region(x0, y0, x1, y1) {
+                            Some(bytes) => {
+                                let img = ColorImage::from_rgba_unmultiplied(
+                                    [(x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize],
+                                    &bytes,
                                 );
+                                if let Some(handle) = &mut self.texture {
+                                    handle.set_partial(
+                                        [x0 as usize, y0 as usize],
+                                        img,
+                                        TextureOptions::LINEAR,
+                                    );
+                                }
+                                self.mask_shown = true;
+                                return;
                             }
+                            // Mask gone: fall through and rebuild from the
+                            // composite instead of leaving a stale texture.
+                            None => {
+                                self.texture = None;
+                                self.mask_shown = false;
+                            }
+                        },
+                        // Nothing changed: the upload is already correct.
+                        None => {
+                            self.mask_shown = true;
                             return;
                         }
-                        // Mask gone: fall through and rebuild from the
-                        // composite instead of leaving a stale texture.
-                        None => self.texture = None,
-                    },
-                    // Nothing changed: the upload is already correct.
-                    None => return,
+                    }
                 }
             }
-            // No mask to show: fall through to Animation Assist / composite.
         }
         // Animation Assist: the canvas shows the current frame only
         // (active layer over the page), not the full composite.
         if self.anim_assist && !self.doc.layers.is_empty() {
+            // The frame texture is canvas-sized too: a GPU that cannot hold
+            // one would reject the upload in the backend (a legacy 16384²
+            // document asks for ~1 GiB), so say so instead of building it.
+            let long = self.doc.w.max(self.doc.h) as usize;
+            if long > ctx.input(|i| i.max_texture_side) {
+                let msg = "Animation Assist needs a canvas texture this GPU cannot allocate.";
+                if self.status != msg {
+                    self.status = msg.to_string();
+                }
+                self.texture = None;
+                self.anim_shown = None;
+                self.composite.invalidate();
+                return;
+            }
             // Frame view is not the composite (dab rects are consumed
             // here, never by the tile cache): drop the tiles.
             self.composite.invalidate();
@@ -2319,6 +2384,32 @@ impl ProCraftApp {
     /// Total preview cards currently needed (built-ins + customs).
     fn preview_count(&self) -> usize {
         procraft_engine::presets().len() + self.custom_brushes.len()
+    }
+}
+
+/// What the mask-view branch must do this frame.
+#[derive(Debug, PartialEq)]
+enum MaskAction {
+    /// Nothing mask-specific: the composite / assist path owns the frame.
+    Idle,
+    /// The layer has a mask and the view is on: build or patch the mask texture.
+    Show,
+    /// A mask texture is on screen but no longer applies: drop it once.
+    Drop,
+}
+
+/// The pure decision behind the mask-view branch of `refresh_texture`.
+///
+/// Only the mask view itself can drain the dirty rect: on a maskless layer
+/// the composite path must still see it (a full-canvas flatten per dab
+/// otherwise). A texture that was showing mask pixels is dropped exactly
+/// once, whichever way the view leaves that state.
+fn mask_action(view_mask: bool, has_mask: bool, mask_shown: bool) -> MaskAction {
+    match (view_mask, has_mask) {
+        (true, true) => MaskAction::Show,
+        (false, true) => MaskAction::Idle,
+        _ if mask_shown => MaskAction::Drop,
+        _ => MaskAction::Idle,
     }
 }
 
@@ -15028,5 +15119,40 @@ mod tests {
         let last = (tw - 1) * 4;
         assert_eq!(&bytes[last..last + 4], &[0, 0, 255, 255]);
         assert!(bytes.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn mask_action_shows_only_for_a_masked_layer_in_view() {
+        assert_eq!(mask_action(true, true, false), MaskAction::Show);
+        // Already showing a mask: the Show arm stays reachable, so a dab
+        // patches instead of rebuilding.
+        assert_eq!(mask_action(true, true, true), MaskAction::Show);
+    }
+
+    #[test]
+    fn mask_action_leaves_the_mask_texture_when_only_the_view_turns_off() {
+        // The checkbox marks the whole canvas dirty, so the composite path
+        // repaints every tile over the mask pixels: no drop is needed, and
+        // the mask texture is still valid if the view comes back.
+        assert_eq!(mask_action(false, true, true), MaskAction::Idle);
+    }
+
+    #[test]
+    fn mask_action_drops_a_shown_mask_when_the_layer_loses_it() {
+        // "View" on, switched to a maskless layer.
+        assert_eq!(mask_action(true, false, true), MaskAction::Drop);
+        // "Clear mask" also turns the view off; the texture still holds
+        // mask pixels, so it must be dropped rather than patched over.
+        assert_eq!(mask_action(false, false, true), MaskAction::Drop);
+    }
+
+    #[test]
+    fn mask_action_is_idle_when_there_is_no_mask_to_show() {
+        // The crux: the dirty rect must be left for the composite path.
+        assert_eq!(mask_action(true, false, false), MaskAction::Idle);
+        assert_eq!(mask_action(false, false, false), MaskAction::Idle);
+        // View off with a mask: the mask texture was already dropped (or
+        // never built), so nothing to do.
+        assert_eq!(mask_action(false, true, false), MaskAction::Idle);
     }
 }
