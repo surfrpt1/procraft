@@ -1017,33 +1017,6 @@ impl Document {
         (sx, sy)
     }
 
-    /// Slide a layer buffer by (`sx`,`sy`) with zero-fill (far-edge tails
-    /// trim). `stride` is 4 for pixels, 1 for masks.
-    fn slide_buffer(buf: &mut [u8], w: u32, h: u32, stride: usize, sx: i32, sy: i32) {
-        if (sx == 0 && sy == 0) || w == 0 || h == 0 {
-            return;
-        }
-        let mut next = vec![0u8; buf.len()];
-        for y in 0..h {
-            let old_y = y as i32 - sy;
-            if old_y < 0 || old_y >= h as i32 {
-                continue;
-            }
-            for x in 0..w {
-                let old_x = x as i32 - sx;
-                if old_x < 0 || old_x >= w as i32 {
-                    continue;
-                }
-                let s = ((old_y as u32 * w + old_x as u32) as usize) * stride;
-                let d = ((y * w + x) as usize) * stride;
-                if s + stride <= buf.len() && d + stride <= next.len() {
-                    next[d..d + stride].copy_from_slice(&buf[s..s + stride]);
-                }
-            }
-        }
-        buf.copy_from_slice(&next);
-    }
-
     /// Make canvas bbox [`x0`..=`x1`]×[`y0`..=`y1`] paintable on a moved
     /// layer: slide pixels (and mask) so the bbox maps inside the buffer,
     /// adjusting the offset equally — on-screen content does not move and
@@ -1052,23 +1025,23 @@ impl Document {
     /// then marks the whole layer dirty — content moved outside the dab
     /// rect too). Caller checkpoints first (paint strokes do, so undo
     /// restores buffer and offset together).
+    ///
+    /// This runs per dab, and a stroke that keeps moving outward slides on
+    /// every dab, so the slide itself is tile-granular
+    /// ([`Raster::slide_in_place`]): one tile-grid copy, no dense buffer
+    /// and no whole-canvas temporary.
     pub fn absorb_offset(&mut self, index: usize, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
         if index >= self.layers.len() {
             return false;
         }
-        let (w, h) = (self.w, self.h);
         let (ox, oy) = (self.layers[index].ox, self.layers[index].oy);
-        let (sx, sy) = Self::fit_shift(w, h, ox, oy, x0, y0, x1, y1);
+        let (sx, sy) = Self::fit_shift(self.w, self.h, ox, oy, x0, y0, x1, y1);
         if sx == 0 && sy == 0 {
             return false;
         }
-        let mut d = self.layers[index].pixels.to_dense();
-        Self::slide_buffer(&mut d, w, h, 4, sx, sy);
-        self.layers[index].pixels.replace_dense(&d);
+        self.layers[index].pixels.slide_in_place(sx, sy);
         if let Some(m) = self.layers[index].mask.as_mut() {
-            let mut md = m.to_dense();
-            Self::slide_buffer(&mut md, w, h, 1, sx, sy);
-            m.replace_dense(&md);
+            m.slide_in_place(sx, sy);
         }
         // Content slid +s in the buffer reads at the same screen cell
         // exactly when the offset drops by s.

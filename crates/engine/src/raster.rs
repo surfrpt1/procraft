@@ -248,6 +248,76 @@ impl Raster {
         r
     }
 
+    /// Slide all content by (`sx`, `sy`) pixels with zero fill; content that
+    /// leaves the canvas is dropped. Tile-granular: destination tiles that
+    /// receive only zeros stay `None`, and only tiles that receive non-zero
+    /// bytes are allocated.
+    ///
+    /// Same rule as the dense slide this replaces: destination pixel
+    /// `(x, y)` takes source pixel `(x - sx, y - sy)`, zero outside the old
+    /// bounds. Works for both pixel (`bpp == 4`) and mask (`bpp == 1`)
+    /// rasters, and copies per source-tile row run, so no whole-layer
+    /// buffer is ever materialised.
+    pub fn slide_in_place(&mut self, sx: i32, sy: i32) {
+        if (sx == 0 && sy == 0) || self.is_empty() {
+            return;
+        }
+        let bpp = self.bpp();
+        let tile_len = self.tile_len();
+        let (w, h) = (self.w as i64, self.h as i64);
+        let (sx, sy) = (sx as i64, sy as i64);
+        let side = TILE as i64;
+        // Read from the old grid while the new one is assembled; `next` is
+        // only the per-raster pointer row, never a full-canvas byte buffer.
+        let old = std::mem::take(&mut self.tiles);
+        let mut next: Vec<Option<Arc<Vec<u8>>>> = vec![None; old.len()];
+        // Reused scratch for one destination tile at a time. It only goes
+        // back into the pool when it came out all zero, so a fetched
+        // buffer never needs re-clearing.
+        let mut scratch: Option<Vec<u8>> = None;
+        for dty in 0..self.tiles_y {
+            for dtx in 0..self.tiles_x {
+                let (dx0, dy0) = (dtx as i64 * side, dty as i64 * side);
+                let dx1 = (dx0 + side).min(w);
+                let dy1 = (dy0 + side).min(h);
+                // Part of the destination tile that reads from inside the
+                // old canvas; the rest of the tile stays zero.
+                let (x0, x1) = (dx0.max(sx), dx1.min(sx + w));
+                let (y0, y1) = (dy0.max(sy), dy1.min(sy + h));
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                let mut out = scratch.take().unwrap_or_else(|| vec![0u8; tile_len]);
+                for y in y0..y1 {
+                    let src_y = y - sy;
+                    let (sty, local_y) = ((src_y / side) as u32, (src_y % side) as usize);
+                    let src_row = sty * self.tiles_x;
+                    let dst_row = (y - dy0) as usize * TILE as usize;
+                    let mut x = x0;
+                    while x < x1 {
+                        let src_x = x - sx;
+                        let stx = (src_x / side) as u32;
+                        // A run never straddles a source tile boundary.
+                        let seg_end = x1.min((stx + 1) as i64 * side + sx);
+                        if let Some(src) = old[(src_row + stx) as usize].as_deref() {
+                            let n = (seg_end - x) as usize;
+                            let s = (local_y * TILE as usize + (src_x % side) as usize) * bpp;
+                            let d = (dst_row + (x - dx0) as usize) * bpp;
+                            out[d..d + n * bpp].copy_from_slice(&src[s..s + n * bpp]);
+                        }
+                        x = seg_end;
+                    }
+                }
+                if out.iter().any(|&b| b != 0) {
+                    next[(dty * self.tiles_x + dtx) as usize] = Some(Arc::new(out));
+                } else {
+                    scratch = Some(out);
+                }
+            }
+        }
+        self.tiles = next;
+    }
+
     /// Fill every pixel. `fill(0)` drops all tiles.
     pub fn fill(&mut self, v: u8) {
         if v == 0 {
@@ -429,6 +499,131 @@ mod tests {
         assert_eq!(m.tile_len(), 65536);
         assert_eq!(m.get((299 * 300 + 299) as usize), 255);
         assert_eq!(m.to_dense().len(), 300 * 300);
+    }
+
+    /// Per-pixel reference for the slide rule: `dst(x, y)` takes
+    /// `src(x - sx, y - sy)`, zero outside the old bounds. Deliberately
+    /// dense and naive.
+    fn dense_slide(bytes: &[u8], w: u32, h: u32, bpp: usize, sx: i32, sy: i32) -> Vec<u8> {
+        let mut out = vec![0u8; bytes.len()];
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let (ox, oy) = (x - sx, y - sy);
+                if ox < 0 || oy < 0 || ox >= w as i32 || oy >= h as i32 {
+                    continue;
+                }
+                let s = (oy as usize * w as usize + ox as usize) * bpp;
+                let d = (y as usize * w as usize + x as usize) * bpp;
+                out[d..d + bpp].copy_from_slice(&bytes[s..s + bpp]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn slide_matches_the_dense_reference() {
+        let (w, h) = (600u32, 600u32); // 3x3 tiles, seams at 256 and 512
+        let mut dense = vec![0u8; (w * h * 4) as usize];
+        // A square straddling both the x and the y seam, so each copied run
+        // crosses a source tile edge and lands in the next tile.
+        for y in 230..290u32 {
+            for x in 200..340u32 {
+                let i = ((y * w + x) * 4) as usize;
+                dense[i..i + 4].copy_from_slice(&[(x % 251) as u8, (y % 251) as u8, 255, 200]);
+            }
+        }
+        let mut r = Raster::from_dense(w, h, 4, &dense);
+        assert_eq!(r.allocated_tiles().count(), 4, "the square spans 2x2 tiles");
+        r.slide_in_place(7, -3);
+        assert_eq!(r.to_dense(), dense_slide(&dense, w, h, 4, 7, -3));
+        assert_eq!(
+            r.allocated_tiles().count(),
+            4,
+            "exactly the tiles the square moved into"
+        );
+        assert!(r.tile(2, 0).is_none(), "blank tiles stay None");
+        assert!(r.tile(0, 2).is_none());
+        assert!(r.tile(2, 2).is_none());
+
+        // A blank raster slides without allocating anything.
+        let mut blank = Raster::rgba(w, h);
+        let before = blank.allocated_tiles().count();
+        blank.slide_in_place(7, -3);
+        assert_eq!(blank.allocated_tiles().count(), before);
+        assert_eq!(before, 0);
+    }
+
+    #[test]
+    fn slide_is_a_no_op_for_zero_shift() {
+        let mut r = Raster::rgba(600, 300);
+        r.set4(((10 * 600 + 10) * 4) as usize, [1, 2, 3, 4]);
+        r.set4(((200 * 600 + 400) * 4) as usize, [5, 6, 7, 8]);
+        let before = r.to_dense();
+        let tiles = r
+            .allocated_tiles()
+            .map(|(tx, ty, _)| (tx, ty))
+            .collect::<Vec<_>>();
+        r.slide_in_place(0, 0);
+        assert_eq!(r.to_dense(), before);
+        assert_eq!(
+            r.allocated_tiles()
+                .map(|(tx, ty, _)| (tx, ty))
+                .collect::<Vec<_>>(),
+            tiles
+        );
+    }
+
+    #[test]
+    fn slide_works_on_masks() {
+        let (w, h) = (300u32, 5u32);
+        let mut m = Raster::mask(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                m.set((y * w + x) as usize, 255);
+            }
+        }
+        assert_eq!(m.bpp(), 1);
+        let dense = m.to_dense();
+        m.slide_in_place(-256, 0);
+        assert_eq!(m.bpp(), 1);
+        assert_eq!(m.to_dense(), dense_slide(&dense, w, h, 1, -256, 0));
+        // Destination x reads source x + 256: the first 44 columns keep
+        // content and the rest of the row is zero fill.
+        assert_eq!(m.get((4 * w) as usize), 255);
+        assert_eq!(m.get((4 * w + 43) as usize), 255);
+        assert_eq!(m.get((4 * w + 44) as usize), 0);
+        assert_eq!(m.get((4 * w + 299) as usize), 0);
+        assert_eq!(
+            m.allocated_tiles().count(),
+            1,
+            "only the left tile column holds content; the right one stays None"
+        );
+    }
+
+    #[test]
+    fn slide_trims_content_that_leaves_the_canvas() {
+        let (w, h) = (300u32, 4u32);
+        let mut r = Raster::rgba(w, h);
+        r.set4(0, [1, 2, 3, 4]); // (0, 0)
+        r.set4((299 * 4) as usize, [5, 6, 7, 8]); // (299, 0)
+        r.set4(((3 * w + 10) * 4) as usize, [9, 10, 11, 12]); // (10, 3)
+        let dense = r.to_dense();
+        r.slide_in_place(-3, 2);
+        assert_eq!(r.to_dense(), dense_slide(&dense, w, h, 4, -3, 2));
+        // The left column and the bottom row fall off the canvas: dropped,
+        // never wrapped onto the opposite edge.
+        assert_eq!(r.get4(0), [0; 4], "nothing wrapped onto (0, 0)");
+        assert_eq!(
+            r.get4(((2 * w + 296) * 4) as usize),
+            [5, 6, 7, 8],
+            "the survivor moved by the shift"
+        );
+        assert_eq!(r.get4(((2 * w) * 4) as usize), [0; 4]);
+        assert_eq!(
+            r.get4(((3 * w + 10) * 4) as usize),
+            [0; 4],
+            "the bottom row is not wrapped to the top"
+        );
     }
 
     #[test]
