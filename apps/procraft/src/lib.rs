@@ -546,6 +546,129 @@ fn push_recent(recent: &mut Vec<String>, path: &str) {
 /// M49: cooldown before retrying a failed settings write (seconds).
 const SAVE_RETRY_SECS: f64 = 2.0;
 
+/// One row of the Layers panel, stack order: a group header (with its
+/// nesting depth for indentation and how many layers it holds) or a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerPanelRow {
+    Group {
+        id: u32,
+        depth: usize,
+        members: usize,
+    },
+    Layer {
+        index: usize,
+        depth: usize,
+    },
+}
+
+/// Flatten the layer stack into panel rows. Headers sit above their topmost
+/// member; groups with no layers anywhere (fresh, or emptied by moving or
+/// deleting members) still get a row so they never vanish, root-level ones
+/// at the top. Collapsed groups hide their subtree but keep their header.
+fn layer_panel_rows(doc: &Document) -> Vec<LayerPanelRow> {
+    let chains: Vec<Vec<u32>> = (0..doc.layers.len())
+        .map(|i| {
+            let mut up = Vec::new();
+            let mut seen = Vec::new();
+            let mut g = doc.layers[i].group;
+            while let Some(id) = g {
+                if seen.contains(&id) {
+                    break;
+                }
+                seen.push(id);
+                let Some(gr) = doc.group(id) else {
+                    break;
+                };
+                up.push(id);
+                g = gr.parent;
+            }
+            up.reverse();
+            up
+        })
+        .collect();
+    let mut live: Vec<u32> = Vec::new();
+    for chain in &chains {
+        for id in chain {
+            if !live.contains(id) {
+                live.push(*id);
+            }
+        }
+    }
+    let members = |id: u32| chains.iter().filter(|c| c.contains(&id)).count();
+    let collapsed = |id: u32| doc.group(id).is_some_and(|g| g.collapsed);
+    let mut rows = Vec::new();
+    let mut printed: Vec<u32> = Vec::new();
+    push_layerless_groups(doc, None, 0, &live, &mut printed, &mut rows);
+    for i in (0..doc.layers.len()).rev() {
+        let chain = &chains[i];
+        for (depth, id) in chain.iter().enumerate() {
+            if printed.contains(id) || chain[..depth].iter().any(|a| collapsed(*a)) {
+                continue;
+            }
+            printed.push(*id);
+            rows.push(LayerPanelRow::Group {
+                id: *id,
+                depth,
+                members: members(*id),
+            });
+            if !collapsed(*id) {
+                push_layerless_groups(doc, Some(*id), depth + 1, &live, &mut printed, &mut rows);
+            }
+        }
+        if chain.iter().any(|id| collapsed(*id)) {
+            continue;
+        }
+        rows.push(LayerPanelRow::Layer {
+            index: i,
+            depth: chain.len(),
+        });
+    }
+    rows
+}
+
+/// Append the layerless groups under `parent` (newest first), recursing into
+/// their own layerless children and honoring collapse.
+fn push_layerless_groups(
+    doc: &Document,
+    parent: Option<u32>,
+    depth: usize,
+    live: &[u32],
+    printed: &mut Vec<u32>,
+    rows: &mut Vec<LayerPanelRow>,
+) {
+    let mut children: Vec<u32> = doc
+        .groups
+        .iter()
+        .filter(|g| g.parent == parent && !live.contains(&g.id) && !printed.contains(&g.id))
+        .map(|g| g.id)
+        .collect();
+    children.sort_unstable_by(|a, b| b.cmp(a));
+    for id in children {
+        printed.push(id);
+        let collapsed = doc.group(id).is_some_and(|g| g.collapsed);
+        rows.push(LayerPanelRow::Group {
+            id,
+            depth,
+            members: 0,
+        });
+        if !collapsed {
+            push_layerless_groups(doc, Some(id), depth + 1, live, printed, rows);
+        }
+    }
+}
+
+/// Group-header button presses, applied after the row loop so the panel can
+/// draw from `&self.doc` without holding a borrow while it mutates it.
+#[derive(Default)]
+struct GroupRowActions {
+    collapse: Option<u32>,
+    eye: Option<u32>,
+    add: Option<u32>,
+    ungroup: Option<u32>,
+    opacity: Option<(u32, f32)>,
+    rename: Option<(u32, String)>,
+}
+
 /// Layers-panel footer text: layer count, the active layer's name and the
 /// document's allocated tile memory (painted tiles plus masks). Fresh
 /// layers cost nothing until a tile is touched, so this starts at `0 B`
@@ -3717,6 +3840,147 @@ impl ProCraftApp {
         }
     }
 
+    /// Name for a fresh group that does not collide with an existing one
+    /// ("Group 3" after "Group 3" was disbanded).
+    fn next_group_name(&self) -> String {
+        let mut n = 1;
+        while self
+            .doc
+            .groups
+            .iter()
+            .any(|g| g.name == format!("Group {n}"))
+        {
+            n += 1;
+        }
+        format!("Group {n}")
+    }
+
+    /// One group header: collapse and visibility toggles, inline rename,
+    /// move-active-in and ungroup actions, and an opacity slider while the
+    /// group is expanded. Requests land in `acts` so the panel can apply
+    /// them after the row loop.
+    fn group_header_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        depth: usize,
+        id: u32,
+        members: usize,
+        acts: &mut GroupRowActions,
+    ) {
+        let Some((name, visible, collapsed, opacity)) = self
+            .doc
+            .group(id)
+            .map(|g| (g.name.clone(), g.visible, g.collapsed, g.opacity))
+        else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            if ui
+                .small_button(if collapsed { "+" } else { "−" })
+                .on_hover_text(if collapsed {
+                    "Expand group"
+                } else {
+                    "Collapse group"
+                })
+                .clicked()
+            {
+                acts.collapse = Some(id);
+            }
+            let mut vis = visible;
+            if ui
+                .toggle_value(&mut vis, "👁")
+                .on_hover_text("Toggle group visibility")
+                .changed()
+            {
+                acts.eye = Some(id);
+            }
+            if self.group_renaming == Some(id) {
+                let resp = ui.text_edit_singleline(&mut self.group_name_edit);
+                if !resp.has_focus() {
+                    resp.request_focus();
+                }
+                let enter = ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
+                let mut commit = resp.lost_focus() || enter;
+                let mut cancel = false;
+                let (ok_label, x_label) = if self.has_symbols {
+                    ("✓", "✕")
+                } else {
+                    ("OK", "X")
+                };
+                if ui
+                    .add_sized([44.0, 28.0], egui::Button::new(ok_label))
+                    .clicked()
+                {
+                    commit = true;
+                }
+                if ui
+                    .add_sized([44.0, 28.0], egui::Button::new(x_label))
+                    .clicked()
+                {
+                    cancel = true;
+                }
+                if commit && !cancel {
+                    let edited = std::mem::take(&mut self.group_name_edit);
+                    acts.rename = Some((
+                        id,
+                        if edited.trim().is_empty() {
+                            name.clone()
+                        } else {
+                            edited
+                        },
+                    ));
+                }
+                if commit || cancel {
+                    self.group_renaming = None;
+                    self.group_name_edit.clear();
+                }
+            } else {
+                let hint = if members == 1 {
+                    "1 layer · tap to rename".to_string()
+                } else {
+                    format!("{members} layers · tap to rename")
+                };
+                if ui
+                    .selectable_label(false, &name)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.group_renaming = Some(id);
+                    self.group_name_edit = name.clone();
+                }
+            }
+            if members == 0 {
+                ui.weak("empty");
+            }
+            if ui
+                .small_button("+Add")
+                .on_hover_text("Move active layer into this group")
+                .clicked()
+            {
+                acts.add = Some(id);
+            }
+            if ui
+                .small_button("Ungroup")
+                .on_hover_text("Disband group (keeps layers)")
+                .clicked()
+            {
+                acts.ungroup = Some(id);
+            }
+        });
+        // Collapsed and empty groups keep a single line.
+        if !collapsed && members > 0 {
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
+                let mut op = opacity;
+                stepped_slider(ui, &mut op, 0.0..=1.0, 0.05, "Opacity");
+                if (op - opacity).abs() > f32::EPSILON {
+                    acts.opacity = Some((id, op));
+                }
+            });
+        }
+    }
+
     fn layers_panel_body(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let t = self.tokens(ui);
@@ -3739,163 +4003,34 @@ impl ProCraftApp {
                     } else {
                         ui.horizontal(|ui| self.layer_action_row(ui));
                     }
-                    if ui.button("New group").clicked() {
-                        let name = format!("Group {}", self.doc.groups.len() + 1);
-                        self.doc.new_group(name.clone());
-                        self.ghost_dirty = true;
-                        self.status = format!("{name} created.");
+                    if ui
+                        .button("New group")
+                        .on_hover_text("Group the active layer in a new group")
+                        .clicked()
+                    {
+                        let name = self.next_group_name();
+                        let layer_name = self.doc.layers[self.doc.active].name.clone();
+                        if self
+                            .doc
+                            .group_layer(self.doc.active, name.clone())
+                            .is_some()
+                        {
+                            self.ghost_dirty = true;
+                            self.status = format!("{name} created with {layer_name}.");
+                        }
                     }
                     let mut remove = None;
                     let mut select = None;
                     let mut touched = false;
-                    let mut grp_collapse = None;
-                    let mut grp_eye = None;
-                    let mut grp_add = None;
-                    let mut grp_ungroup = None;
-                    let mut grp_opacity: Option<(u32, f32)> = None;
-                    let mut grp_rename_commit: Option<(u32, String)> = None;
-                    // Ancestor chains (top-down group ids) per layer, computed up
-                    // front so the row loop can read them without borrowing.
-                    let chains: Vec<Vec<u32>> = (0..self.doc.layers.len())
-                        .map(|i| {
-                            let mut up = Vec::new();
-                            let mut seen = Vec::new();
-                            let mut g = self.doc.layers[i].group;
-                            while let Some(id) = g {
-                                if seen.contains(&id) {
-                                    break;
-                                }
-                                seen.push(id);
-                                let Some(gr) = self.doc.groups.iter().find(|x| x.id == id) else {
-                                    break;
-                                };
-                                up.push(id);
-                                g = gr.parent;
-                            }
-                            up.reverse();
-                            up
-                        })
-                        .collect();
-                    let is_collapsed = |doc: &Document, id: u32| {
-                        doc.groups
-                            .iter()
-                            .find(|g| g.id == id)
-                            .is_some_and(|g| g.collapsed)
-                    };
-                    let mut printed: Vec<u32> = Vec::new();
-                    for i in (0..self.doc.layers.len()).rev() {
-                        let chain = chains[i].clone();
-                        for (d, gid) in chain.iter().enumerate() {
-                            if printed.contains(gid) {
+                    let mut acts = GroupRowActions::default();
+                    for row in layer_panel_rows(&self.doc) {
+                        let (i, depth) = match row {
+                            LayerPanelRow::Group { id, depth, members } => {
+                                self.group_header_row(ui, depth, id, members, &mut acts);
                                 continue;
                             }
-                            // Headers parked under a collapsed ancestor stay hidden
-                            // with their subtree.
-                            if chain[..d].iter().any(|a| is_collapsed(&self.doc, *a)) {
-                                continue;
-                            }
-                            printed.push(*gid);
-                            let (gname, gvis, gcollapsed, gopacity) =
-                                match self.doc.groups.iter().find(|g| g.id == *gid) {
-                                    Some(g) => (g.name.clone(), g.visible, g.collapsed, g.opacity),
-                                    None => continue,
-                                };
-                            ui.horizontal(|ui| {
-                                ui.add_space(d as f32 * 12.0);
-                                if ui
-                                    .small_button(if gcollapsed { "+" } else { "−" })
-                                    .on_hover_text(if gcollapsed {
-                                        "Expand group"
-                                    } else {
-                                        "Collapse group"
-                                    })
-                                    .clicked()
-                                {
-                                    grp_collapse = Some(*gid);
-                                }
-                                let mut vis = gvis;
-                                if ui
-                                    .toggle_value(&mut vis, "👁")
-                                    .on_hover_text("Toggle group visibility")
-                                    .changed()
-                                {
-                                    grp_eye = Some(*gid);
-                                }
-                                if Some(*gid) == self.group_renaming {
-                                    let resp = ui.text_edit_singleline(&mut self.group_name_edit);
-                                    if !resp.has_focus() {
-                                        resp.request_focus();
-                                    }
-                                    let enter =
-                                        ui.ctx().input(|inp| inp.key_pressed(egui::Key::Enter));
-                                    let mut commit = resp.lost_focus() || enter;
-                                    let mut cancel = false;
-                                    let (ok_label, x_label) = if self.has_symbols {
-                                        ("✓", "✕")
-                                    } else {
-                                        ("OK", "X")
-                                    };
-                                    if ui
-                                        .add_sized([44.0, 28.0], egui::Button::new(ok_label))
-                                        .clicked()
-                                    {
-                                        commit = true;
-                                    }
-                                    if ui
-                                        .add_sized([44.0, 28.0], egui::Button::new(x_label))
-                                        .clicked()
-                                    {
-                                        cancel = true;
-                                    }
-                                    if commit && !cancel {
-                                        let name = std::mem::take(&mut self.group_name_edit);
-                                        grp_rename_commit = Some((
-                                            *gid,
-                                            if name.trim().is_empty() {
-                                                gname.clone()
-                                            } else {
-                                                name
-                                            },
-                                        ));
-                                    }
-                                    if commit || cancel {
-                                        self.group_renaming = None;
-                                        self.group_name_edit.clear();
-                                    }
-                                } else {
-                                    if ui.selectable_label(false, &gname).clicked() {
-                                        self.group_renaming = Some(*gid);
-                                        self.group_name_edit = gname.clone();
-                                    }
-                                }
-                                if ui
-                                    .small_button("+Add")
-                                    .on_hover_text("Move active layer into this group")
-                                    .clicked()
-                                {
-                                    grp_add = Some(*gid);
-                                }
-                                if ui
-                                    .small_button("Ungroup")
-                                    .on_hover_text("Disband group (keeps layers)")
-                                    .clicked()
-                                {
-                                    grp_ungroup = Some(*gid);
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.add_space(d as f32 * 12.0);
-                                let mut gop = gopacity;
-                                stepped_slider(ui, &mut gop, 0.0..=1.0, 0.05, "Opacity");
-                                if (gop - gopacity).abs() > f32::EPSILON {
-                                    grp_opacity = Some((*gid, gop));
-                                }
-                            });
-                        }
-                        if chain.iter().any(|id| is_collapsed(&self.doc, *id)) {
-                            continue;
-                        }
-                        let depth = chain.len();
+                            LayerPanelRow::Layer { index, depth } => (index, depth),
+                        };
                         let layer = &mut self.doc.layers[i];
                         ui.horizontal(|ui| {
                             ui.add_space(depth as f32 * 12.0);
@@ -3984,7 +4119,7 @@ impl ProCraftApp {
                             self.status = "Active layer is in a hidden group.".to_string();
                         }
                     }
-                    if let Some(gid) = grp_collapse {
+                    if let Some(gid) = acts.collapse {
                         let cur = self
                             .doc
                             .groups
@@ -3993,7 +4128,7 @@ impl ProCraftApp {
                             .is_some_and(|g| g.collapsed);
                         self.doc.set_group_collapsed(gid, !cur);
                     }
-                    if let Some(gid) = grp_eye {
+                    if let Some(gid) = acts.eye {
                         let cur = self
                             .doc
                             .groups
@@ -4004,24 +4139,27 @@ impl ProCraftApp {
                         self.ghost_dirty = true;
                         self.doc.mark_full_dirty();
                     }
-                    if let Some(gid) = grp_add {
+                    if let Some(gid) = acts.add {
                         let active = self.doc.active;
                         self.doc.move_layer_into_group(active, Some(gid));
                         self.ghost_dirty = true;
-                        self.status = "Active layer moved into the group.".to_string();
+                        self.status = format!(
+                            "{} moved into the group.",
+                            self.doc.layers[self.doc.active].name
+                        );
                     }
-                    if let Some(gid) = grp_ungroup {
+                    if let Some(gid) = acts.ungroup {
                         self.doc.ungroup(gid);
                         self.ghost_dirty = true;
                         self.doc.mark_full_dirty();
                         self.status = "Group disbanded (layers kept).".to_string();
                     }
-                    if let Some((gid, op)) = grp_opacity {
+                    if let Some((gid, op)) = acts.opacity {
                         self.doc.set_group_opacity(gid, op);
                         self.ghost_dirty = true;
                         self.doc.mark_full_dirty();
                     }
-                    if let Some((gid, name)) = grp_rename_commit {
+                    if let Some((gid, name)) = acts.rename {
                         self.doc.rename_group(gid, name);
                     }
                     if touched {
@@ -15112,6 +15250,92 @@ mod tests {
             );
         }
         assert_eq!((8192u32.div_ceil(procraft_engine::TILE)).pow(2), 1024);
+    }
+
+    #[test]
+    fn layer_panel_rows_keep_empty_groups_visible() {
+        let mut doc = Document::new(8, 8);
+        let g = doc.new_group("Empty".to_string());
+        let rows = layer_panel_rows(&doc);
+        assert!(rows.contains(&LayerPanelRow::Group {
+            id: g,
+            depth: 0,
+            members: 0
+        }));
+        // The layer list still follows, so the group row is not a dead end.
+        assert_eq!(
+            rows.last(),
+            Some(&LayerPanelRow::Layer { index: 0, depth: 0 })
+        );
+    }
+
+    #[test]
+    fn layer_panel_rows_indent_members_under_their_group() {
+        let mut doc = Document::new(8, 8);
+        doc.add_layer("top".to_string());
+        let outer = doc.new_group("outer".to_string());
+        doc.move_layer_into_group(1, Some(outer));
+        let inner = doc.group_layer(1, "inner".to_string()).unwrap();
+        assert_eq!(
+            layer_panel_rows(&doc),
+            vec![
+                LayerPanelRow::Group {
+                    id: outer,
+                    depth: 0,
+                    members: 1
+                },
+                LayerPanelRow::Group {
+                    id: inner,
+                    depth: 1,
+                    members: 1
+                },
+                LayerPanelRow::Layer { index: 1, depth: 2 },
+                LayerPanelRow::Layer { index: 0, depth: 0 },
+            ]
+        );
+        // A collapsed group keeps its own header but hides the subtree.
+        doc.set_group_collapsed(outer, true);
+        assert_eq!(
+            layer_panel_rows(&doc),
+            vec![
+                LayerPanelRow::Group {
+                    id: outer,
+                    depth: 0,
+                    members: 1
+                },
+                LayerPanelRow::Layer { index: 0, depth: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn layer_panel_rows_show_empty_children_under_their_parent() {
+        let mut doc = Document::new(8, 8);
+        let parent = doc.new_group("parent".to_string());
+        doc.move_layer_into_group(0, Some(parent));
+        let empty = doc.new_group("empty".to_string());
+        doc.groups
+            .iter_mut()
+            .find(|g| g.id == empty)
+            .unwrap()
+            .parent = Some(parent);
+        let rows = layer_panel_rows(&doc);
+        assert_eq!(
+            rows,
+            vec![
+                LayerPanelRow::Group {
+                    id: parent,
+                    depth: 0,
+                    members: 1
+                },
+                LayerPanelRow::Group {
+                    id: empty,
+                    depth: 1,
+                    members: 0
+                },
+                LayerPanelRow::Layer { index: 0, depth: 1 },
+            ]
+        );
     }
 
     #[test]

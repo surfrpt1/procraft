@@ -791,6 +791,25 @@ impl Document {
     /// Create an empty top-level group and return its id. Structural like
     /// add/remove layer: not undoable, marks the view dirty.
     pub fn new_group(&mut self, name: String) -> u32 {
+        self.push_group(name, None)
+    }
+
+    /// Create a group around one layer and move it in, preserving the
+    /// stacking order. The group nests inside the layer's current group
+    /// (like Photoshop's Group from Layers). Out-of-range indexes change
+    /// nothing and return `None`.
+    pub fn group_layer(&mut self, index: usize, name: String) -> Option<u32> {
+        let parent = self.layers.get(index)?.group;
+        if let Some(id) = parent {
+            self.group(id)?;
+        }
+        let id = self.push_group(name, parent);
+        self.layers[index].group = Some(id);
+        self.mark_full_dirty();
+        Some(id)
+    }
+
+    fn push_group(&mut self, name: String, parent: Option<u32>) -> u32 {
         // Ids start at 1; 0 always reads as "no group".
         let id = self.next_group_id.max(1);
         self.next_group_id = id.saturating_add(1).max(1);
@@ -800,7 +819,7 @@ impl Document {
             visible: true,
             collapsed: false,
             opacity: 1.0,
-            parent: None,
+            parent,
         });
         self.mark_full_dirty();
         id
@@ -4065,6 +4084,46 @@ mod tests {
         doc.ungroup(outer);
         assert!(doc.groups.is_empty());
         assert!(doc.layers.iter().all(|l| l.group.is_none()));
+    }
+
+    #[test]
+    fn group_layer_wraps_a_layer_in_place() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("mid".to_string());
+        doc.add_layer("top".to_string());
+        doc.active = 1;
+        let g = doc
+            .group_layer(1, "Group 1".to_string())
+            .expect("layer 1 groups");
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert!(doc
+            .group(g)
+            .is_some_and(|gr| gr.parent.is_none() && !gr.collapsed && gr.visible));
+        // Grouping must not restack the canvas.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "mid", "top"]);
+        assert_eq!(doc.active, 1);
+        // Out-of-range indexes are a no-op, not a panic.
+        let before = doc.groups.len();
+        assert!(doc.group_layer(99, "nope".to_string()).is_none());
+        assert_eq!(doc.groups.len(), before);
+    }
+
+    #[test]
+    fn group_layer_nests_inside_the_parent_group() {
+        let mut doc = Document::new(1, 1);
+        let outer = doc.new_group("outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc
+            .group_layer(0, "inner".to_string())
+            .expect("layer 0 groups");
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        assert_eq!(doc.layers[0].group, Some(inner));
+        // The outer group now only holds the nested group, not the layer.
+        assert_eq!(
+            doc.layers.iter().filter(|l| l.group == Some(outer)).count(),
+            0
+        );
     }
 
     #[test]
