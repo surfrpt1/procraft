@@ -2020,12 +2020,12 @@ git commit -m "perf(engine): tilebench and 8K measurements"
 `cargo run --release -p procraft-engine --example tilebench` (release build). Tile
 figures are one 256² centre tile, 20 repetitions averaged; `flatten` is a single
 full pass (n = 1). Every layer holds a full 256² patch in that tile — the fill is
-dense on purpose, because the compositor skips pixels whose accumulated alpha is
+dense on purpose, because the compositor skips a layer whose effective alpha is
 0, so a sparse patch would measure fast paths rather than a solid tile. 100L
 therefore measures 100 blended layers, not empty-tile fast paths. Two consecutive
 runs agreed within ~1.6 % on the tile figures and within ~3 % on the 8K/100L
-`flatten` (a single pass, so it moves more: 22.0–23.5 s across consecutive runs on
-this 15 W host).
+`flatten` (a single pass, so it moves more: 22.0–22.7 s across those two runs;
+~7 % across five runs on this 15 W host).
 
 | Date | Host | 4K / 1L tile | 4K / 100L tile | 8K / 1L tile | 8K / 100L tile | 8K flatten (100L) |
 |---|---|---|---|---|---|---|

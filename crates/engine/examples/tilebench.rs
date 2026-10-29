@@ -24,9 +24,9 @@ fn bench(side: u32, layers: usize) -> (f64, f64, usize) {
         layer.opacity = 0.6;
         // One full 256² patch of content per layer, all in the centre tile,
         // so 100 layers cost 25 MB instead of 25 GB. The fill has to be
-        // dense: `composite_tile` early-outs per pixel once the accumulated
-        // alpha is 0, so a sparse patch would time mostly fast paths and
-        // the tile column would be an optimistic bound, not a solid tile.
+        // dense: `composite_tile` skips a layer where the effective alpha
+        // is 0, so a sparse patch would time mostly fast paths and the
+        // tile column would be an optimistic bound, not a solid tile.
         for y in py0..(py0 + TILE).min(side) {
             for x in px0..(px0 + TILE).min(side) {
                 layer
