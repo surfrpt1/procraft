@@ -1806,7 +1806,7 @@ mod tests {
             ..Brush::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 16.0, 16.0);
-        doc.layers[0].pixels.clone()
+        doc.layers[0].pixels.to_dense()
     }
 
     #[test]

@@ -720,7 +720,10 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
-                layer_mask.set(o, (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8);
+                layer_mask.set(
+                    o,
+                    (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8,
+                );
             }
         }
     }
@@ -846,7 +849,10 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
-                layer_mask.set(o, (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8);
+                layer_mask.set(
+                    o,
+                    (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8,
+                );
             }
         }
     }
@@ -2381,9 +2387,7 @@ impl Document {
             // Store only where the buffer exists (see `slot`).
             if let Some(o) = slot(cx, cy) {
                 if o + 3 < layer.pixels.len() {
-                    layer
-                        .pixels
-                        .set4(o, blend_over(content, color, opacity));
+                    layer.pixels.set4(o, blend_over(content, color, opacity));
                     any = true;
                 }
             }
@@ -2458,9 +2462,7 @@ impl Document {
                         if let Some(o) = slot(nx, ny) {
                             if o + 3 < layer.pixels.len() {
                                 let px = layer.pixels.get4(o);
-                                if px[3] >= 128
-                                    && px[0].max(px[1]).max(px[2]) < barrier
-                                {
+                                if px[3] >= 128 && px[0].max(px[1]).max(px[2]) < barrier {
                                     is_open = false;
                                 }
                             }
@@ -2526,9 +2528,7 @@ impl Document {
                     if let Some(o) = slot(nx, ny) {
                         if o + 3 < layer.pixels.len() {
                             let content = layer.pixels.get4(o);
-                            layer
-                                .pixels
-                                .set4(o, blend_over(content, color, opacity));
+                            layer.pixels.set4(o, blend_over(content, color, opacity));
                             any = true;
                         }
                     }
@@ -2914,19 +2914,25 @@ mod tests {
         // core: it never paints through line art.
         let pale_halo = |d: &Document| {
             d.layers[0]
-                .pixels.to_dense().chunks(4)
+                .pixels
+                .to_dense()
+                .chunks(4)
                 .filter(|p| (153..=222).contains(&p[0]))
                 .count()
         };
         let dark_ramp = |d: &Document| {
             d.layers[0]
-                .pixels.to_dense().chunks(4)
+                .pixels
+                .to_dense()
+                .chunks(4)
                 .filter(|p| (1..=152).contains(&p[0]))
                 .count()
         };
         let black_core = |d: &Document| {
             d.layers[0]
-                .pixels.to_dense().chunks(4)
+                .pixels
+                .to_dense()
+                .chunks(4)
                 .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
                 .count()
         };
@@ -3007,7 +3013,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 10.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4) as usize + 3);
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4) as usize + 3);
         assert!(at(&doc, 2, 10) > 0);
         assert_eq!(at(&doc, 18, 10), 0);
         // Horizontal: mirrored left-right.
@@ -3066,9 +3073,17 @@ mod tests {
             let mut doc = Document::new(48, 48);
             doc.fill_poly(&brush, Color::rgb(0, 255, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
             let mid = ((24 * 48 + 24) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels.get(mid + 3), 255, "{kind:?} fill middle");
+            assert_eq!(
+                doc.layers[0].pixels.get(mid + 3),
+                255,
+                "{kind:?} fill middle"
+            );
             let corner = ((2 * 48 + 2) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels.get(corner + 3), 0, "{kind:?} fill corner");
+            assert_eq!(
+                doc.layers[0].pixels.get(corner + 3),
+                0,
+                "{kind:?} fill corner"
+            );
         }
         // Polygon sides clamp: 2 behaves like a triangle, 99 like 12.
         let mut doc = Document::new(48, 48);
@@ -3157,7 +3172,9 @@ mod tests {
         // Eraser removes alpha (destination-out); color bytes of fully
         // transparent pixels are intentionally left alone.
         assert!(doc.layers[0]
-            .pixels.to_dense().iter()
+            .pixels
+            .to_dense()
+            .iter()
             .skip(3)
             .step_by(4)
             .all(|&b| b == 0));
@@ -3457,7 +3474,11 @@ mod tests {
             tail,
             0.0,
         );
-        let alpha = |x: u32| doc.layers[0].pixels.get(((100 * doc.w + x) * 4 + 3) as usize);
+        let alpha = |x: u32| {
+            doc.layers[0]
+                .pixels
+                .get(((100 * doc.w + x) * 4 + 3) as usize)
+        };
         let gap = (20..=220).find(|&x| alpha(x) == 0);
         assert_eq!(gap, None, "first tapered-tail gap at x={gap:?}");
     }
@@ -3484,7 +3505,9 @@ mod tests {
             dyn_,
             0.0,
         );
-        let alpha = doc.layers[0].pixels.get(((16 * doc.w + 28) * 4 + 3) as usize);
+        let alpha = doc.layers[0]
+            .pixels
+            .get(((16 * doc.w + 28) * 4 + 3) as usize);
         assert!(alpha > 0, "short segment endpoint alpha {alpha}");
     }
 
@@ -3561,7 +3584,9 @@ mod tests {
 
     fn alpha_sum(doc: &Document) -> u64 {
         doc.layers[0]
-            .pixels.to_dense().iter()
+            .pixels
+            .to_dense()
+            .iter()
             .skip(3)
             .step_by(4)
             .map(|&b| b as u64)
@@ -4283,7 +4308,9 @@ mod tests {
             };
             doc.dab(&brush, Color::rgb(255, 255, 255), 11.5, 11.5);
             doc.layers[0]
-                .pixels.to_dense().iter()
+                .pixels
+                .to_dense()
+                .iter()
                 .skip(3)
                 .step_by(4)
                 .map(|&a| a as u32)
@@ -4309,7 +4336,12 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 255, 255), 7.5, 7.5);
-        let on = doc.layers[0].pixels.to_dense().iter().filter(|&&b| b != 0).count();
+        let on = doc.layers[0]
+            .pixels
+            .to_dense()
+            .iter()
+            .filter(|&&b| b != 0)
+            .count();
         let mut plain = Document::new(16, 16);
         plain.dab(
             &Brush {
@@ -4322,7 +4354,12 @@ mod tests {
             7.5,
             7.5,
         );
-        let full = plain.layers[0].pixels.to_dense().iter().filter(|&&b| b != 0).count();
+        let full = plain.layers[0]
+            .pixels
+            .to_dense()
+            .iter()
+            .filter(|&&b| b != 0)
+            .count();
         assert!(full > 0 && on < full, "full={full} dual={on}");
     }
 

@@ -1755,9 +1755,9 @@ impl Document {
                 if out_a > 0.0 {
                     for (ch, sc) in [sr, sg, sb].iter().enumerate() {
                         let blended = src.blend.apply(*sc as f32, dst_px[o + ch] as f32);
-                        dst_px[o + ch] =
-                            ((blended * sa + dst_px[o + ch] as f32 * da * (1.0 - sa)) / out_a)
-                                .round() as u8;
+                        dst_px[o + ch] = ((blended * sa + dst_px[o + ch] as f32 * da * (1.0 - sa))
+                            / out_a)
+                            .round() as u8;
                     }
                     dst_px[o + 3] = (out_a * 255.0).round() as u8;
                 }
@@ -2546,7 +2546,12 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let blurred = Self::box_blur(&self.layers[index].pixels.to_dense(), w, h, radius.min(25) as i32);
+        let blurred = Self::box_blur(
+            &self.layers[index].pixels.to_dense(),
+            w,
+            h,
+            radius.min(25) as i32,
+        );
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
         let mut pixels = self.layers[index].pixels.to_dense();
@@ -4493,9 +4498,12 @@ mod tests {
 
     #[test]
     fn undo_byte_budget_binds_on_large_canvas() {
-        // 2048x2048 RGBA = 16 MiB per step: the 256 MiB budget caps at 16,
-        // well under the 32-count backstop.
+        // 2048x2048 RGBA of allocated tiles = 16 MiB per step: the 256 MiB
+        // budget caps at 16, well under the 32-count backstop.
         let mut doc = Document::new(2048, 2048);
+        // Touch every tile first: a blank layer holds no tiles now, so only
+        // real storage can make the byte budget bind.
+        doc.layers[0].pixels.fill(255);
         for _ in 0..40 {
             doc.checkpoint();
         }
@@ -4529,9 +4537,12 @@ mod tests {
     fn mask_multiplies_layer_alpha() {
         let mut doc = Document::new(4, 1);
         doc.background = [255, 255, 255, 255];
-        doc.layers[0].pixels = px_rgba(&doc, &(vec![
-            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-        ]));
+        doc.layers[0].pixels = px_rgba(
+            &doc,
+            &(vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ]),
+        );
         doc.add_mask(0);
         // Conceal the left half.
         if let Some(m) = doc.layers[0].mask.as_mut() {
@@ -4846,7 +4857,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 5.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
         assert!(at(&doc, 2, 5) > 0);
         assert!(at(&doc, 8, 5) > 0);
         assert_eq!(at(&doc, 18, 5), 0);
@@ -5153,7 +5165,12 @@ mod tests {
         let count: usize = before.to_dense().chunks(4).filter(|p| p[3] != 0).count();
         doc.affine_layer(0, 1.0, 90.0);
         assert_eq!(
-            doc.layers[0].pixels.to_dense().chunks(4).filter(|p| p[3] != 0).count(),
+            doc.layers[0]
+                .pixels
+                .to_dense()
+                .chunks(4)
+                .filter(|p| p[3] != 0)
+                .count(),
             count
         );
         // Four quarter-turns return every byte exactly.
@@ -5236,7 +5253,11 @@ mod tests {
         let o = ((4 * 8 + 4) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
         assert_eq!(
-            doc.layers[0].mask.as_ref().unwrap().get((4 * 8 + 4) as usize),
+            doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .get((4 * 8 + 4) as usize),
             255
         );
         // Bad grid (wrong point count) is a silent no-op.
@@ -5292,7 +5313,11 @@ mod tests {
         let d = ((2 * 8 + 2) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get4(d), [255, 0, 0, 255]);
         assert_eq!(
-            doc.layers[0].mask.as_ref().unwrap().get((2 * 8 + 2) as usize),
+            doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .get((2 * 8 + 2) as usize),
             255
         );
         assert_eq!(doc.layers[0].pixels.get(o + 3), 0);
@@ -5332,8 +5357,12 @@ mod tests {
     fn content_bounds_covers_the_painted_pixels() {
         let mut doc = Document::new(8, 8);
         assert_eq!(doc.content_bounds(0), None);
-        doc.layers[0].pixels.set(((3 * 8 + 2) * 4 + 3) as usize, 255);
-        doc.layers[0].pixels.set(((5 * 8 + 6) * 4 + 3) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((3 * 8 + 2) * 4 + 3) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((5 * 8 + 6) * 4 + 3) as usize, 255);
         assert_eq!(doc.content_bounds(0), Some((2.0, 3.0, 6.0, 5.0)));
         assert_eq!(doc.content_bounds(9), None);
     }
@@ -5362,10 +5391,13 @@ mod tests {
         assert_eq!(doc.layers[0].pixels, before);
         // Single opaque dot on transparency spreads out.
         let mut doc = Document::new(9, 9);
-        doc.layers[0].pixels.set(((4 * 9 + 4) * 4 + 3) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((4 * 9 + 4) * 4 + 3) as usize, 255);
         doc.layers[0].pixels.set(((4 * 9 + 4) * 4) as usize, 255);
         doc.blur_layer(0, 2);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 9 + x) * 4 + 3) as usize);
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 9 + x) * 4 + 3) as usize);
         assert!(at(&doc, 4, 4) < 255);
         assert!(at(&doc, 5, 4) > 0);
         assert_eq!(at(&doc, 0, 0), 0);
@@ -5434,7 +5466,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 14.5, 10.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
         for (x, y) in [(14, 10), (10, 14), (6, 10), (10, 6)] {
             assert!(at(&doc, x, y) > 0, "missing dab at {x},{y}");
         }
@@ -5911,7 +5944,8 @@ mod tests {
         };
         doc.checkpoint();
         assert!(doc.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 12 + x) * 4) as usize + 3);
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 12 + x) * 4) as usize + 3);
         // Edge pixels painted, deep interior untouched.
         assert!(at(&doc, 2, 4) > 0);
         assert!(at(&doc, 7, 7) > 0);
@@ -6127,7 +6161,10 @@ mod tests {
         doc.adjust_hsl(0, 180.0, 2.0, 0.0);
         let o = 20usize;
         assert_eq!(doc.layers[0].pixels.get(o), doc.layers[0].pixels.get(o + 1));
-        assert_eq!(doc.layers[0].pixels.get(o + 1), doc.layers[0].pixels.get(o + 2));
+        assert_eq!(
+            doc.layers[0].pixels.get(o + 1),
+            doc.layers[0].pixels.get(o + 2)
+        );
         doc.adjust_hsl(0, 0.0, 1.0, 1.0);
         assert_eq!(doc.layers[0].pixels.get(o), 255);
         // Pure red rotated +120 lands on green.
@@ -6276,7 +6313,9 @@ mod tests {
         }
         let mut doc = Document::new(32, 32);
         // Deterministic pseudo-random paint so any region-copy slip shows.
-        let bytes: Vec<u8> = (0..32 * 32 * 4).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let bytes: Vec<u8> = (0..32 * 32 * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
         // Reach (|d| = 11.4) far beyond the disc: samples come from the
         // ring outside the write bbox.
@@ -6368,7 +6407,9 @@ mod tests {
         let mut doc = Document::new(32, 32);
         // Paint a marker, move the layer, absorb where the marker shows.
         doc.layers[0].pixels.set(((4 * 32 + 4) * 4) as usize, 255);
-        doc.layers[0].pixels.set(((4 * 32 + 4) * 4 + 3) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((4 * 32 + 4) * 4 + 3) as usize, 255);
         doc.translate_layer(0, 10, 0);
         // Canvas (0,4) maps outside the buffer: slide home, marker rides
         // along and still shows at canvas (14,4).
@@ -6563,15 +6604,11 @@ mod tests {
         );
         assert!(doc.undo());
         assert_eq!(
-            doc.layers[0]
-                .pixels
-                .get4(((550 * 600 + 550) * 4) as usize),
+            doc.layers[0].pixels.get4(((550 * 600 + 550) * 4) as usize),
             [0; 4]
         );
         assert_eq!(
-            doc.layers[0]
-                .pixels
-                .get(((10 * 600 + 10) * 4 + 3) as usize),
+            doc.layers[0].pixels.get(((10 * 600 + 10) * 4 + 3) as usize),
             255
         );
     }

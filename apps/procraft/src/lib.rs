@@ -15,8 +15,8 @@ use procraft_engine::{
     size_drag_factor, starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId,
     AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
     DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
-    Settings, ShapePoly, Shortcuts, SizeDragMode, SymmetryMode, TapAction, TextBlock, TextStyle,
-    ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES,
+    Raster, Settings, ShapePoly, Shortcuts, SizeDragMode, SymmetryMode, TapAction, TextBlock,
+    TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES,
     MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES,
     MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
     SETTINGS_VERSION,
@@ -356,7 +356,7 @@ impl ShapeKind {
 struct FillPreview {
     layer: usize,
     seed: (u32, u32),
-    pixels: Vec<u8>,
+    pixels: Raster,
     color: Color,
     opacity: f32,
     start_x: f32,
@@ -387,7 +387,7 @@ fn fill_from_baseline(doc: &mut Document, fp: &mut FillPreview, tolerance: u8, g
     doc.flood_fill(&brush, fp.color, fp.seed.0, fp.seed.1, tolerance, grow);
     fp.applied = tolerance;
     if let Some(layer) = doc.layers.get(fp.layer) {
-        fp.live_hash = pixels_hash(&layer.pixels);
+        fp.live_hash = layer.pixels.fingerprint();
     }
 }
 
@@ -411,7 +411,7 @@ struct FilterPreview {
     /// 5 = HSL, 6 = balance, 7 = recolor.
     kind: u8,
     layer: usize,
-    pixels: Vec<u8>,
+    pixels: Raster,
     last: std::time::Instant,
     stale: bool,
     /// Fingerprint of the layer right after our last apply (or of the
@@ -1828,7 +1828,7 @@ impl ProCraftApp {
             .doc
             .layers
             .get(fp.layer)
-            .is_some_and(|l| pixels_hash(&l.pixels) == fp.live_hash);
+            .is_some_and(|l| l.pixels.fingerprint() == fp.live_hash);
         if !layer_ok || !fill_context_matches(&self.doc, &fp) {
             return;
         }
@@ -2106,7 +2106,8 @@ impl ProCraftApp {
                 ..preset
             };
             paint_preview_stroke(&mut doc, &brush, ink);
-            let img = ColorImage::from_rgba_unmultiplied([144, 36], &doc.layers[0].pixels.clone());
+            let img =
+                ColorImage::from_rgba_unmultiplied([144, 36], &doc.layers[0].pixels.to_dense());
             self.preset_textures.push(ctx.load_texture(
                 format!("brush-{idx}"),
                 img,
@@ -5910,7 +5911,7 @@ impl ProCraftApp {
         // last apply left behind (or the snapshot on a fresh preview).
         let expired = match &self.filter_preview {
             Some(fp) => match self.doc.layers.get(fp.layer) {
-                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                Some(l) => l.pixels.fingerprint() != fp.live_hash,
                 None => true,
             },
             None => false,
@@ -5934,7 +5935,7 @@ impl ProCraftApp {
             self.doc.checkpoint();
             match self.doc.layers.get(layer) {
                 Some(l) => {
-                    let live_hash = pixels_hash(&l.pixels);
+                    let live_hash = l.pixels.fingerprint();
                     self.filter_preview = Some(FilterPreview {
                         kind,
                         layer,
@@ -5961,11 +5962,11 @@ impl ProCraftApp {
                 return;
             }
             if let Some(l) = self.doc.layers.get_mut(fp.layer) {
-                l.pixels = fp.pixels.clone();
+                l.pixels.clone_from(&fp.pixels);
             }
             apply(&mut self.doc, fp.layer);
             if let Some(l) = self.doc.layers.get(fp.layer) {
-                fp.live_hash = pixels_hash(&l.pixels);
+                fp.live_hash = l.pixels.fingerprint();
             }
             fp.last = std::time::Instant::now();
             fp.stale = false;
@@ -5985,7 +5986,7 @@ impl ProCraftApp {
         }
         let expired = match &self.filter_preview {
             Some(fp) => match self.doc.layers.get(fp.layer) {
-                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                Some(l) => l.pixels.fingerprint() != fp.live_hash,
                 None => true,
             },
             None => return,
@@ -6002,11 +6003,11 @@ impl ProCraftApp {
         if let Some(mut fp) = self.filter_preview.take() {
             if self.doc.layers.get(fp.layer).is_some() {
                 if let Some(l) = self.doc.layers.get_mut(fp.layer) {
-                    l.pixels = fp.pixels.clone();
+                    l.pixels.clone_from(&fp.pixels);
                 }
                 apply(&mut self.doc, fp.layer);
                 if let Some(l) = self.doc.layers.get(fp.layer) {
-                    fp.live_hash = pixels_hash(&l.pixels);
+                    fp.live_hash = l.pixels.fingerprint();
                 }
             }
             self.filter_preview = Some(fp);
@@ -7773,8 +7774,8 @@ enum XformApply {
 /// permanently lose content pushed off-canvas. Dropped by re-arming,
 /// re-captured whenever the document or layer changes behind it.
 struct XformBase {
-    pixels: Vec<u8>,
-    mask: Option<Vec<u8>>,
+    pixels: Raster,
+    mask: Option<Raster>,
     layer: usize,
     pins: Vec<(f32, f32)>,
     /// Canvas anchors the base topology was built with (pins already
@@ -8635,8 +8636,8 @@ fn wrap_degrees(deg: f32) -> f32 {
 /// Re-captured whenever the document changes behind it (painting, undo,
 /// pin drags) so sessions never fight each other.
 struct TformBase {
-    pixels: Vec<u8>,
-    mask: Option<Vec<u8>>,
+    pixels: Raster,
+    mask: Option<Raster>,
     layer: usize,
     rev: u64,
     ox: i32,
@@ -8744,6 +8745,19 @@ fn flip_buf_v(buf: &mut [u8], w: usize, h: usize, stride: usize) {
     }
 }
 
+/// Flip a raster in place through the dense bridge: the transform session's
+/// exact pixel permutation works on whole buffers, not tiles.
+fn flip_raster(r: &mut Raster, horizontal: bool) {
+    let (w, h, bpp) = (r.w() as usize, r.h() as usize, r.bpp());
+    let mut d = r.to_dense();
+    if horizontal {
+        flip_buf_h(&mut d, w, h, bpp);
+    } else {
+        flip_buf_v(&mut d, w, h, bpp);
+    }
+    r.replace_dense(&d);
+}
+
 /// Apply one Transform-layer press: compose it onto the session and
 /// re-apply everything from the pristine base in a single pass. Flips
 /// are exact pixel permutations; scale/rotation reuse
@@ -8799,7 +8813,6 @@ fn tform_apply(doc: &mut Document, t: &mut TformPress, op: TformOp, live: bool) 
     }
     // Swap the pristine base in (offsets included), apply the flips as
     // exact permutations, then the scale/rotation resample over it.
-    let (w, h) = (doc.w as usize, doc.h as usize);
     {
         let b = t.base.as_ref().expect("base captured above");
         let layer = &mut doc.layers[active];
@@ -8808,16 +8821,16 @@ fn tform_apply(doc: &mut Document, t: &mut TformPress, op: TformOp, live: bool) 
         layer.ox = b.ox;
         layer.oy = b.oy;
         if t.flip_h {
-            flip_buf_h(&mut layer.pixels, w, h, 4);
+            flip_raster(&mut layer.pixels, true);
             if let Some(m) = layer.mask.as_mut() {
-                flip_buf_h(m, w, h, 1);
+                flip_raster(m, true);
             }
             layer.ox = -layer.ox;
         }
         if t.flip_v {
-            flip_buf_v(&mut layer.pixels, w, h, 4);
+            flip_raster(&mut layer.pixels, false);
             if let Some(m) = layer.mask.as_mut() {
-                flip_buf_v(m, w, h, 1);
+                flip_raster(m, false);
             }
             layer.oy = -layer.oy;
         }
@@ -11410,7 +11423,7 @@ impl eframe::App for ProCraftApp {
                                         .doc
                                         .layers
                                         .get(fp.layer)
-                                        .is_some_and(|l| pixels_hash(&l.pixels) == fp.live_hash)
+                                        .is_some_and(|l| l.pixels.fingerprint() == fp.live_hash)
                                     && fill_context_matches(&self.doc, fp)
                             });
                             if same_live {
@@ -11456,7 +11469,7 @@ impl eframe::App for ProCraftApp {
                                     .doc
                                     .layers
                                     .get(layer)
-                                    .map(|l| pixels_hash(&l.pixels))
+                                    .map(|l| l.pixels.fingerprint())
                                     .unwrap_or_default();
                                 self.fill_preview = Some(FillPreview {
                                     layer,
@@ -11486,7 +11499,7 @@ impl eframe::App for ProCraftApp {
                             // layer changed underneath (paint, undo, layer
                             // op…), drop the sweep instead of wiping work.
                             let expired = match self.doc.layers.get(fp.layer) {
-                                Some(l) => pixels_hash(&l.pixels) != fp.live_hash,
+                                Some(l) => l.pixels.fingerprint() != fp.live_hash,
                                 None => true,
                             };
                             if expired {
@@ -13364,7 +13377,7 @@ mod tests {
         // at (4,4) must show at (6,4) after the solved warp.
         let mut doc = Document::new(8, 8);
         let o = ((4 * 8 + 4) * 4) as usize;
-        doc.layers[0].pixels[o..o + 4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(o, [255, 0, 0, 255]);
         let from = vec![
             (0.0, 0.0),
             (4.0, 0.0),
@@ -13381,7 +13394,7 @@ mod tests {
         let grid = pull_grid(&pins, &from, 8.0, 8.0, 2, 2).expect("non-degenerate pins solve");
         doc.warp_layer(doc.active, 2, 2, &grid);
         let o = ((4 * 8 + 6) * 4) as usize;
-        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
     }
 
     #[test]
@@ -13784,15 +13797,15 @@ mod tests {
     /// 8x8 layer with a solid opaque 4x4 red square at (2..6, 2..6).
     fn xform_test_doc() -> Document {
         let mut doc = Document::new(8, 8);
-        let l = &mut doc.layers[0];
-        l.pixels = vec![0u8; 8 * 8 * 4];
+        let mut dense = vec![0u8; 8 * 8 * 4];
         for y in 2..6 {
             for x in 2..6 {
                 let i = (y * 8 + x) * 4;
-                l.pixels[i] = 255;
-                l.pixels[i + 3] = 255;
+                dense[i] = 255;
+                dense[i + 3] = 255;
             }
         }
+        doc.layers[0].pixels = Raster::from_dense(8, 8, 4, &dense);
         doc
     }
 
@@ -13800,15 +13813,15 @@ mod tests {
     /// content bounds (1, 1, 14, 14) after the 3px frame pad.
     fn xform_test_doc16() -> Document {
         let mut doc = Document::new(16, 16);
-        let l = &mut doc.layers[0];
-        l.pixels = vec![0u8; 16 * 16 * 4];
+        let mut dense = vec![0u8; 16 * 16 * 4];
         for y in 4..12 {
             for x in 4..12 {
                 let i = (y * 16 + x) * 4;
-                l.pixels[i] = 255;
-                l.pixels[i + 3] = 255;
+                dense[i] = 255;
+                dense[i + 3] = 255;
             }
         }
+        doc.layers[0].pixels = Raster::from_dense(16, 16, 4, &dense);
         doc
     }
 
@@ -13816,26 +13829,27 @@ mod tests {
     /// anchors, so the whole canvas is one rigid mesh.
     fn xform_test_doc_full() -> Document {
         let mut doc = Document::new(8, 8);
-        let l = &mut doc.layers[0];
-        l.pixels = vec![0u8; 8 * 8 * 4];
-        for p in l.pixels.chunks_mut(4) {
+        let mut dense = vec![0u8; 8 * 8 * 4];
+        for p in dense.chunks_mut(4) {
             p[0] = 255;
             p[3] = 255;
         }
+        doc.layers[0].pixels = Raster::from_dense(8, 8, 4, &dense);
         doc
     }
 
     fn xform_alpha(doc: &Document, x: usize, y: usize) -> u8 {
-        doc.layers[0].pixels[(y * 8 + x) * 4 + 3]
+        doc.layers[0].pixels.get((y * 8 + x) * 4 + 3)
     }
 
     fn xform_alpha16(doc: &Document, layer: usize, x: usize, y: usize) -> u8 {
-        doc.layers[layer].pixels[(y * 16 + x) * 4 + 3]
+        doc.layers[layer].pixels.get((y * 16 + x) * 4 + 3)
     }
 
     fn xform_opaque16(doc: &Document, layer: usize) -> usize {
         doc.layers[layer]
             .pixels
+            .to_dense()
             .chunks(4)
             .filter(|p| p[3] != 0)
             .count()
@@ -14004,8 +14018,8 @@ mod tests {
         );
         // Something else edits the canvas behind the session's back.
         let i = ((8 + 1) * 4) as usize;
-        doc.layers[0].pixels[i + 1] = 200;
-        doc.layers[0].pixels[i + 3] = 255;
+        doc.layers[0].pixels.set(i + 1, 200);
+        doc.layers[0].pixels.set(i + 3, 255);
         doc.mark_full_dirty();
         // The first tick after an external edit re-arms instead of
         // warping the edited pixels through pin geometry that no longer
@@ -14014,13 +14028,21 @@ mod tests {
             xform_translate(&mut doc, &mut x, 0.5, 0.0),
             XformApply::NoOp
         );
-        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 20));
+        assert!(doc.layers[0]
+            .pixels
+            .to_dense()
+            .chunks(4)
+            .any(|p| p[1] >= 20));
         // The fresh session then warps coherently from the edited pixels.
         assert_eq!(
             xform_translate(&mut doc, &mut x, 0.5, 0.0),
             XformApply::Applied
         );
-        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] >= 20));
+        assert!(doc.layers[0]
+            .pixels
+            .to_dense()
+            .chunks(4)
+            .any(|p| p[1] >= 20));
     }
 
     #[test]
@@ -14051,8 +14073,8 @@ mod tests {
         for y in 4..8 {
             for x in 0..4 {
                 let i = (y * 16 + x) * 4;
-                doc.layers[1].pixels[i + 1] = 255;
-                doc.layers[1].pixels[i + 3] = 255;
+                doc.layers[1].pixels.set(i + 1, 255);
+                doc.layers[1].pixels.set(i + 3, 255);
             }
         }
         doc.active = 0;
@@ -14173,7 +14195,7 @@ mod tests {
             &mut record,
         ));
         let i = ((3 * doc.w + 9) * 4) as usize;
-        assert_eq!(&doc.layers[0].pixels[i..i + 3], &[255, 0, 0]);
+        assert_eq!(&doc.layers[0].pixels.to_dense()[i..i + 3], &[255, 0, 0]);
         // The tail is consumed exactly once.
         assert!(!flush_stroke_tail(
             &mut doc,
@@ -14237,7 +14259,7 @@ mod tests {
             leftover = lo;
         }
         assert!(taper_replay(&mut doc, &brush, color, &record));
-        let alpha = |x: u32| doc.layers[0].pixels[((6 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| doc.layers[0].pixels.get(((6 * doc.w + x) * 4 + 3) as usize);
         assert!(alpha(6) > 200, "head alpha {}", alpha(6));
         assert!(alpha(46) < 40, "tail alpha {}", alpha(46));
         assert!(alpha(20) < alpha(6));
@@ -14293,7 +14315,7 @@ mod tests {
             leftover = lo;
         }
         assert!(taper_replay(&mut doc, &brush, color, &record));
-        let alpha = |x: u32, y: u32| doc.layers[0].pixels[((y * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize);
         assert!(alpha(8, 18) > 0, "start tip alpha {}", alpha(8, 18));
         assert!(alpha(136, 18) > 0, "end tip alpha {}", alpha(136, 18));
     }
@@ -14315,7 +14337,11 @@ mod tests {
             ..Default::default()
         };
         paint_preview_stroke(&mut doc, &brush, Color::rgb(255, 0, 0));
-        let alpha = |x: u32| doc.layers[0].pixels[((18 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| {
+            doc.layers[0]
+                .pixels
+                .get(((18 * doc.w + x) * 4 + 3) as usize)
+        };
         assert!(alpha(72) > 100, "mid alpha {}", alpha(72));
         assert!(alpha(8) < alpha(72), "head alpha {}", alpha(8));
         assert!(alpha(136) < alpha(72), "tail alpha {}", alpha(136));
@@ -14336,18 +14362,18 @@ mod tests {
     /// pixel at (6,6): every flip/rotate/scale visibly moves something.
     fn tform_doc() -> Document {
         let mut doc = Document::new(8, 8);
-        let l = &mut doc.layers[0];
-        l.pixels = vec![0u8; 8 * 8 * 4];
+        let mut dense = vec![0u8; 8 * 8 * 4];
         for y in 2..5 {
             for x in 2..5 {
                 let i = (y * 8 + x) * 4;
-                l.pixels[i] = 255;
-                l.pixels[i + 3] = 255;
+                dense[i] = 255;
+                dense[i + 3] = 255;
             }
         }
         let i = (6 * 8 + 6) * 4;
-        l.pixels[i] = 255;
-        l.pixels[i + 3] = 255;
+        dense[i] = 255;
+        dense[i + 3] = 255;
+        doc.layers[0].pixels = Raster::from_dense(8, 8, 4, &dense);
         doc
     }
 
@@ -14422,15 +14448,15 @@ mod tests {
         );
         // Something else edits the canvas behind the session's back.
         let i = ((8 + 1) * 4) as usize; // (1,1)
-        doc.layers[0].pixels[i + 1] = 200;
-        doc.layers[0].pixels[i + 3] = 255;
+        doc.layers[0].pixels.set(i + 1, 200);
+        doc.layers[0].pixels.set(i + 3, 255);
         doc.mark_full_dirty();
         assert_eq!(
             tform_button(&mut doc, &mut t, TformOp::Scale(1.25)),
             XformApply::Applied
         );
         // The edit was baked into the re-captured base and survives.
-        assert!(doc.layers[0].pixels.chunks(4).any(|p| p[1] > 0));
+        assert!(doc.layers[0].pixels.to_dense().chunks(4).any(|p| p[1] > 0));
     }
 
     #[test]
@@ -14515,7 +14541,7 @@ mod tests {
         assert_eq!(t.scale, 2.0);
         // Painting behind the session's back invalidates it; the panel
         // must read 100% again, not a transform that no longer applies.
-        doc.layers[0].pixels[0] = 10;
+        doc.layers[0].pixels.set(0, 10);
         doc.mark_full_dirty();
         tform_refresh(&doc, &mut t);
         assert_eq!((t.scale, t.degrees), (1.0, 0.0));
@@ -14623,12 +14649,8 @@ mod tests {
         }
         fn px(doc: &Document, x: u32, y: u32) -> [u8; 4] {
             let i = ((y * doc.w + x) * 4) as usize;
-            [
-                doc.layers[0].pixels[i],
-                doc.layers[0].pixels[i + 1],
-                doc.layers[0].pixels[i + 2],
-                doc.layers[0].pixels[i + 3],
-            ]
+            let r = &doc.layers[0].pixels;
+            [r.get(i), r.get(i + 1), r.get(i + 2), r.get(i + 3)]
         }
 
         let mut live = scene();

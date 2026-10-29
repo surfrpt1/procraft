@@ -406,8 +406,7 @@ impl Document {
                 let out_a = cov + dst_a * (1.0 - cov);
                 if out_a > 0.0 {
                     for ch in 0..3 {
-                        dst[ch] = ((c[ch] as f32 * cov
-                            + dst[ch] as f32 * dst_a * (1.0 - cov))
+                        dst[ch] = ((c[ch] as f32 * cov + dst[ch] as f32 * dst_a * (1.0 - cov))
                             / out_a)
                             .round() as u8;
                     }
@@ -689,7 +688,14 @@ mod tests {
             &style,
         )
         .unwrap();
-        let count = |d: &Document| d.layers[0].pixels.to_dense().chunks(4).filter(|p| p[3] != 0).count();
+        let count = |d: &Document| {
+            d.layers[0]
+                .pixels
+                .to_dense()
+                .chunks(4)
+                .filter(|p| p[3] != 0)
+                .count()
+        };
         assert!(count(&b) > count(&a));
     }
 
@@ -759,9 +765,8 @@ mod tests {
         assert!(!doc.undo());
         // And crucially the fresh text layer is untouched.
         assert_eq!(doc.layers[idx].pixels, snap);
-        assert!((0..64)
-            .any(|x| (0..64)
-                .any(|y| { doc.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3) > 0 })));
+        assert!((0..64).any(|x| (0..64)
+            .any(|y| { doc.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3) > 0 })));
         assert!(w > 0 && h > 0);
     }
 
@@ -791,8 +796,9 @@ mod tests {
         let t = doc.layers[idx].text.as_ref().unwrap();
         assert_eq!((w, h), (t.w, t.h));
         // The old location is cleared (whole layer repaints from scratch).
-        let px =
-            |d: &Document, x: u32, y: u32| d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3);
+        let px = |d: &Document, x: u32, y: u32| {
+            d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3)
+        };
         assert!((0..50).all(|x| (0..50).all(|y| px(&doc, x, y) == 0)));
         // The new location paints.
         assert!((88..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
@@ -809,8 +815,9 @@ mod tests {
             t.x = 90.0;
         }
         doc.rerender_text_layer(idx).unwrap();
-        let px =
-            |d: &Document, x: u32, y: u32| d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3);
+        let px = |d: &Document, x: u32, y: u32| {
+            d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3)
+        };
         assert!((90..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
         assert!(doc.undo());
         // Pixels AND the block revert together.

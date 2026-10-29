@@ -568,17 +568,23 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::Raster;
+
+    /// Test-only: an RGBA raster sized to the document from dense bytes.
+    fn px_rgba(doc: &Document, bytes: &[u8]) -> Raster {
+        Raster::from_dense(doc.w, doc.h, 4, bytes)
+    }
 
     fn sample_doc() -> Document {
         let mut doc = Document::new(5, 3);
         doc.background = [10, 20, 30, 255];
         doc.layers[0].name = "A".to_string();
-        doc.layers[0].pixels = vec![200; 5 * 3 * 4];
+        doc.layers[0].pixels = px_rgba(&doc, &[200; 5 * 3 * 4]);
         doc.add_layer("BC".to_string());
         doc.layers[1].blend = BlendMode::Difference;
         doc.layers[1].opacity = 0.5;
         doc.layers[1].clip = true;
-        doc.layers[1].pixels = vec![7; 5 * 3 * 4];
+        doc.layers[1].pixels = px_rgba(&doc, &[7; 5 * 3 * 4]);
         doc.add_mask(1);
         doc.layers[1].mask.as_mut().unwrap().set(0, 0);
         doc
@@ -758,7 +764,8 @@ mod tests {
         assert!(open_psd(&path).is_err());
         let _ = std::fs::remove_file(&path);
         let mut doc = Document::new(2, 2);
-        doc.layers[0].pixels.truncate(3);
+        // Wrong geometry (not a 2x2 RGBA raster) exercises the size guard.
+        doc.layers[0].pixels = Raster::new(1, 1, 4);
         assert!(save_psd(&dir.join("procraft-badsize.psd"), &doc).is_err());
     }
 }
