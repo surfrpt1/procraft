@@ -6,23 +6,23 @@
 
 use eframe::egui::{self, Color32, ColorImage, Sense, TextureHandle, TextureOptions, Vec2};
 // iOS has no rfd backend: same call shape, every dialog declined.
+#[cfg(target_os = "android")]
+use procraft_engine::ext_matches;
 use procraft_engine::{
     analogous, check_font, clamp_frame, classify_touch_tap, complementary, curves_lut,
-    export_gif_ext, export_timelapse, export_tip_png, gallery_thumb, import_brush_file_report,
-    import_gif_document, import_gpl_file, levels_lut, next_frame, onion_ghost, open_brush_library,
-    open_palette, open_psd, palette_from_rgba, pan_offset, prev_frame, rasterize_frame,
-    rasterize_frame_region, save_brush_library, save_palette, save_psd, shift_wheel_remap,
-    size_drag_factor, starter_palette, step_playback_visible, triadic, zoom_drag_factor, ActionId,
-    AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color, DabDynamics, Document,
-    DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet, PaintTarget, Palette, PaletteSet,
-    Raster, Settings, ShapePoly, Shortcuts, SizeDragMode, SymmetryMode, TapAction, TextBlock,
-    TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES,
-    MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES,
-    MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
-    SETTINGS_VERSION, TILE,
+    export_gif_ext, export_timelapse, export_tip_png, file_size_label, gallery_thumb,
+    import_brush_file_report, import_gif_document, import_gpl_file, levels_lut, next_frame,
+    onion_ghost, open_brush_library, open_palette, open_psd, palette_from_rgba, pan_offset,
+    prev_frame, rasterize_frame, rasterize_frame_region, save_brush_library, save_palette,
+    save_psd, shift_wheel_remap, size_drag_factor, starter_palette, step_playback_visible, triadic,
+    zoom_drag_factor, ActionId, AssistLine, BlendMode, Brush, BrushPreset, ChordKey, Color,
+    DabDynamics, Document, DragActionId, GuideKind, Guides, KeyChord, LoopMode, ModSet,
+    PaintTarget, Palette, PaletteSet, Raster, Settings, ShapePoly, Shortcuts, SizeDragMode,
+    SymmetryMode, TapAction, TextBlock, TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD,
+    MAX_CANVAS_SIDE, MAX_FONT_BYTES, MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES,
+    MAX_OUTLINE_PX, MAX_PALETTES, MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS,
+    MIN_ANIM_HOLD, MIN_TEXT_PX, SETTINGS_VERSION, TILE,
 };
-#[cfg(target_os = "android")]
-use procraft_engine::{ext_matches, file_size_label};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
 
@@ -524,6 +524,13 @@ fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathB
 const MAX_RECENT: usize = 10;
 /// M33 Gallery: thumbnail longest side in px.
 const GALLERY_THUMB_SIDE: u32 = 96;
+/// Gallery new-canvas presets: (label, width, height). Every side stays
+/// within [`MAX_CANVAS_SIDE`]; the 8K entry is the square export target.
+const CANVAS_PRESETS: [(&str, u32, u32); 3] = [
+    ("1080p", 1920, 1080),
+    ("4K", 4096, 4096),
+    ("8K", 8192, 8192),
+];
 
 /// M33 Gallery: record a project path as most-recent (dedup, truncate).
 fn push_recent(recent: &mut Vec<String>, path: &str) {
@@ -538,6 +545,22 @@ fn push_recent(recent: &mut Vec<String>, path: &str) {
 
 /// M49: cooldown before retrying a failed settings write (seconds).
 const SAVE_RETRY_SECS: f64 = 2.0;
+
+/// Layers-panel footer text: layer count, the active layer's name and the
+/// document's allocated tile memory (painted tiles plus masks). Fresh
+/// layers cost nothing until a tile is touched, so this starts at `0 B`
+/// and grows by 256 KB per painted tile.
+fn layer_readout(doc: &Document) -> String {
+    format!(
+        "{} layer(s), active: {} · {}",
+        doc.layers.len(),
+        doc.layers
+            .get(doc.active)
+            .map(|l| l.name.as_str())
+            .unwrap_or("-"),
+        file_size_label(doc.layer_alloc_bytes() as u64)
+    )
+}
 
 /// M49: what makes two settings snapshots differ in the discrete sense.
 /// Zoom is excluded — it coalesces through `should_flush_zoom` and gets
@@ -3853,15 +3876,13 @@ impl ProCraftApp {
                     });
                 }
                 ui.separator();
-                ui.label(format!(
-                    "{} layer(s), active: {}",
-                    self.doc.layers.len(),
-                    self.doc
-                        .layers
-                        .get(self.doc.active)
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("-")
-                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(layer_readout(&self.doc));
+                    ui.weak(format!(
+                        "cache {}",
+                        file_size_label(self.composite.bytes() as u64)
+                    ));
+                });
                 ui.separator();
                 self.lapse_card(ui, &t);
                 ui.collapsing("Animation", |ui| {
@@ -9813,6 +9834,18 @@ impl eframe::App for ProCraftApp {
                             browse = true;
                         }
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, w, h) in CANVAS_PRESETS {
+                            if ui.button(label).clicked() {
+                                self.gallery_new_w = w;
+                                self.gallery_new_h = h;
+                            }
+                        }
+                        ui.label(format!(
+                            "8K: {} tiles/layer, painted tiles only",
+                            (MAX_CANVAS_SIDE.div_ceil(TILE)).pow(2)
+                        ));
+                    });
                     ui.separator();
                     if self.recent.is_empty() {
                         ui.label("No recent projects yet — start one above or open a file.");
@@ -14735,5 +14768,41 @@ mod tests {
         assert_eq!(px(&live, 11, 4), [200, 200, 200, 255]);
         fill_from_baseline(&mut live, &mut fp, 0, 4);
         assert_eq!(live.layers[0].pixels, direct(4).layers[0].pixels);
+    }
+
+    #[test]
+    fn new_canvas_clamps_at_the_engine_cap() {
+        assert_eq!(MAX_CANVAS_SIDE, 8192);
+    }
+
+    #[test]
+    fn canvas_presets_cover_1080p_4k_and_8k() {
+        assert_eq!(
+            CANVAS_PRESETS,
+            [
+                ("1080p", 1920, 1080),
+                ("4K", 4096, 4096),
+                ("8K", 8192, 8192),
+            ]
+        );
+        for (label, w, h) in CANVAS_PRESETS {
+            assert!(
+                w <= MAX_CANVAS_SIDE && h <= MAX_CANVAS_SIDE,
+                "{label} ({w}x{h}) exceeds the engine cap"
+            );
+        }
+        assert_eq!((8192u32.div_ceil(procraft_engine::TILE)).pow(2), 1024);
+    }
+
+    #[test]
+    fn layer_readout_formats_the_document_allocation() {
+        let mut doc = Document::new(64, 64);
+        assert_eq!(layer_readout(&doc), "1 layer(s), active: Layer 1 · 0 B");
+        // One painted cell materialises a whole 256² RGBA tile.
+        doc.layers[0].pixels.set4(0, [1, 2, 3, 4]);
+        assert_eq!(
+            layer_readout(&doc),
+            "1 layer(s), active: Layer 1 · 256.0 KB"
+        );
     }
 }

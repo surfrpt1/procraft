@@ -420,9 +420,11 @@ const MAX_UNDO_ENTRIES: usize = 32;
 /// cap binds on small ones (32 steps x ~5 MiB at 1280x800).
 const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
 
-/// Canvas side cap for crop/resize: bounds reallocations (one 4096x4096
-/// layer is 64 MiB) and matches the GIF import dimension cap.
-pub const MAX_CANVAS_SIDE: u32 = 4096;
+/// Canvas side cap for crop/resize: bounds reallocations (tiles are
+/// allocated on demand, so an 8192² layer that is never painted costs
+/// nothing; a painted one is 1024 tiles, 256 MiB) and matches the 8K
+/// export target.
+pub const MAX_CANVAS_SIDE: u32 = 8192;
 
 #[derive(Clone, Debug)]
 struct UndoEntry {
@@ -2998,7 +3000,7 @@ impl Document {
     /// M45 hardening: files over 64MB fail closed on metadata, and
     /// dimensions are checked from the header before the full decode
     /// so a phone panorama can't OOM the session (cap matches
-    /// [`MAX_CANVAS_SIDE`], the GIF import cap, and `rehome_canvas`).
+    /// [`MAX_CANVAS_SIDE`] and `rehome_canvas`).
     pub fn load_background(&mut self, path: &std::path::Path) -> Result<(), String> {
         const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -4458,9 +4460,21 @@ mod tests {
         assert!(doc.crop(5, 0, 9, 3).is_err());
         assert!(doc.crop(3, 0, 1, 3).is_err());
         assert!(doc.rehome_canvas(0, 8, 0, 0).is_err());
-        assert!(doc.rehome_canvas(5000, 8, 0, 0).is_err());
+        assert!(doc.rehome_canvas(8193, 8, 0, 0).is_err());
         // Failed ops touch nothing.
         assert_eq!((doc.w, doc.h), (8, 8));
+    }
+
+    #[test]
+    fn canvas_cap_allows_8k_but_not_more() {
+        assert_eq!(MAX_CANVAS_SIDE, 8192);
+        assert!(Document::new(8192, 8192)
+            .rehome_canvas(8192, 8192, 0, 0)
+            .is_ok());
+        let err = Document::new(64, 64)
+            .rehome_canvas(8193, 64, 0, 0)
+            .unwrap_err();
+        assert!(err.contains("want 1-8192 each"), "{err}");
     }
 
     #[test]
@@ -5705,10 +5719,10 @@ mod tests {
     #[test]
     fn m45_import_rejects_oversize_dimensions() {
         // M45: a phone panorama wider than the canvas cap must fail
-        // closed instead of adopting a 5000px layer (OOM guard).
+        // closed instead of adopting an oversize layer (OOM guard).
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-m45-oversize.png");
-        let wide = 5000u32;
+        let wide = MAX_CANVAS_SIDE + 8;
         let tall = 100u32;
         let raw = vec![200u8; (wide * tall * 4) as usize];
         let mut out = Vec::new();

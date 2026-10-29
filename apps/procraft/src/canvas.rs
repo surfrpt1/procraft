@@ -45,9 +45,7 @@ impl CompositeCache {
         }
     }
 
-    /// Bytes currently held (tests, and the memory readout that will show
-    /// it next to the layer total).
-    #[allow(dead_code)]
+    /// Bytes currently held: the layers-panel memory readout.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
