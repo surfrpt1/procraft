@@ -4613,7 +4613,7 @@ impl ProCraftApp {
         }
         // A landscape phone cannot show Save/Open/PSD in one popup: cap it
         // above the bar and scroll instead of clipping the last rows.
-        egui::ScrollArea::vertical()
+        let out = egui::ScrollArea::vertical()
             .id_salt("file-menu-scroll")
             .max_height(max_h.unwrap_or(f32::INFINITY))
             .show(ui, |ui| {
@@ -4827,6 +4827,14 @@ impl ProCraftApp {
                     }
                 }
             });
+        let fade = menu_fade_height(
+            out.content_size.y,
+            out.inner_rect.height(),
+            out.state.offset.y,
+        );
+        if fade > 0.0 {
+            fade_bottom_edge(ui, out.inner_rect, ui.visuals().window_fill(), fade);
+        }
     }
 
     /// Top safe inset for the mobile shell: the status bar/notch strip the
@@ -7321,6 +7329,40 @@ fn modal_scroll(ui: &mut egui::Ui, sheet: Option<&MobileModal>, body: impl FnOnc
 /// rect: a cap that moved with the popup made it grow every frame.
 fn menu_popup_room(from: f32, to: f32) -> f32 {
     (to - from - 16.0).max(200.0)
+}
+
+/// Fade height for a scrollable popup body: nothing when the list already
+/// ends in view, otherwise a short gradient so the last row reads as
+/// continuing rather than clipped.
+fn menu_fade_height(content_h: f32, viewport_h: f32, offset_y: f32) -> f32 {
+    let below = content_h - viewport_h - offset_y;
+    if below <= 1.0 {
+        0.0
+    } else {
+        MENU_FADE_H.min(viewport_h * 0.25)
+    }
+}
+
+const MENU_FADE_H: f32 = 24.0;
+
+/// Paint `rect`'s bottom `height` points as a gradient into `fill`, over the
+/// rows that are only half in view.
+fn fade_bottom_edge(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32, height: f32) {
+    let clear = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 0);
+    let (left, right) = (rect.left() + 1.0, rect.right() - 1.0);
+    let top = rect.bottom() - height;
+    let mut mesh = egui::epaint::Mesh::default();
+    for (pos, color) in [
+        (egui::pos2(left, top), clear),
+        (egui::pos2(right, top), clear),
+        (egui::pos2(right, rect.bottom()), fill),
+        (egui::pos2(left, rect.bottom()), fill),
+    ] {
+        mesh.colored_vertex(pos, color);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -12880,6 +12922,17 @@ mod tests {
         assert_eq!(menu_popup_room(59.0, 734.0), 659.0);
         // Never smaller than a couple of rows, even if the popup opens low.
         assert_eq!(menu_popup_room(300.0, 390.0), 200.0);
+    }
+
+    #[test]
+    fn file_menu_fades_only_while_more_rows_are_below() {
+        // Scrolled to the last row: no more content, so no fade.
+        assert_eq!(menu_fade_height(489.0, 296.0, 193.0), 0.0);
+        // A list that fits needs no gradient either.
+        assert_eq!(menu_fade_height(200.0, 296.0, 0.0), 0.0);
+        // Rows below the fold: short fade, capped at a quarter of the body.
+        assert_eq!(menu_fade_height(489.0, 296.0, 0.0), 24.0);
+        assert_eq!(menu_fade_height(489.0, 60.0, 0.0), 15.0);
     }
 
     #[test]
