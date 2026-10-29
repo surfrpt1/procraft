@@ -46,6 +46,18 @@ pub fn viewport_active(
         || side > MAX_CANVAS_SIDE
 }
 
+/// A mask view with nothing to show must not suppress the fallback when the
+/// document needs it; with Animation Assist on the viewport is not taken, so
+/// leaving the user's View alone is correct.
+pub(crate) fn maskless_view_blocks_fallback(
+    view_mask: bool,
+    has_mask: bool,
+    anim_assist: bool,
+    needs_fallback: bool,
+) -> bool {
+    view_mask && !has_mask && !anim_assist && needs_fallback
+}
+
 /// Bytes of one full composite tile, which is what the engine returns.
 const TILE_BYTES: usize = (TILE * TILE * 4) as usize;
 
@@ -867,6 +879,16 @@ mod tests {
             viewport_active(false, false, 16384, 16384),
             "a legacy oversized canvas never asks for a too-large texture"
         );
+    }
+
+    #[test]
+    fn maskless_view_yields_to_the_fallback() {
+        assert!(maskless_view_blocks_fallback(true, false, false, true));
+        assert!(!maskless_view_blocks_fallback(true, true, false, true));
+        assert!(!maskless_view_blocks_fallback(false, false, false, true));
+        assert!(!maskless_view_blocks_fallback(true, false, false, false));
+        // Assist keeps its own upload path; do not touch the user's View.
+        assert!(!maskless_view_blocks_fallback(true, false, true, true));
     }
 
     #[test]

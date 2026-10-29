@@ -2016,15 +2016,17 @@ impl ProCraftApp {
             .layers
             .get(self.doc.active)
             .is_some_and(|l| l.mask.is_some());
-        if self.view_mask
-            && !has_mask
-            && canvas::viewport_active(
+        if canvas::maskless_view_blocks_fallback(
+            self.view_mask,
+            has_mask,
+            self.anim_assist,
+            canvas::viewport_active(
                 viewport_forced(),
                 cfg!(any(target_os = "android", target_os = "ios")),
                 self.doc.w.max(self.doc.h),
                 ctx.input(|i| i.max_texture_side),
-            )
-        {
+            ),
+        ) {
             self.view_mask = false;
             let msg = "This layer has no mask.";
             if self.status != msg {
@@ -2078,8 +2080,15 @@ impl ProCraftApp {
             MaskAction::Show => {
                 let dirty = self.doc.take_dirty();
                 // The texture is canvas-sized, so a GPU that cannot hold one
-                // would reject the upload in the backend: say so instead.
-                if self.doc.w.max(self.doc.h) as usize > ctx.input(|i| i.max_texture_side) {
+                // — or a document above the 8K cap this GPU-backed path was
+                // sized for — would reject the upload in the backend: say so
+                // instead.
+                if canvas::viewport_active(
+                    false,
+                    false,
+                    self.doc.w.max(self.doc.h),
+                    ctx.input(|i| i.max_texture_side),
+                ) {
                     let msg = "Mask view needs a canvas texture this GPU cannot allocate.";
                     if self.status != msg {
                         self.status = msg.to_string();
@@ -2145,10 +2154,15 @@ impl ProCraftApp {
         // (active layer over the page), not the full composite.
         if self.anim_assist && !self.doc.layers.is_empty() {
             // The frame texture is canvas-sized too: a GPU that cannot hold
-            // one would reject the upload in the backend (a legacy 16384²
-            // document asks for ~1 GiB), so say so instead of building it.
-            let long = self.doc.w.max(self.doc.h) as usize;
-            if long > ctx.input(|i| i.max_texture_side) {
+            // one — or a document above the 8K cap — would reject the upload
+            // in the backend (a legacy 16384² document asks for ~1 GiB), so
+            // say so instead of building it.
+            if canvas::viewport_active(
+                false,
+                false,
+                self.doc.w.max(self.doc.h),
+                ctx.input(|i| i.max_texture_side),
+            ) {
                 let msg = "Animation Assist needs a canvas texture this GPU cannot allocate.";
                 if self.status != msg {
                     self.status = msg.to_string();
@@ -10943,8 +10957,8 @@ impl eframe::App for ProCraftApp {
                             );
                         }
                     }
-                } else {
-                    let tex = self.texture.as_ref().expect("canvas texture").id();
+                } else if let Some(tex) = self.texture.as_ref() {
+                    let tex = tex.id();
                     paint_textured_quad(
                         ui.painter(),
                         tex,
