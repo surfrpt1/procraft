@@ -936,6 +936,10 @@ struct ProCraftApp {
     /// Composite tiles behind the canvas texture: a dab recomposites and
     /// uploads only the tiles under its dirty rect (see `refresh_texture`).
     composite: canvas::CompositeCache,
+    /// Viewport-resolution canvas (spec §4): the visible rect composited
+    /// into a screen-sized texture instead of one canvas-sized one. Unused
+    /// unless `canvas::viewport_active` says so.
+    view_tex: canvas::ViewTex,
     painting: bool,
     last: Option<(f32, f32)>,
     last_target: Option<(f32, f32)>,
@@ -1230,6 +1234,7 @@ impl ProCraftApp {
                     canvas::CACHE_DESKTOP
                 },
             ),
+            view_tex: canvas::ViewTex::new(),
             painting: false,
             last: None,
             last_target: None,
@@ -1979,10 +1984,34 @@ impl ProCraftApp {
         }
     }
 
+    /// Whether the viewport-resolution fallback (spec §4) drives the canvas
+    /// this frame. Mask view and Animation Assist opt out: they keep their
+    /// own full uploads.
+    fn viewport_canvas(&self, ctx: &egui::Context) -> bool {
+        !self.view_mask
+            && !self.anim_assist
+            && canvas::viewport_active(
+                viewport_forced(),
+                cfg!(any(target_os = "android", target_os = "ios")),
+                self.doc.w.max(self.doc.h),
+                ctx.input(|i| i.max_texture_side),
+            )
+    }
+
     /// Upload only what changed since the last frame (no-op when clean).
     /// Composite view uploads one `set_partial` per tile under the dirty
     /// rect; pan, zoom and rotation never recomposite.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
+        // Viewport-resolution fallback (spec §4): the draw path composites
+        // the visible rect, so there is nothing to upload here. Drop the
+        // full-canvas texture — at 8K it is 268 MB of VRAM this path never
+        // samples — but keep the composite cache: it is exactly what the
+        // viewport reads, the one deliberate exception to "texture dropped
+        // ⇒ cache invalidated".
+        if self.viewport_canvas(ctx) {
+            self.texture = None;
+            return;
+        }
         // Mask viewer: grayscale of the active layer's mask, full upload.
         if self.view_mask {
             if let Some(mv) = self.doc.mask_view() {
@@ -9214,6 +9243,12 @@ fn flush_stroke_tail(
     true
 }
 
+/// Host captures and remote device testing force the viewport-resolution
+/// canvas (spec §4) regardless of document size or GPU limits.
+fn viewport_forced() -> bool {
+    std::env::var("PROCRAFT_FORCE_VIEWPORT_CANVAS").is_ok_and(|v| v == "1")
+}
+
 /// Textured quad for a rotated canvas view: `corners` are TL, TR, BR, BL
 /// with matching unit UVs, tinted (egui has no canvas transform, so the
 /// texture stays axis-aligned and the quad does the rotating).
@@ -10554,7 +10589,11 @@ impl eframe::App for ProCraftApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let ctx = ui.ctx().clone();
             self.refresh_texture(&ctx);
-            let tex = self.texture.as_ref().unwrap().id();
+            // Target B (spec §4): composite the visible rect instead of
+            // sampling one canvas-sized texture. Decided once per frame;
+            // `refresh_texture` already returned without an upload when set.
+            let viewport = self.viewport_canvas(&ctx);
+            let max_side = ctx.input(|i| i.max_texture_side);
             let (w, h) = (self.doc.w as f32, self.doc.h as f32);
             let avail = ui.available_size();
             // Viewport rect for press-origin tests (Hand grabs anywhere
@@ -10685,21 +10724,87 @@ impl eframe::App for ProCraftApp {
                         ang,
                     )
                 };
-                paint_textured_quad(
-                    ui.painter(),
-                    tex,
-                    [
-                        to_screen(0.0, 0.0),
-                        to_screen(w, 0.0),
-                        to_screen(w, h),
-                        to_screen(0.0, h),
-                    ],
-                    Color32::WHITE,
-                );
                 let to_canvas = |pos: egui::Pos2| {
                     let q = unrot_pt(pos, cc, ang);
                     ((q.x - rect.min.x) / z, (q.y - rect.min.y) / z)
                 };
+                if viewport {
+                    // Canvas rect the panel covers. Unrotated that is the
+                    // tested `for_screen`; rotated, the panel's four corners
+                    // mapped back, because the axis-aligned intersection of
+                    // page and panel is neither inside nor outside what the
+                    // rotation actually shows.
+                    let view = if ang == 0.0 {
+                        let (ox, oy) = to_canvas(view_rect.min);
+                        canvas::ViewRect::for_screen(
+                            ox,
+                            oy,
+                            view_rect.width(),
+                            view_rect.height(),
+                            w,
+                            h,
+                            z,
+                        )
+                    } else {
+                        canvas::ViewRect::from_canvas_points(
+                            [
+                                to_canvas(view_rect.left_top()),
+                                to_canvas(view_rect.right_top()),
+                                to_canvas(view_rect.right_bottom()),
+                                to_canvas(view_rect.left_bottom()),
+                            ],
+                            w,
+                            h,
+                        )
+                    };
+                    // Physical pixels: 1:1 at zoom >= 100 %, downscaled when
+                    // zoomed out (the covered canvas extent caps it), never
+                    // past what the GPU can hold.
+                    let ppp = ctx.pixels_per_point();
+                    let panel = [view_rect.width(), view_rect.height()];
+                    let extent = [view.x1 - view.x0, view.y1 - view.y0];
+                    let mut out = [1usize; 2];
+                    for axis in 0..2 {
+                        let wanted = (panel[axis] * ppp).ceil().max(1.0) as usize;
+                        let covered = extent[axis].ceil().max(1.0) as usize;
+                        out[axis] = wanted.min(covered).clamp(1, max_side);
+                    }
+                    // Mid-gesture frames reuse the previous texture at its
+                    // own view rect: pinch stays responsive, and the first
+                    // post-gesture frame re-renders from canvas tiles.
+                    if !gesture || self.view_tex.texture().is_none() {
+                        self.view_tex
+                            .render(&ctx, &mut self.doc, &mut self.composite, view, out);
+                    }
+                    if let (Some(v), Some(t)) = (self.view_tex.view(), self.view_tex.texture()) {
+                        if v.x1 > v.x0 && v.y1 > v.y0 {
+                            paint_textured_quad(
+                                ui.painter(),
+                                t.id(),
+                                [
+                                    to_screen(v.x0, v.y0),
+                                    to_screen(v.x1, v.y0),
+                                    to_screen(v.x1, v.y1),
+                                    to_screen(v.x0, v.y1),
+                                ],
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                } else {
+                    let tex = self.texture.as_ref().expect("canvas texture").id();
+                    paint_textured_quad(
+                        ui.painter(),
+                        tex,
+                        [
+                            to_screen(0.0, 0.0),
+                            to_screen(w, 0.0),
+                            to_screen(w, h),
+                            to_screen(0.0, h),
+                        ],
+                        Color32::WHITE,
+                    );
+                }
                 let clamp_pt = |x: f32, y: f32| (x.clamp(0.0, w - 1.0), y.clamp(0.0, h - 1.0));
                 // Mirror axis overlay so the symmetry center is visible.
                 let axis_color = Color32::from_rgba_unmultiplied(220, 40, 40, 180);
