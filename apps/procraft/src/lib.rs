@@ -19,13 +19,14 @@ use procraft_engine::{
     TextStyle, ToolId, LAPSE_SIDE, MAX_ANIM_FPS, MAX_ANIM_HOLD, MAX_CANVAS_SIDE, MAX_FONT_BYTES,
     MAX_IMAGE_COLORS, MAX_LAPSE_FRAMES, MAX_LIBRARY_BRUSHES, MAX_OUTLINE_PX, MAX_PALETTES,
     MAX_PALETTE_COLORS, MAX_TEXT_SPACING, MIN_ANIM_FPS, MIN_ANIM_HOLD, MIN_TEXT_PX,
-    SETTINGS_VERSION,
+    SETTINGS_VERSION, TILE,
 };
 #[cfg(target_os = "android")]
 use procraft_engine::{ext_matches, file_size_label};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use rfd_shim as rfd;
 
+mod canvas;
 mod design;
 mod settings;
 
@@ -854,6 +855,9 @@ struct ProCraftApp {
     page_custom: [u8; 3],
     picker_size: f32,
     texture: Option<TextureHandle>,
+    /// Composite tiles behind the canvas texture: a dab recomposites and
+    /// uploads only the tiles under its dirty rect (see `refresh_texture`).
+    composite: canvas::CompositeCache,
     painting: bool,
     last: Option<(f32, f32)>,
     last_target: Option<(f32, f32)>,
@@ -1141,6 +1145,13 @@ impl ProCraftApp {
             page_custom: [255, 255, 255],
             picker_size: 165.0,
             texture: None,
+            composite: canvas::CompositeCache::new(
+                if cfg!(any(target_os = "android", target_os = "ios")) {
+                    canvas::CACHE_MOBILE
+                } else {
+                    canvas::CACHE_DESKTOP
+                },
+            ),
             painting: false,
             last: None,
             last_target: None,
@@ -1891,10 +1902,15 @@ impl ProCraftApp {
     }
 
     /// Upload only what changed since the last frame (no-op when clean).
+    /// Composite view uploads one `set_partial` per tile under the dirty
+    /// rect; pan, zoom and rotation never recomposite.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
         // Mask viewer: grayscale of the active layer's mask, full upload.
         if self.view_mask {
             if let Some(mv) = self.doc.mask_view() {
+                // The canvas texture is not the composite here, so no
+                // composite tile can be trusted when the view returns.
+                self.composite.invalidate();
                 let dirty = self.texture.is_none() || self.doc.take_dirty().is_some();
                 if dirty {
                     let img = ColorImage::from_rgba_unmultiplied(
@@ -1909,6 +1925,9 @@ impl ProCraftApp {
         // Animation Assist: the canvas shows the current frame only
         // (active layer over the page), not the full composite.
         if self.anim_assist && !self.doc.layers.is_empty() {
+            // Frame view is not the composite (dab rects are consumed
+            // here, never by the tile cache): drop the tiles.
+            self.composite.invalidate();
             let active = self.doc.active.min(self.doc.layers.len() - 1);
             if self.texture.is_none() || self.anim_shown != Some(active) {
                 let bytes = rasterize_frame(&self.doc, active);
@@ -1932,22 +1951,60 @@ impl ProCraftApp {
             return;
         }
         self.anim_shown = None;
+        // Full upload: new/changed texture. Walk the tiles row-major;
+        // `tile_image` crops the last column and row so the dense buffer
+        // is exactly `w * h * 4` and the texture stays canvas-sized.
         if self.texture.is_none() {
-            let flat = self.doc.flatten();
-            let img = ColorImage::from_rgba_unmultiplied(
+            let plan = self.doc.stack_plan();
+            let (tw, th) = (self.doc.tiles_x(), self.doc.tiles_y());
+            let mut img = Vec::with_capacity(self.doc.w as usize * self.doc.h as usize * 4);
+            for ty in 0..th {
+                for tx in 0..tw {
+                    let tile = self.composite.tile(&self.doc, &plan, tx, ty);
+                    let (rgba, _, _) = canvas::tile_image(&self.doc, tile, tx, ty);
+                    img.extend_from_slice(&rgba);
+                }
+            }
+            let image = ColorImage::from_rgba_unmultiplied(
                 [self.doc.w as usize, self.doc.h as usize],
-                &flat,
+                &img,
             );
-            self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+            self.texture = Some(ctx.load_texture("canvas", image, TextureOptions::LINEAR));
+            // The upload already covers the whole canvas.
+            self.doc.take_dirty();
             return;
         }
         if let Some((x0, y0, x1, y1)) = self.doc.take_dirty() {
-            let bytes = self.doc.flatten_region(x0, y0, x1, y1);
-            let w = (x1 - x0 + 1) as usize;
-            let h = ((y1 - y0 + 1) as usize).max(bytes.len() / 4 / w.max(1));
-            let img = ColorImage::from_rgba_unmultiplied([w, h], &bytes);
-            if let Some(handle) = &mut self.texture {
-                handle.set_partial([x0 as usize, y0 as usize], img, TextureOptions::LINEAR);
+            // One plan per pass: it snapshots the revision, and the next
+            // dab bumps it (a retained plan would be stale).
+            let plan = self.doc.stack_plan();
+            let (x0, y0) = (
+                x0.min(self.doc.w.saturating_sub(1)),
+                y0.min(self.doc.h.saturating_sub(1)),
+            );
+            let (x1, y1) = (
+                x1.min(self.doc.w.saturating_sub(1)),
+                y1.min(self.doc.h.saturating_sub(1)),
+            );
+            for ty in y0 / TILE..=y1 / TILE {
+                for tx in x0 / TILE..=x1 / TILE {
+                    // A cached hit would be the pre-edit composite of the
+                    // very tile this dab touched, so drop it first.
+                    self.composite.evict(tx, ty);
+                    let tile = self.composite.tile(&self.doc, &plan, tx, ty);
+                    let (rgba, w, h) = canvas::tile_image(&self.doc, tile, tx, ty);
+                    if w == 0 || h == 0 {
+                        continue;
+                    }
+                    let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                    if let Some(handle) = &mut self.texture {
+                        handle.set_partial(
+                            [(tx * TILE) as usize, (ty * TILE) as usize],
+                            image,
+                            TextureOptions::LINEAR,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1999,6 +2056,7 @@ impl ProCraftApp {
             PendingOpen::Image => match self.doc.load_background(&path) {
                 Ok(()) => {
                     self.texture = None;
+                    self.composite.invalidate();
                     self.lasso_points.clear();
                     self.lasso_poly.clear();
                     self.status = format!("Opened {}", path.display());
@@ -2017,6 +2075,7 @@ impl ProCraftApp {
                     self.doc = doc;
                     self.clear_recovery();
                     self.texture = None;
+                    self.composite.invalidate();
                     self.lasso_points.clear();
                     self.lasso_poly.clear();
                     self.status = format!("PSD opened {} (masks do not import)", path.display());
@@ -3819,6 +3878,7 @@ impl ProCraftApp {
                         if ui.checkbox(&mut self.anim_assist, "Assist").changed() {
                             self.anim_playing = false;
                             self.texture = None; // rebuild the view (frame vs composite)
+                            self.composite.invalidate();
                             self.ghost_dirty = true;
                             self.status = if self.anim_assist {
                                 "Animation Assist on: one frame at a time.".to_string()
@@ -3839,6 +3899,7 @@ impl ProCraftApp {
                                 self.anim_fwd = true;
                                 self.anim_last_t = ui.ctx().input(|i| i.time);
                                 self.texture = None;
+                                self.composite.invalidate();
                                 self.ghost_dirty = true;
                                 self.status = "Playing.".to_string();
                             }
@@ -4695,6 +4756,7 @@ impl ProCraftApp {
                         match self.doc.load_background(&path) {
                             Ok(()) => {
                                 self.texture = None;
+                                self.composite.invalidate();
                                 self.lasso_points.clear();
                                 self.lasso_poly.clear();
                                 self.status = format!("Opened {}", path.display());
@@ -4806,6 +4868,7 @@ impl ProCraftApp {
                                 self.doc = doc;
                                 self.clear_recovery();
                                 self.texture = None;
+                                self.composite.invalidate();
                                 self.lasso_points.clear();
                                 self.lasso_poly.clear();
                                 self.status =
@@ -6240,6 +6303,7 @@ impl ProCraftApp {
         self.anim_shown = None;
         self.ghost_dirty = true;
         self.texture = None;
+        self.composite.invalidate();
         self.lasso_points.clear();
         self.lasso_poly.clear();
     }
@@ -6295,6 +6359,7 @@ impl ProCraftApp {
     /// the real dimensions.
     fn after_canvas_change(&mut self) {
         self.texture = None;
+        self.composite.invalidate();
         self.ghost_dirty = true;
         self.sel_edges_dirty = true;
         self.lasso_poly.clear();
@@ -10001,6 +10066,7 @@ impl eframe::App for ProCraftApp {
                                 Ok(doc) => {
                                     self.doc = doc;
                                     self.texture = None;
+                                    self.composite.invalidate();
                                     self.ghost_dirty = true;
                                     self.anim_playing = false;
                                     self.anim_shown = None;
