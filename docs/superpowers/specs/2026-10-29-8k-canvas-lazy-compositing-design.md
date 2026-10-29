@@ -30,10 +30,11 @@ hibernation to disk; changing the brush engine's sampling.
 
 ```rust
 const TILE: u32 = 256;          // TILE * TILE * 4 = 256 KiB per tile
-type Tile = Arc<[u8; (TILE * TILE * 4) as usize]>;
+type Tile = Arc<Vec<u8>>;       // len = TILE * TILE * bpp
 
 pub struct Raster {
     w: u32, h: u32,             // canvas size (shared by all layers)
+    bpp: u8,                    // 4 = RGBA layer, 1 = mask
     tiles_x: u32, tiles_y: u32, // ceil(w / TILE), ceil(h / TILE)
     tiles: Vec<Option<Tile>>,   // None = fully transparent
 }
@@ -42,27 +43,30 @@ pub struct Raster {
 - Empty tiles are `None`, never zero-filled allocations: 100 blank layers at 8K
   cost 100 pointer arrays (1024 slots × 8 B ≈ 8 KB each), not 26 GB. A tile is
   materialised the first time a write touches it.
-- Reads: `get(x, y) -> [u8; 4]` (zero on `None` or outside the layer's offset),
-  `tile(tx, ty) -> Option<&Tile>` for row-wise work, `to_dense()` and
-  `from_dense()` as migration bridges for export, PSD and thumbnail paths.
-- Writes: `put`, `fill_rect`, `write_row`, always through `Arc::make_mut`, so
+- Reads: `get(i) -> u8` / `get4(i) -> [u8; 4]` on the dense byte index the old
+  `Vec<u8>` used (zero on `None` or past the end), `tile(tx, ty)` and
+  `allocated_tiles()` for row-wise work, `to_dense()` and `from_dense()` as
+  migration bridges for export, PSD and thumbnail paths.
+- Writes: `set`, `set4`, `tile_mut`, `fill`, always through `Arc::make_mut`, so
   untouched tiles stay shared between history steps and duplicate layers.
 - Mask rasters are 1 byte/pixel with the same geometry and tiling (64 KiB per
-  tile), stored as `Vec<Option<Arc<[u8; 65536]>>>`.
+  tile).
 - Edge tiles are full 256² and padded with zeros; canvas bounds gate all reads
   so padding is never visible.
-- A tile that a write leaves entirely zero is dropped back to `None`, so an
-  erased area costs nothing on disk or in memory.
+- `fill(0)`, `from_dense` and `replace_dense` drop all-zero tiles; erasing
+  pixel by pixel leaves an allocated zero tile until the next whole-layer
+  write, so "erased costs nothing" holds on disk and after any full rewrites,
+  not per erased pixel.
 
 **Invariant:** a `None` slot and an all-zero tile are equivalent. Tests assert
-`get`/`region` equality between both forms, and that the zero-collapse rule
-holds after fills and erases.
+`get`/`region` equality between both forms, and that zero tiles are never
+materialised by dense loads.
 
 ## 2. Undo
 
 - `Layer` checkpoints clone the tile vector (pointer copy) instead of pixel
-  bytes; `UndoEntry.pixels` becomes `Vec<Option<Tile>>`, `mask` the 1-byte
-  equivalent, and `text` is unchanged.
+  bytes; `UndoEntry.pixels` becomes a `Raster`, `mask` an `Option<Raster>`, and
+  `text` is unchanged.
 - A stroke writes through `Arc::make_mut`, so the first touch of a tile in a
   stroke allocates its 256 KiB copy once; the checkpoint keeps the old pointer.
 - Cost per stroke = touched tiles × 256 KiB (typically 1–5 MB at 8K) instead of
