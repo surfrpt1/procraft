@@ -2299,7 +2299,6 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let snap = self.layers[self.active].pixels.to_dense();
         let (lox, loy) = (self.layers[self.active].ox, self.layers[self.active].oy);
         // Canvas cell -> buffer offset, if the layer covers it. Uncovered
         // canvas reads as transparent content (fill can flow through it
@@ -2314,15 +2313,15 @@ impl Document {
         };
         // Seed on uncovered canvas has no buffer to fill: no-op.
         let Some(seed_off) = slot(x, y) else { return };
-        if seed_off + 3 >= snap.len() {
-            return;
-        }
-        let target = [
-            snap[seed_off],
-            snap[seed_off + 1],
-            snap[seed_off + 2],
-            snap[seed_off + 3],
-        ];
+        // Read the seed through the tile accessors: a full-layer dense copy
+        // just to sample four bytes is 256 MiB of traffic on an 8K layer.
+        let target = {
+            let pixels = &self.layers[self.active].pixels;
+            if seed_off + 3 >= pixels.len() {
+                return;
+            }
+            pixels.get4(seed_off)
+        };
         let opacity = brush.opacity.clamp(0.0, 1.0);
         // A seed already carrying the fill color is a no-op only without
         // growth; with `grow` the second fill must still extend the region.
@@ -3178,6 +3177,54 @@ mod tests {
             .skip(3)
             .step_by(4)
             .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn dab_paints_across_a_tile_seam() {
+        let mut doc = Document::new(600, 100);
+        let brush = Brush {
+            size: 24.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color([255, 0, 0, 255]), 256.0, 50.0);
+        let px = &doc.layers[0].pixels;
+        assert_eq!(px.get4(((50 * 600 + 250) * 4) as usize)[3], 255);
+        assert_eq!(px.get4(((50 * 600 + 262) * 4) as usize)[3], 255);
+        assert_eq!(px.alloc_bytes(), 2 * 256 * 1024, "both tiles exist");
+    }
+
+    #[test]
+    fn eraser_clears_but_keeps_scene_undoable() {
+        let mut doc = Document::new(300, 300);
+        let brush = Brush {
+            size: 40.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color([10, 20, 30, 255]), 150.0, 150.0);
+        doc.checkpoint();
+        let eraser = Brush {
+            eraser: true,
+            ..brush
+        };
+        doc.dab(&eraser, Color([0, 0, 0, 255]), 150.0, 150.0);
+        // Destination-out clears alpha only; the color bytes of a fully
+        // transparent pixel are deliberately left alone (same contract as
+        // `stroke_paints_and_eraser_clears`), so the seam readback is
+        // [r, g, b, 0] rather than a zeroed pixel.
+        assert_eq!(
+            doc.layers[0].pixels.get4(((150 * 300 + 150) * 4) as usize),
+            [10, 20, 30, 0]
+        );
+        assert!(doc.undo());
+        assert_eq!(
+            doc.layers[0]
+                .pixels
+                .get(((150 * 300 + 150) * 4 + 3) as usize),
+            255
+        );
     }
 
     fn sample_library() -> Vec<BrushPreset> {

@@ -2875,11 +2875,22 @@ impl Document {
         let rx1 = (bx1 + reach).min(w - 1);
         let ry1 = (by1 + reach).min(h - 1);
         let rw = rx1 - rx0 + 1;
-        let src_pixels = self.layers[index].pixels.to_dense();
+        let sel = self.selection;
+        let Document {
+            layers,
+            selection_mask,
+            ..
+        } = self;
+        let mask = selection_mask.as_deref();
+        // Reads come from a bounded region copy (disc plus sample reach):
+        // sampling the tiles directly keeps an 8K push O(region) instead of
+        // materialising the whole layer twice per pointer move.
+        let pixels = &layers[index].pixels;
         let mut src = Vec::with_capacity((rw * (ry1 - ry0 + 1) * 4) as usize);
         for ry in ry0..=ry1 {
-            let s = ((ry * w + rx0) * 4) as usize;
-            src.extend_from_slice(&src_pixels[s..s + (rw * 4) as usize]);
+            for rx in rx0..=rx1 {
+                src.extend_from_slice(&pixels.get4(((ry * w + rx) * 4) as usize));
+            }
         }
         let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
             let sx = sx.clamp(0.0, w as f32 - 1.0);
@@ -2893,9 +2904,7 @@ impl Document {
                 + at(x0, y1) * (1.0 - fx) * fy
                 + at(x1, y1) * fx * fy
         };
-        let sel = self.selection;
-        let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let layer = &mut layers[index];
         for py in by0..=by1 {
             for px in bx0..=bx1 {
                 let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2)).sqrt()
@@ -2916,17 +2925,18 @@ impl Document {
                     continue;
                 }
                 let o = ((py * w + px) * 4) as usize;
-                if o + 3 >= pixels.len() {
+                if o + 3 >= layer.pixels.len() {
                     continue;
                 }
                 let k = Self::sel_k(mask, w, px, py);
-                for ch in 0..4 {
+                let mut dst = layer.pixels.get4(o);
+                for (ch, d) in dst.iter_mut().enumerate() {
                     let v = sample(ox, oy, ch);
-                    pixels[o + ch] = (pixels[o + ch] as f32 * (1.0 - k) + v * k).round() as u8;
+                    *d = (*d as f32 * (1.0 - k) + v * k).round() as u8;
                 }
+                layer.pixels.set4(o, dst);
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_dirty(bx0, by0, bx1, by1);
     }
 
@@ -6233,6 +6243,28 @@ mod tests {
         doc.liquify(0, 11.5, 15.5, 0.0, 0.0, 16.0, 1.0);
         doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 0.0);
         assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn liquify_pushes_across_a_tile_seam() {
+        use crate::brush::{Brush, Color};
+        // x = 256 is a tile seam; the push pulls red from the left tile
+        // into the right one, so the region read must cross the seam.
+        let mut doc = Document::new(520, 40);
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 0, 0, 255, 39);
+        doc.fill_rect(&brush, Color::rgb(0, 0, 255), 256, 0, 519, 39);
+        doc.liquify(0, 256.0, 20.0, 10.0, 0.0, 24.0, 1.0);
+        let at = |x: u32| doc.layers[0].pixels.get4(((20 * 520 + x) * 4) as usize);
+        assert_eq!(
+            at(257),
+            [255, 0, 0, 255],
+            "red is pulled across the seam from the left tile"
+        );
+        assert_eq!(at(400), [0, 0, 255, 255], "far field untouched");
     }
 
     #[test]
