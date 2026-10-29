@@ -35,6 +35,12 @@ struct PlannedLayer {
 #[derive(Clone, Debug, Default)]
 pub struct StackPlan {
     layers: Vec<PlannedLayer>,
+    /// `Document::revision()` at snapshot time. A mismatch means the plan
+    /// outlived the state it describes and would blend stale inputs.
+    rev: u64,
+    /// Layer count at snapshot time: structural edits that reorder or drop
+    /// layers bump `rev` too, but checking both makes a stale index obvious.
+    layer_count: usize,
 }
 
 impl Document {
@@ -74,12 +80,27 @@ impl Document {
                 tiled,
             });
         }
-        StackPlan { layers }
+        StackPlan {
+            layers,
+            rev: self.revision(),
+            layer_count: self.layers.len(),
+        }
     }
 
     /// One tile of the composite, `TILE * TILE * 4` bytes, row-major.
     /// Pixels outside the canvas are zero.
     pub fn composite_tile(&self, plan: &StackPlan, tx: u32, ty: u32) -> Vec<u8> {
+        // A stale plan would read layers by index after a reorder/removal.
+        debug_assert_eq!(
+            plan.rev,
+            self.revision(),
+            "stack plan is stale: rebuild it after document mutations"
+        );
+        debug_assert_eq!(
+            plan.layer_count,
+            self.layers.len(),
+            "stack plan is stale: layer count changed since the snapshot"
+        );
         let mut out = vec![0u8; (TILE * TILE * 4) as usize];
         let x0 = tx.saturating_mul(TILE);
         let y0 = ty.saturating_mul(TILE);
@@ -113,13 +134,13 @@ impl Document {
                         let Some(tile) = layer.pixels.tile(lx / TILE, ly / TILE) else {
                             continue;
                         };
-                        let (tx, ty) = (lx % TILE, ly % TILE);
-                        let off = ((ty * TILE + tx) * 4) as usize;
+                        let (tix, tiy) = (lx % TILE, ly % TILE);
+                        let off = ((tiy * TILE + tix) * 4) as usize;
                         // The mask shares the layer's geometry, so its
                         // tile-local byte is the reference's dense index.
                         let mask = layer.mask.as_ref().map(|m| {
                             m.tile(lx / TILE, ly / TILE)
-                                .map_or(0, |t| t[(ty * TILE + tx) as usize])
+                                .map_or(0, |t| t[(tiy * TILE + tix) as usize])
                         });
                         (
                             [tile[off], tile[off + 1], tile[off + 2], tile[off + 3]],
@@ -245,9 +266,13 @@ mod tests {
         let w = doc.w;
         for y in 0..70u32 {
             for x in 0..90u32 {
+                // Fractional, holey base: `below_a` stays below 1, so the
+                // clipped group member below is a real intersection and not
+                // an invisible `a * 1.0`.
+                let a = if (x * y) % 7 == 0 { 0 } else { 140 };
                 doc.layers[0].pixels.set4(
                     ((y * w + x) * 4) as usize,
-                    [(x * 2) as u8, (y * 3) as u8, (x + y) as u8, 255],
+                    [(x * 2) as u8, (y * 3) as u8, (x + y) as u8, a],
                 );
             }
         }
@@ -292,6 +317,121 @@ mod tests {
         doc.layers[lidx].pixels.fill(255);
         doc.move_layer_into_group(lidx, Some(hidden));
         doc.set_group_visible(hidden, false);
+        // Clipping *inside* a group: the clip flag and the stacked group
+        // opacities meet in one alpha, which the plan must reproduce.
+        doc.add_layer("clipped-in-group".into());
+        let clip_idx = doc.layers.len() - 1;
+        doc.layers[clip_idx].clip = true;
+        doc.layers[clip_idx].opacity = 0.66;
+        doc.layers[clip_idx].blend = BlendMode::Multiply;
+        doc.layers[clip_idx].ox = -5;
+        doc.layers[clip_idx].oy = 4;
+        for y in 0..70u32 {
+            for x in 0..90u32 {
+                let a = ((x * 13 + y * 9) % 256) as u8;
+                doc.layers[clip_idx]
+                    .pixels
+                    .set4(((y * w + x) * 4) as usize, [90, 220, 120, a]);
+            }
+        }
+        doc.move_layer_into_group(clip_idx, Some(outer));
+        doc
+    }
+
+    /// Mask and clip on the *same* layer: the mask scales `a` first, then
+    /// the clip multiplies it by the accumulated `below_a`. Both clipped
+    /// layers carry non-trivial opacities and offsets.
+    fn doc_with_mask_and_clip() -> Document {
+        let mut doc = Document::new(120, 90);
+        doc.background = [240, 235, 225, 255];
+        let w = doc.w;
+        // Fractional base alpha: clipping is a real intersection, not 0/1.
+        for y in 0..90u32 {
+            for x in 0..120u32 {
+                doc.layers[0].pixels.set4(
+                    ((y * w + x) * 4) as usize,
+                    [(x * 2) as u8, (y * 2) as u8, 170, ((x + 2 * y) % 200) as u8],
+                );
+            }
+        }
+        doc.add_layer("masked-clip-a".into());
+        doc.layers[1].clip = true;
+        doc.layers[1].opacity = 0.62;
+        doc.layers[1].ox = -9;
+        doc.layers[1].oy = 5;
+        for y in 0..90u32 {
+            for x in 0..120u32 {
+                doc.layers[1].pixels.set4(
+                    ((y * w + x) * 4) as usize,
+                    [250, 40, 70, ((x * 7 + y * 3) % 256) as u8],
+                );
+            }
+        }
+        let mask = doc.layers[1]
+            .mask
+            .get_or_insert_with(|| Raster::mask(w, doc.h));
+        for y in 0..90u32 {
+            for x in 0..120u32 {
+                // Hard 0 and 255 bands plus a mid band: conceal, reveal,
+                // and a fractional factor all feed the clipped alpha.
+                let v = match (x / 13) % 3 {
+                    0 => 0,
+                    1 => 255,
+                    _ => ((x * 5 + y * 9) % 256) as u8,
+                };
+                mask.set((y * w + x) as usize, v);
+            }
+        }
+        doc.add_layer("masked-clip-b".into());
+        doc.layers[2].clip = true;
+        doc.layers[2].opacity = 0.43;
+        doc.layers[2].ox = 6;
+        doc.layers[2].oy = -4;
+        for y in 0..90u32 {
+            for x in 0..120u32 {
+                doc.layers[2].pixels.set4(
+                    ((y * w + x) * 4) as usize,
+                    [10, 200, 240, ((x * 3 + y * 5) % 256) as u8],
+                );
+            }
+        }
+        let mask = doc.layers[2]
+            .mask
+            .get_or_insert_with(|| Raster::mask(w, doc.h));
+        for y in 0..90u32 {
+            for x in 0..120u32 {
+                mask.set((y * w + x) as usize, ((y * 11 + x * 3) % 256) as u8);
+            }
+        }
+        doc
+    }
+
+    /// 513x300: three tile columns and two tile rows, so tiles are partial in
+    /// both axes and tile row 1 starts at `y = 256`.
+    fn doc_wide_513_300() -> Document {
+        let mut doc = Document::new(513, 300);
+        doc.background = [0, 0, 0, 255];
+        let w = doc.w;
+        for y in 0..300u32 {
+            for x in 0..513u32 {
+                if (x / 17 + y / 11) % 4 == 0 {
+                    doc.layers[0]
+                        .pixels
+                        .set4(((y * w + x) * 4) as usize, [x as u8, y as u8, 77, 255]);
+                }
+            }
+        }
+        doc.add_layer("top".into());
+        doc.layers[1].opacity = 0.4;
+        doc.layers[1].ox = -200;
+        doc.layers[1].oy = 100;
+        for y in 0..300u32 {
+            for x in 0..513u32 {
+                doc.layers[1]
+                    .pixels
+                    .set4(((y * w + x) * 4) as usize, [9, 200, 31, 255]);
+            }
+        }
         doc
     }
 
@@ -364,32 +504,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "stack plan is stale")]
+    fn stale_plan_trips_the_debug_assert() {
+        // A structural edit after the snapshot invalidates the plan; using
+        // it anyway would blend the wrong layer inputs.
+        let mut doc = doc_with_everything();
+        let plan = doc.stack_plan();
+        doc.add_layer("late".into());
+        let _ = doc.composite_tile(&plan, 0, 0);
+    }
+
+    #[test]
     fn edge_tiles_cover_canvas_edges() {
         // 513x300 spans three tile columns and two tile rows, so every
         // edge tile is partial in one or both axes.
-        let mut doc = Document::new(513, 300);
-        doc.background = [0, 0, 0, 255];
-        let w = doc.w;
-        for y in 0..300u32 {
-            for x in 0..513u32 {
-                if (x / 17 + y / 11) % 4 == 0 {
-                    doc.layers[0]
-                        .pixels
-                        .set4(((y * w + x) * 4) as usize, [x as u8, y as u8, 77, 255]);
-                }
-            }
-        }
-        doc.add_layer("top".into());
-        doc.layers[1].opacity = 0.4;
-        doc.layers[1].ox = -200;
-        doc.layers[1].oy = 100;
-        for y in 0..300u32 {
-            for x in 0..513u32 {
-                doc.layers[1]
-                    .pixels
-                    .set4(((y * w + x) * 4) as usize, [9, 200, 31, 255]);
-            }
-        }
+        let doc = doc_wide_513_300();
         assert_tile_parity(&doc);
         assert_flatten_parity(&doc);
         // A 1x1 canvas and an exact multiple of the tile side.
@@ -486,6 +616,39 @@ mod tests {
     }
 
     #[test]
+    fn mask_and_clip_on_the_same_layer_match_reference() {
+        // The contract calls out mask and clip meeting on one layer: the
+        // mask factor and the clip intersection must compose in the same
+        // order (and with the same rounding) as the reference.
+        let doc = doc_with_mask_and_clip();
+        assert_tile_parity(&doc);
+        assert_flatten_parity(&doc);
+        // Non-vacuity: dropping either factor must move pixels, so a future
+        // fixture edit cannot leave the combination silently untested.
+        let mut no_mask = doc.clone();
+        no_mask.layers[1].mask = None;
+        no_mask.layers[2].mask = None;
+        let mut no_clip = doc.clone();
+        no_clip.layers[1].clip = false;
+        no_clip.layers[2].clip = false;
+        assert_ne!(doc.flatten(), no_mask.flatten(), "mask has no effect");
+        assert_ne!(doc.flatten(), no_clip.flatten(), "clip has no effect");
+    }
+
+    #[test]
+    fn clip_inside_a_group_changes_the_composite() {
+        // Guards the group fixture: an opaque base pins `below_a` at 1 and
+        // would turn the clipped group member into a silent no-op, leaving
+        // clip-in-group untested even though parity still passes.
+        let grouped = doc_with_groups();
+        let mut unclipped = grouped.clone();
+        for layer in unclipped.layers.iter_mut() {
+            layer.clip = false;
+        }
+        assert_ne!(grouped.flatten(), unclipped.flatten(), "clip is a no-op");
+    }
+
+    #[test]
     fn foreign_raster_geometry_matches_reference() {
         // File readers reject these, but the type allows them: the plan must
         // fall back to dense reads and stay byte-identical.
@@ -508,7 +671,11 @@ mod tests {
 
     #[test]
     fn flatten_region_matches_reference_in_canvas_order() {
-        for doc in [doc_with_everything(), doc_with_groups()] {
+        for doc in [
+            doc_with_everything(),
+            doc_with_groups(),
+            doc_with_mask_and_clip(),
+        ] {
             for (x0, y0, x1, y1) in [
                 (0, 0, 0, 0),
                 (5, 7, 5, 7),
@@ -525,6 +692,24 @@ mod tests {
                     doc.h
                 );
             }
+        }
+    }
+
+    #[test]
+    fn flatten_region_crosses_a_tile_row() {
+        // On the small fixtures every region clamps below y = 200, so the
+        // outer `ty` loop in `flatten_region` only ever ran once. Straddle
+        // the y = 256 tile-row boundary on the 513x300 canvas.
+        let doc = doc_wide_513_300();
+        for (x0, y0, x1, y1) in [
+            (500, 250, 520, 260),
+            (250, 255, 260, 257),
+            (0, 250, 600, 262),
+        ] {
+            let got = doc.flatten_region(x0, y0, x1, y1);
+            let want = region_reference(&doc, x0, y0, x1, y1);
+            assert_eq!(got.len(), want.len(), "region {x0},{y0}..{x1},{y1} size");
+            assert_eq!(got, want, "region {x0},{y0}..{x1},{y1}");
         }
     }
 }
