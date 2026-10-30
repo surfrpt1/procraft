@@ -916,6 +916,85 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Move a layer up one level: out of its group into the group's parent
+    /// (the top level for a root group). The stack position is kept, so the
+    /// canvas does not restack. Returns false for a top-level or invalid
+    /// layer.
+    pub fn move_layer_out_of_group(&mut self, index: usize) -> bool {
+        let Some(group) = self.layers.get(index).and_then(|l| l.group) else {
+            return false;
+        };
+        let parent = self.group(group).and_then(|g| g.parent);
+        self.layers[index].group = parent;
+        self.mark_full_dirty();
+        true
+    }
+
+    /// Layer indexes inside `id`, nested groups included.
+    pub fn group_layer_indexes(&self, id: u32) -> Vec<usize> {
+        let mut ids = vec![id];
+        let mut k = 0;
+        while k < ids.len() {
+            let cur = ids[k];
+            for g in &self.groups {
+                if g.parent == Some(cur) && !ids.contains(&g.id) {
+                    ids.push(g.id);
+                }
+            }
+            k += 1;
+        }
+        (0..self.layers.len())
+            .filter(|&i| self.layers[i].group.is_some_and(|g| ids.contains(&g)))
+            .collect()
+    }
+
+    /// Whether `move_group` would change the stack: the group's layers must
+    /// form one contiguous block with a layer to swap past.
+    pub fn can_move_group(&self, id: u32, up: bool) -> bool {
+        let list = self.group_layer_indexes(id);
+        let Some((&lo, &hi)) = list.first().zip(list.last()) else {
+            return false;
+        };
+        if hi - lo + 1 != list.len() {
+            return false;
+        }
+        if up {
+            hi + 1 < self.layers.len()
+        } else {
+            lo > 0
+        }
+    }
+
+    /// Move a group's whole layer block one step up (`up`) or down, carrying
+    /// nested groups with it. Returns false and leaves the stack alone for
+    /// empty groups and for groups interleaved with other layers.
+    pub fn move_group(&mut self, id: u32, up: bool) -> bool {
+        if !self.can_move_group(id, up) {
+            return false;
+        }
+        let list = self.group_layer_indexes(id);
+        let (lo, hi) = (list[0], list[list.len() - 1]);
+        if up {
+            let other = self.layers.remove(hi + 1);
+            self.layers.insert(lo, other);
+            if self.active == hi + 1 {
+                self.active = lo;
+            } else if self.active >= lo && self.active <= hi {
+                self.active += 1;
+            }
+        } else {
+            let other = self.layers.remove(lo - 1);
+            self.layers.insert(hi, other);
+            if self.active == lo - 1 {
+                self.active = hi;
+            } else if self.active >= lo && self.active <= hi {
+                self.active -= 1;
+            }
+        }
+        self.mark_full_dirty();
+        true
+    }
+
     /// Disband a group: member layers (and subgroups) move up one level,
     /// the group row disappears. Contents always survive (no destructive
     /// group delete in v1).
@@ -4115,6 +4194,100 @@ mod tests {
         doc.ungroup(outer);
         assert!(doc.groups.is_empty());
         assert!(doc.layers.iter().all(|l| l.group.is_none()));
+    }
+
+    #[test]
+    fn move_out_of_group_keeps_the_stack_position() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert!(doc.move_layer_out_of_group(0));
+        assert_eq!(doc.layers[0].group, None);
+        // Leaving the group must not restack the canvas.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "b", "c"]);
+        // A top-level layer has nowhere to go.
+        assert!(!doc.move_layer_out_of_group(0));
+        // Out-of-range indexes are a no-op, not a panic.
+        assert!(!doc.move_layer_out_of_group(9));
+    }
+
+    #[test]
+    fn move_out_of_a_nested_group_lands_in_the_parent() {
+        let mut doc = Document::new(1, 1);
+        let outer = doc.new_group("outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc
+            .group_layer(0, "inner".to_string())
+            .expect("layer 0 groups");
+        assert!(doc.move_layer_out_of_group(0));
+        assert_eq!(doc.layers[0].group, Some(outer));
+        assert!(doc.group(inner).is_some());
+    }
+
+    #[test]
+    fn move_group_shifts_its_whole_block() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        doc.active = 0;
+        assert!(doc.move_group(g, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["b", "Layer 1", "c"]);
+        assert_eq!(doc.layers[0].group, None);
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+        assert!(doc.move_group(g, true));
+        assert_eq!(doc.layers[2].group, Some(g));
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+        // Already at the top of the stack.
+        assert!(!doc.can_move_group(g, true));
+        assert!(!doc.move_group(g, true));
+        assert!(doc.move_group(g, false));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["b", "Layer 1", "c"]);
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+    }
+
+    #[test]
+    fn move_group_refuses_interleaved_members() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        doc.add_layer("d".to_string());
+        let g = doc
+            .group_layers(&[0, 2], "g".to_string())
+            .expect("two layers group");
+        assert!(!doc.can_move_group(g, true));
+        assert!(!doc.move_group(g, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn move_group_carries_nested_layers() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        let outer = doc.new_group("outer".to_string());
+        let inner = doc.new_group("inner".to_string());
+        doc.groups.iter_mut().find(|g| g.id == inner).unwrap().parent = Some(outer);
+        doc.layers[0].group = Some(outer);
+        doc.layers[1].group = Some(inner);
+        doc.add_layer("above".to_string());
+        assert!(doc.can_move_group(outer, true));
+        assert!(doc.move_group(outer, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["above", "Layer 1", "b"]);
+        assert_eq!(doc.layers[1].group, Some(outer));
+        assert_eq!(doc.layers[2].group, Some(inner));
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        // A group with no layers has no stacking position to move.
+        let empty = doc.new_group("empty".to_string());
+        assert!(!doc.can_move_group(empty, true));
+        assert!(!doc.can_move_group(empty, false));
     }
 
     #[test]

@@ -667,6 +667,60 @@ struct GroupRowActions {
     ungroup: Option<u32>,
     opacity: Option<(u32, f32)>,
     rename: Option<(u32, String)>,
+    /// `(group, up)` from the header menu.
+    reorder: Option<(u32, bool)>,
+}
+
+/// What a batch of header presses changed: `dirty` means the canvas ghost
+/// needs a rebuild, `status` is the line to show.
+#[derive(Default)]
+struct GroupActionReport {
+    status: Option<String>,
+    dirty: bool,
+}
+
+/// Apply the header presses collected during the row loop. Split out of the
+/// draw so the wiring is testable without an egui context.
+fn apply_group_actions(doc: &mut Document, acts: &GroupRowActions) -> GroupActionReport {
+    let mut report = GroupActionReport::default();
+    if let Some(gid) = acts.collapse {
+        let cur = doc.group(gid).is_some_and(|g| g.collapsed);
+        doc.set_group_collapsed(gid, !cur);
+    }
+    if let Some(gid) = acts.eye {
+        let cur = doc.group(gid).is_none_or(|g| g.visible);
+        doc.set_group_visible(gid, !cur);
+        report.dirty = true;
+    }
+    if let Some((gid, up)) = acts.reorder {
+        if doc.move_group(gid, up) {
+            let name = doc.group(gid).map_or(String::new(), |g| g.name.clone());
+            report.status = Some(format!("{name} moved {}.", if up { "up" } else { "down" }));
+            report.dirty = true;
+        }
+    }
+    if let Some(gid) = acts.add {
+        let active = doc.active;
+        doc.move_layer_into_group(active, Some(gid));
+        report.dirty = true;
+        report.status = Some(format!(
+            "{} moved into the group.",
+            doc.layers[doc.active].name
+        ));
+    }
+    if let Some(gid) = acts.ungroup {
+        doc.ungroup(gid);
+        report.dirty = true;
+        report.status = Some("Group disbanded (layers kept).".to_string());
+    }
+    if let Some((gid, op)) = acts.opacity {
+        doc.set_group_opacity(gid, op);
+        report.dirty = true;
+    }
+    if let Some((gid, name)) = acts.rename.as_ref() {
+        doc.rename_group(*gid, name.clone());
+    }
+    report
 }
 
 /// Inline member count for a group header (`(3)`). Empty groups show an
@@ -703,6 +757,18 @@ fn next_layer_selection(
         return next;
     }
     vec![target]
+}
+
+/// Consume a pending "bring this row into view" request when the row it
+/// names is drawn. The request must fire once: the header redraws every
+/// frame, and repeating the scroll would fight the user's own scrolling.
+fn take_scroll_request(request: &mut Option<u32>, id: u32) -> bool {
+    if *request == Some(id) {
+        *request = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Status line after "New group": naming the parent explains why the new
@@ -1193,6 +1259,9 @@ struct ProCraftApp {
     renaming: Option<usize>,
     renaming_text: String,
     group_renaming: Option<u32>,
+    /// Group header the panel should bring into view, set by "New group".
+    /// Consumed by the matching row on the next draw.
+    group_scroll: Option<u32>,
     /// Multi-selection for the Layers panel, as layer indexes. Always
     /// contains the active layer, and resets when the layer count changes
     /// (add, duplicate, merge, delete, undo) since indexes are not ids.
@@ -1473,6 +1542,7 @@ impl ProCraftApp {
             renaming: None,
             renaming_text: String::new(),
             group_renaming: None,
+            group_scroll: None,
             layer_selection: Vec::new(),
             layer_count_marker: 0,
             group_name_edit: String::new(),
@@ -3928,7 +3998,7 @@ impl ProCraftApp {
         else {
             return;
         };
-        ui.horizontal_wrapped(|ui| {
+        let header = ui.horizontal_wrapped(|ui| {
             ui.add_space(depth as f32 * 12.0);
             if ui
                 .small_button(if collapsed { "+" } else { "−" })
@@ -4018,21 +4088,61 @@ impl ProCraftApp {
             if members == 0 {
                 ui.weak("empty");
             }
-            if ui
-                .small_button("+Add")
-                .on_hover_text("Move active layer into this group")
-                .clicked()
-            {
-                acts.add = Some(id);
-            }
-            if ui
-                .small_button("Ungroup")
-                .on_hover_text("Disband group (keeps layers)")
-                .clicked()
-            {
-                acts.ungroup = Some(id);
+            // Secondary actions sit behind one menu so the header stays a
+            // single line in the narrow drawer.
+            let can_up = self.doc.can_move_group(id, true);
+            let can_down = self.doc.can_move_group(id, false);
+            let mut start_rename = false;
+            ui.menu_button(if self.has_symbols { "⋯" } else { "..." }, |ui| {
+                if ui.button("Rename group").clicked() {
+                    start_rename = true;
+                    ui.close();
+                }
+                if ui
+                    .button("Add active layer")
+                    .on_hover_text("Move the active layer into this group")
+                    .clicked()
+                {
+                    acts.add = Some(id);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(can_up, egui::Button::new("Move up"))
+                    .on_disabled_hover_text("Already at the top of the stack")
+                    .clicked()
+                {
+                    acts.reorder = Some((id, true));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(can_down, egui::Button::new("Move down"))
+                    .on_disabled_hover_text("Already at the bottom of the stack")
+                    .clicked()
+                {
+                    acts.reorder = Some((id, false));
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button("Ungroup")
+                    .on_hover_text("Disband group (keeps layers)")
+                    .clicked()
+                {
+                    acts.ungroup = Some(id);
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Group actions");
+            if start_rename {
+                self.group_renaming = Some(id);
+                self.group_name_edit = name.clone();
             }
         });
+        if take_scroll_request(&mut self.group_scroll, id) {
+            header.response.scroll_to_me(Some(egui::Align::Center));
+        }
         // Collapsed and empty groups keep a single line.
         if !collapsed && members > 0 {
             ui.horizontal(|ui| {
@@ -4101,13 +4211,15 @@ impl ProCraftApp {
                             [only] => self.doc.layers[*only].name.clone(),
                             many => format!("{} layers", many.len()),
                         };
-                        if self.doc.group_layers(&selection, name.clone()).is_some() {
+                        if let Some(id) = self.doc.group_layers(&selection, name.clone()) {
                             self.ghost_dirty = true;
                             self.status =
                                 group_created_status(&name, parent_name.as_deref(), &targets);
+                            self.group_scroll = Some(id);
                         }
                     }
                     let mut remove = None;
+                    let mut move_out = None;
                     let mut select = None;
                     let mut touched = false;
                     let mut acts = GroupRowActions::default();
@@ -4199,6 +4311,14 @@ impl ProCraftApp {
                                     self.renaming_text = layer.name.clone();
                                 }
                             }
+                            if layer.group.is_some()
+                                && ui
+                                    .small_button(if self.has_symbols { "↥" } else { "Out" })
+                                    .on_hover_text("Move layer out of its group")
+                                    .clicked()
+                            {
+                                move_out = Some(i);
+                            }
                             if ui
                                 .add_sized([44.0, 24.0], egui::Button::new("del"))
                                 .clicked()
@@ -4216,6 +4336,10 @@ impl ProCraftApp {
                             }
                         });
                     }
+                    // A request the rows did not consume (its group sits under
+                    // a collapsed ancestor) is dropped rather than saved for a
+                    // surprise scroll when that ancestor is expanded.
+                    self.group_scroll = None;
                     if let Some(i) = select {
                         self.doc.active = i;
                         // A fresh full upload (matters for the mask viewer).
@@ -4224,48 +4348,13 @@ impl ProCraftApp {
                             self.status = "Active layer is in a hidden group.".to_string();
                         }
                     }
-                    if let Some(gid) = acts.collapse {
-                        let cur = self
-                            .doc
-                            .groups
-                            .iter()
-                            .find(|g| g.id == gid)
-                            .is_some_and(|g| g.collapsed);
-                        self.doc.set_group_collapsed(gid, !cur);
-                    }
-                    if let Some(gid) = acts.eye {
-                        let cur = self
-                            .doc
-                            .groups
-                            .iter()
-                            .find(|g| g.id == gid)
-                            .is_none_or(|g| g.visible);
-                        self.doc.set_group_visible(gid, !cur);
+                    let report = apply_group_actions(&mut self.doc, &acts);
+                    if report.dirty {
                         self.ghost_dirty = true;
                         self.doc.mark_full_dirty();
                     }
-                    if let Some(gid) = acts.add {
-                        let active = self.doc.active;
-                        self.doc.move_layer_into_group(active, Some(gid));
-                        self.ghost_dirty = true;
-                        self.status = format!(
-                            "{} moved into the group.",
-                            self.doc.layers[self.doc.active].name
-                        );
-                    }
-                    if let Some(gid) = acts.ungroup {
-                        self.doc.ungroup(gid);
-                        self.ghost_dirty = true;
-                        self.doc.mark_full_dirty();
-                        self.status = "Group disbanded (layers kept).".to_string();
-                    }
-                    if let Some((gid, op)) = acts.opacity {
-                        self.doc.set_group_opacity(gid, op);
-                        self.ghost_dirty = true;
-                        self.doc.mark_full_dirty();
-                    }
-                    if let Some((gid, name)) = acts.rename {
-                        self.doc.rename_group(gid, name);
+                    if let Some(status) = report.status {
+                        self.status = status;
                     }
                     if touched {
                         self.ghost_dirty = true;
@@ -4274,6 +4363,13 @@ impl ProCraftApp {
                     if let Some(i) = remove {
                         self.ghost_dirty = true;
                         self.doc.remove_layer(i);
+                    }
+                    if let Some(i) = move_out {
+                        let name = self.doc.layers[i].name.clone();
+                        if self.doc.move_layer_out_of_group(i) {
+                            self.ghost_dirty = true;
+                            self.status = format!("{name} moved out of the group.");
+                        }
                     }
                 },
             );
@@ -5998,7 +6094,10 @@ impl ProCraftApp {
             } else {
                 "mobile-drawer-layers"
             }))
-            .order(egui::Order::Foreground)
+            // One tier below popups: pressing a button in the drawer raises
+            // the area to the top of its own order, which would otherwise put
+            // the drawer over a menu opened from it. Menus are Foreground.
+            .order(egui::Order::Middle)
             // Areas are clamped into the viewport by default, which pins the
             // closed drawer to the edge and kills the slide. Let it sit off
             // screen; the viewport clip still trims it.
@@ -15481,6 +15580,116 @@ mod tests {
             group_created_status("Group 2", Some("Group 1"), "Layer 3"),
             "Group 2 created inside Group 1 with Layer 3."
         );
+    }
+
+    #[test]
+    fn scroll_request_fires_once_for_its_group() {
+        let mut request = Some(7);
+        assert!(take_scroll_request(&mut request, 7));
+        assert_eq!(request, None);
+        // The header redraws every frame; repeating the request would fight
+        // the user's own scrolling.
+        assert!(!take_scroll_request(&mut request, 7));
+    }
+
+    #[test]
+    fn scroll_request_waits_for_its_group_row() {
+        let mut request = Some(7);
+        assert!(!take_scroll_request(&mut request, 3));
+        assert_eq!(request, Some(7));
+        assert!(!take_scroll_request(&mut None, 7));
+    }
+
+    #[test]
+    fn group_actions_apply_each_header_press() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        // Rename only changes the name.
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                rename: Some((g, "Renamed".to_string())),
+                ..Default::default()
+            },
+        );
+        assert_eq!(doc.group(g).unwrap().name, "Renamed");
+        assert!(!report.dirty);
+        assert!(report.status.is_none());
+        // The eye toggles visibility and dirties the view.
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                eye: Some(g),
+                ..Default::default()
+            },
+        );
+        assert!(!doc.group(g).unwrap().visible);
+        assert!(report.dirty);
+        // Collapse toggles without dirtying the view.
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                collapse: Some(g),
+                ..Default::default()
+            },
+        );
+        assert!(doc.group(g).unwrap().collapsed);
+        assert!(!report.dirty);
+        // Add pulls the active layer in and names it in the status.
+        doc.active = 1;
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                add: Some(g),
+                ..Default::default()
+            },
+        );
+        assert_eq!(doc.layers.iter().filter(|l| l.group == Some(g)).count(), 2);
+        assert_eq!(report.status.as_deref(), Some("b moved into the group."));
+        // Dispose of one member so the group still has a block to move.
+        assert!(doc.move_layer_out_of_group(1));
+        // Ungroup disbands and reports it.
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                ungroup: Some(g),
+                ..Default::default()
+            },
+        );
+        assert!(doc.group(g).is_none());
+        assert_eq!(
+            report.status.as_deref(),
+            Some("Group disbanded (layers kept).")
+        );
+        assert!(report.dirty);
+    }
+
+    #[test]
+    fn group_actions_move_the_group_and_report_it() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                reorder: Some((g, true)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert!(report.dirty);
+        assert_eq!(report.status.as_deref(), Some("g moved up."));
+        // Already at the top: the blocked move reports nothing.
+        let report = apply_group_actions(
+            &mut doc,
+            &GroupRowActions {
+                reorder: Some((g, true)),
+                ..Default::default()
+            },
+        );
+        assert!(!report.dirty);
+        assert!(report.status.is_none());
     }
 
     #[test]
