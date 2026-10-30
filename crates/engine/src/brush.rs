@@ -94,6 +94,9 @@ pub struct Taper {
     pub pressure: f32,
 }
 
+/// Taper span in brush diameters: at 1.0, an end fades over six widths.
+pub const TAPER_DIAMETERS: f32 = 6.0;
+
 impl Default for Taper {
     fn default() -> Self {
         Self::NONE
@@ -134,6 +137,33 @@ impl Taper {
             1.0
         };
         let f = rise.min(fall);
+        self.shape_of(f)
+    }
+
+    /// Taper factor from canvas distances: `from_start` travelled so far
+    /// and `to_end` still to go, for a brush `size` px wide. Each end fades
+    /// over `start`/`end` × [`TAPER_DIAMETERS`] brush diameters, so live
+    /// dabs need no final stroke length and the release replay reproduces
+    /// them exactly.
+    pub fn distance_factor(&self, from_start: f32, to_end: f32, size: f32) -> f32 {
+        let span = size.max(1.0) * TAPER_DIAMETERS;
+        let rise = ramp(from_start, self.start, span);
+        let fall = ramp(to_end, self.end, span);
+        self.shape_of(rise.min(fall))
+    }
+
+    /// Live taper for a dab at `from_start` px into the stroke. Only the
+    /// start ramp is known while the pen is down; the end ramp needs the
+    /// final length and is applied once on release ([`distance_factor`]).
+    /// Passing 0 for the end here would apply the *full* end ramp to every
+    /// live dab, so the stroke would be painted thin while drawing and
+    /// repainted at full width on lift.
+    pub fn live_factor(&self, from_start: f32, size: f32) -> f32 {
+        let span = size.max(1.0) * TAPER_DIAMETERS;
+        self.shape_of(ramp(from_start, self.start, span))
+    }
+
+    fn shape_of(&self, f: f32) -> f32 {
         let smooth = f * f * (3.0 - 2.0 * f);
         f + (smooth - f) * clamp01(self.shape)
     }
@@ -151,6 +181,16 @@ impl Taper {
 
 fn clamp01(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
+}
+
+/// One taper ramp: 0 at the tip, 1 once `dist` reaches `amount` × `span`.
+/// `amount` 0 means that end of the stroke has no taper.
+fn ramp(dist: f32, amount: f32, span: f32) -> f32 {
+    if amount <= 0.0 {
+        1.0
+    } else {
+        (dist / (clamp01(amount) * span)).clamp(0.0, 1.0)
+    }
 }
 
 // serde defaults for the fields added in M14: old `.pcbrush` files without
@@ -219,6 +259,27 @@ fn hash01(x: i32, y: i32) -> f32 {
 fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
     let cell = ((3.0 * scale.clamp(0.25, 4.0)).round() as u32).max(1);
     hash01((px / cell) as i32, (py / cell) as i32)
+}
+
+/// Bilinear tap of an imported stamp tip at texel-space `(tx, ty)`.
+/// Texels outside the tip read as transparent, so scaled tips keep a
+/// soft edge instead of blocky nearest-neighbour steps.
+fn sample_tip(tip: &BrushTip, tx: f32, ty: f32) -> f32 {
+    let x = tx - 0.5;
+    let y = ty - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let mut acc = 0.0;
+    for (dy, wy) in [(0.0, 1.0 - fy), (1.0, fy)] {
+        for (dx, wx) in [(0.0, 1.0 - fx), (1.0, fx)] {
+            let (ix, iy) = (x0 + dx, y0 + dy);
+            if ix < 0.0 || iy < 0.0 || ix >= tip.w as f32 || iy >= tip.h as f32 {
+                continue;
+            }
+            acc += tip.mask[(iy as u32 * tip.w + ix as u32) as usize] as f32 / 255.0 * wx * wy;
+        }
+    }
+    acc
 }
 
 /// Grain sample 0.0..=1.0: an imported grayscale texture tiled across the
@@ -434,7 +495,10 @@ impl Default for Brush {
         Self {
             size: 24.0,
             opacity: 1.0,
-            softness: 0.6,
+            // Hard-ish by convention: a brush you cannot see the edge of
+            // reads as out of focus, and every paint app ships its default
+            // round around 80% hardness. Softness is one slider away.
+            softness: 0.2,
             spacing: 0.15,
             eraser: false,
             tip: None,
@@ -546,6 +610,56 @@ fn sample_curve(curve: &[[f32; 2]], pressure: f32) -> f32 {
 }
 
 impl Document {
+    /// Open a stroke scope: the per-pixel coverage peak resets, so the next
+    /// dabs measure against a clean slate. Stroke walkers call this at the
+    /// first segment; call it directly after an explicit lift.
+    pub fn begin_stroke(&mut self) {
+        self.stroke_peak = Some(crate::raster::Raster::mask(self.w, self.h));
+        self.stroke_rect = None;
+    }
+
+    /// Close the active stroke: the next dab opens a fresh one (and the
+    /// peak raster is freed).
+    pub fn end_stroke(&mut self) {
+        self.stroke_peak = None;
+        self.stroke_rect = None;
+    }
+
+    /// Canvas bbox (inclusive) painted by the active stroke, if any.
+    pub fn stroke_rect(&self) -> Option<(u32, u32, u32, u32)> {
+        self.stroke_rect
+    }
+
+    /// Increment that lifts a pixel's stroke coverage from `seen` to
+    /// `target` (both 0..=255). Source-over is sequential, so the second
+    /// pass has to close the *remaining* gap: `(target - seen) / (1 - seen)`.
+    /// Straight subtraction leaves the stroke short of its target (a soft
+    /// brush plateaus around two thirds of its opacity).
+    fn stroke_delta(target: u8, seen: u8) -> u8 {
+        if target <= seen {
+            return 0;
+        }
+        let gap = (target - seen) as u32;
+        let left = (255 - seen) as u32;
+        ((gap * 255 + left / 2) / left) as u8
+    }
+
+    /// Grow a stroke bbox (inclusive) from a dab's canvas bounds. A free
+    /// function so dab loops can pass the field alone, keeping the layers
+    /// borrow disjoint.
+    fn grow_stroke_rect(
+        rect: &mut Option<(u32, u32, u32, u32)>,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) {
+        *rect = Some(match *rect {
+            Some((ax, ay, bx, by)) => (ax.min(x0), ay.min(y0), bx.max(x1), by.max(y1)),
+            None => (x0, y0, x1, y1),
+        });
+    }
+
     /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer,
     /// mirrored per [`Document::symmetry`].
     /// Pixels outside [`Document::selection`] (when set) are skipped.
@@ -554,6 +668,9 @@ impl Document {
     /// mask value, the eraser reveals). Shapes, fills and flood fill always
     /// paint color.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        // A lone dab is its own stroke: without a fresh peak, repeated taps
+        // would keep folding into the previous gesture's coverage map.
+        self.begin_stroke();
         // Single dabs (stroke starts, shape taps) paint at full pressure:
         // resolve(1, 0) returns exactly size/opacity, angle 0 keeps the
         // dab round unless the preset squeezes it.
@@ -643,10 +760,11 @@ impl Document {
         if self.layers[self.active].mask.is_none() {
             self.add_mask(self.active);
         }
-        let x0 = (x - radius).floor().max(0.0) as u32;
-        let y0 = (y - radius).floor().max(0.0) as u32;
-        let x1 = (x + radius).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
-        let y1 = (y + radius).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        // One extra pixel each way for the anti-aliasing rim.
+        let x0 = (x - radius - 1.0).floor().max(0.0) as u32;
+        let y0 = (y - radius - 1.0).floor().max(0.0) as u32;
+        let x1 = (x + radius + 1.0).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + radius + 1.0).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -666,6 +784,8 @@ impl Document {
             let c = color.0;
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let mut peak = self.stroke_peak.as_mut();
         let edge = brush.softness.clamp(0.0, 1.0);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
@@ -693,17 +813,17 @@ impl Document {
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                 let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
                 let d = (u * u + v * v).sqrt() / radius;
-                if d > 1.0 {
+                if d > 1.0 + 0.5 / radius {
                     continue;
                 }
-                let falloff = if d <= 1.0 - edge {
+                let falloff = if edge <= 0.0 || d <= 1.0 - edge {
                     1.0
                 } else {
-                    1.0 - (d - (1.0 - edge)) / edge.max(0.001)
+                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
-                let mut a =
-                    (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(sel_mask, w, px, py))
-                        .clamp(0.0, 1.0);
+                let coverage = ((1.0 - d) * radius + 0.5).clamp(0.0, 1.0);
+                let mut a = (falloff * coverage * strength * Document::sel_k(sel_mask, w, px, py))
+                    .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
@@ -720,6 +840,21 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
+                // Mask coverage telescopes like Normal paint: the strongest
+                // dab this stroke sets the pixel, later dabs add nothing.
+                let a = match peak.as_mut() {
+                    Some(p) => {
+                        let i = (py * w + px) as usize;
+                        let seen = p.get(i);
+                        let da = (a * 255.0).round() as u8;
+                        if da <= seen {
+                            continue;
+                        }
+                        p.set(i, da);
+                        Document::stroke_delta(da, seen) as f32 / 255.0
+                    }
+                    None => a,
+                };
                 layer_mask.set(
                     o,
                     (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8,
@@ -728,8 +863,8 @@ impl Document {
         }
     }
 
-    /// Mask dab through an imported stamp tip (nearest-neighbor at brush
-    /// size, like [`Document::dab_stamp`] but writing luminance).
+    /// Mask dab through an imported stamp tip (bilinear at brush size, like
+    /// [`Document::dab_stamp`] but writing luminance).
     #[allow(clippy::too_many_arguments)]
     fn dab_mask_stamp_resolved(
         &mut self,
@@ -797,6 +932,8 @@ impl Document {
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let mut peak = self.stroke_peak.as_mut();
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
         let half_w = size * 0.5;
@@ -825,15 +962,12 @@ impl Document {
                 } else {
                     (ox, oy / round)
                 };
-                let tx = ((rx + half_w) / scale) as i32;
-                let ty = ((ry + half_h) / scale) as i32;
-                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                let texel = sample_tip(tip, (rx + half_w) / scale, (ry + half_h) / scale);
+                if texel <= 0.0 {
                     continue;
                 }
-                let mut a = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength
-                    * Document::sel_k(sel_mask, w, px, py))
-                .clamp(0.0, 1.0);
+                let mut a =
+                    (texel * strength * Document::sel_k(sel_mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
                     a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
@@ -849,6 +983,21 @@ impl Document {
                 if o >= layer_mask.len() {
                     continue;
                 }
+                // Mask coverage telescopes like Normal paint (see the round
+                // mask dab).
+                let a = match peak.as_mut() {
+                    Some(p) => {
+                        let i = (py * w + px) as usize;
+                        let seen = p.get(i);
+                        let da = (a * 255.0).round() as u8;
+                        if da <= seen {
+                            continue;
+                        }
+                        p.set(i, da);
+                        Document::stroke_delta(da, seen) as f32 / 255.0
+                    }
+                    None => a,
+                };
                 layer_mask.set(
                     o,
                     (value * a + layer_mask.get(o) as f32 * (1.0 - a)).round() as u8,
@@ -878,10 +1027,12 @@ impl Document {
         if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
-        let x0 = (x - radius).floor().max(0.0) as u32;
-        let y0 = (y - radius).floor().max(0.0) as u32;
-        let x1 = (x + radius).ceil().min(w - 1.0).max(0.0) as u32;
-        let y1 = (y + radius).ceil().min(h - 1.0).max(0.0) as u32;
+        // One extra pixel each way: the anti-aliasing rim reaches half a
+        // pixel past the geometric disc.
+        let x0 = (x - radius - 1.0).floor().max(0.0) as u32;
+        let y0 = (y - radius - 1.0).floor().max(0.0) as u32;
+        let x1 = (x + radius + 1.0).ceil().min(w - 1.0).max(0.0) as u32;
+        let y1 = (y + radius + 1.0).ceil().min(h - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -898,6 +1049,12 @@ impl Document {
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        // Normal-blend paint and the eraser telescope: a pixel keeps its
+        // strongest dab this stroke, so overlapping dabs stop summing past
+        // the brush opacity. Other blends fold per dab, as defined.
+        let track = brush.eraser || brush.blend == super::document::BlendMode::Normal;
+        let mut peak = self.stroke_peak.as_mut().filter(|_| track);
         let layer = &mut self.layers[active];
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -921,17 +1078,23 @@ impl Document {
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                 let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
                 let d = (u * u + v * v).sqrt() / radius;
-                if d > 1.0 {
+                if d > 1.0 + 0.5 / radius {
                     continue;
                 }
-                let falloff = if d <= 1.0 - edge {
+                let falloff = if edge <= 0.0 {
+                    // A hard disc is all core; the coverage term below is
+                    // what gives it an edge.
+                    1.0
+                } else if d <= 1.0 - edge {
                     1.0
                 } else {
-                    1.0 - (d - (1.0 - edge)) / edge.max(0.001)
+                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
-                let mut fa =
-                    (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(mask, w, px, py))
-                        .clamp(0.0, 1.0);
+                // Analytic coverage across the last pixel of the rim: a hard
+                // disc keeps its edge but stops stair-stepping.
+                let coverage = ((1.0 - d) * radius + 0.5).clamp(0.0, 1.0);
+                let mut fa = (falloff * coverage * strength * Document::sel_k(mask, w, px, py))
+                    .clamp(0.0, 1.0);
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
@@ -953,6 +1116,20 @@ impl Document {
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
+                // Composite only what this dab adds over the stroke peak;
+                // repeated dabs over one pixel add nothing further.
+                let a = match peak.as_mut() {
+                    Some(p) => {
+                        let i = (py * w + px) as usize;
+                        let seen = p.get(i);
+                        if a <= seen {
+                            continue;
+                        }
+                        p.set(i, a);
+                        Document::stroke_delta(a, seen)
+                    }
+                    None => a,
+                };
                 if brush.eraser {
                     // Destination-out: scale existing alpha down. A pixel the
                     // erase takes to alpha 0 is canonicalised to [0, 0, 0, 0]
@@ -974,8 +1151,9 @@ impl Document {
     }
 
     /// Stamp a grayscale-tip dab centered at `(x, y)`: the tip is scaled so
-    /// its width spans `brush.size` canvas pixels (nearest-neighbor), and
-    /// each texel contributes `mask * opacity` exactly like falloff alpha.
+    /// its width spans `brush.size` canvas pixels (bilinear, so a magnified
+    /// tip keeps a soft edge), and each texel contributes `mask * opacity`
+    /// exactly like falloff alpha.
     /// Selection, symmetry and eraser handling match [`Document::dab`].
     #[allow(clippy::too_many_arguments)]
     fn dab_stamp_resolved(
@@ -1032,6 +1210,9 @@ impl Document {
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
         let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let track = brush.eraser || brush.blend == super::document::BlendMode::Normal;
+        let mut peak = self.stroke_peak.as_mut().filter(|_| track);
         let layer = &mut self.layers[active];
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
@@ -1058,15 +1239,11 @@ impl Document {
                 } else {
                     (ox, oy / round)
                 };
-                let tx = ((rx + half_w) / scale) as i32;
-                let ty = ((ry + half_h) / scale) as i32;
-                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                let texel = sample_tip(tip, (rx + half_w) / scale, (ry + half_h) / scale);
+                if texel <= 0.0 {
                     continue;
                 }
-                let mut fa = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength
-                    * Document::sel_k(mask, w, px, py))
-                .clamp(0.0, 1.0);
+                let mut fa = (texel * strength * Document::sel_k(mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
                     fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
                 }
@@ -1088,6 +1265,18 @@ impl Document {
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
+                let a = match peak.as_mut() {
+                    Some(p) => {
+                        let i = (py * w + px) as usize;
+                        let seen = p.get(i);
+                        if a <= seen {
+                            continue;
+                        }
+                        p.set(i, a);
+                        Document::stroke_delta(a, seen)
+                    }
+                    None => a,
+                };
                 if brush.eraser {
                     // Destination-out, canonicalised like the round dab: an
                     // alpha-0 pixel becomes [0, 0, 0, 0] (see `dab`).
@@ -1149,6 +1338,9 @@ impl Document {
         leftover: f32,
     ) -> (Option<(f32, f32)>, f32) {
         let Some((sx, sy)) = from else {
+            // Stroke start: a fresh coverage peak keeps this gesture's dabs
+            // from piling onto each other.
+            self.begin_stroke();
             let taper = clamp01(to_dyn.taper);
             let size = brush.resolve_size(to_dyn.pressure, to_dyn.speed_norm)
                 * brush.taper.size_factor(taper, to_dyn.pressure);
@@ -1188,6 +1380,9 @@ impl Document {
             let (x, y) = (sx + dx * t, sy + dy * t);
             let (ox, oy) = scatter_offset(brush, x, y, size);
             self.dab_dyn(brush, color, x + ox, y + oy, size, opacity, angle);
+            // Step by the dab size actually drawn: spacing is relative to
+            // the dab, so a tapering tip keeps overlap (and a dotted brush
+            // keeps its relative gaps) all the way to the point.
             size
         };
         let mut travelled = leftover;
@@ -1748,7 +1943,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 shape_count_jitter: 0.0,
                 pressure_curve: None,
                 pressure_opacity_curve: None,
-                taper: Taper::NONE,
+                taper: Taper {
+                    start: 0.25,
+                    end: 0.35,
+                    size: 0.7,
+                    shape: 1.0,
+                    ..Taper::NONE
+                },
             },
         ),
         (
@@ -1788,7 +1989,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 shape_count_jitter: 0.0,
                 pressure_curve: None,
                 pressure_opacity_curve: None,
-                taper: Taper::NONE,
+                taper: Taper {
+                    start: 0.2,
+                    end: 0.4,
+                    size: 0.8,
+                    shape: 1.0,
+                    ..Taper::NONE
+                },
             },
         ),
         (
@@ -1796,7 +2003,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             Brush {
                 size: 24.0,
                 opacity: 1.0,
-                softness: 0.6,
+                softness: 0.2,
                 spacing: 0.15,
                 eraser: false,
                 tip: None,
@@ -3258,6 +3465,22 @@ mod tests {
     }
 
     #[test]
+    fn pencil_and_ink_pen_taper_their_ends() {
+        // Sketch pens ship tapered: the stock brushes should leave the box
+        // with a lifted entry and exit, smoothstepped so the tip is round
+        // rather than a linear leaf.
+        for (name, brush) in presets() {
+            if name != "Pencil" && name != "Ink Pen" {
+                continue;
+            }
+            assert!(brush.taper.start > 0.0, "{name} has no start taper");
+            assert!(brush.taper.end > 0.0, "{name} has no end taper");
+            assert_eq!(brush.taper.shape, 1.0, "{name} taper is not smooth");
+            assert!(check_preset(name, &brush).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
     fn dynamics_resolve_identity_at_full_pressure() {
         let brush = Brush::default();
         assert_eq!(brush.resolve_size(1.0, 0.0), brush.size);
@@ -3338,6 +3561,76 @@ mod tests {
             ..Taper::NONE
         };
         assert!((shaped.factor_at(0.25) - 0.15625).abs() < 0.001);
+    }
+
+    #[test]
+    fn taper_ends_fade_over_a_fixed_distance() {
+        let end = Taper {
+            end: 0.5,
+            ..Taper::NONE
+        };
+        // Six brush diameters: a 20 px brush fades over 120 px, so the
+        // 0.5 setting tapers the last 60.
+        assert_eq!(end.distance_factor(0.0, 0.0, 20.0), 0.0);
+        assert!((end.distance_factor(0.0, 30.0, 20.0) - 0.5).abs() < 0.001);
+        assert_eq!(end.distance_factor(0.0, 60.0, 20.0), 1.0);
+    }
+
+    #[test]
+    fn taper_start_does_not_depend_on_stroke_length() {
+        let start = Taper {
+            start: 0.5,
+            ..Taper::NONE
+        };
+        // Midway through the 60 px start ramp stays 0.5 whether the stroke
+        // ends at 61 px or runs on for hundreds: live dabs need no total.
+        assert!((start.distance_factor(30.0, 0.0, 20.0) - 0.5).abs() < 0.001);
+        assert_eq!(start.distance_factor(200.0, 0.0, 20.0), 1.0);
+    }
+
+    #[test]
+    fn live_taper_matches_the_release_width_until_the_tail() {
+        // What the pen draws while down must be what a lift leaves behind:
+        // the start ramp is live, the end ramp is only known on release.
+        let taper = Taper {
+            start: 0.25,
+            end: 0.35,
+            size: 0.7,
+            shape: 1.0,
+            ..Taper::NONE
+        };
+        let (size, total) = (6.0, 60.0);
+        let span = size * TAPER_DIAMETERS;
+        assert_eq!(taper.live_factor(0.0, size), 0.0, "start touches down");
+        let last_full = total - clamp01(taper.end) * span - 1.0;
+        for d in [span * 0.5, 30.0, 40.0, last_full] {
+            assert_eq!(
+                taper.live_factor(d, size),
+                taper.distance_factor(d, total - d, size),
+                "live width differs from the release width at {d} px"
+            );
+        }
+        assert_eq!(
+            taper.size_factor(taper.live_factor(span * 2.0, size), 1.0),
+            1.0,
+            "a live dab past the start ramp is full width"
+        );
+        // The end ramp still narrows the tail on release.
+        assert_eq!(taper.distance_factor(total, 0.0, size), 0.0);
+    }
+
+    #[test]
+    fn zero_to_end_means_the_stroke_is_over() {
+        // Regression: the live path passed 0 for `to_end`, which is not
+        // "end unknown" but "already at the end", so every live dab took
+        // the full end ramp (30% width for the default pen preset).
+        let taper = Taper {
+            end: 0.35,
+            size: 0.7,
+            ..Taper::NONE
+        };
+        assert_eq!(taper.distance_factor(100.0, 0.0, 6.0), 0.0);
+        assert_eq!(taper.live_factor(100.0, 6.0), 1.0);
     }
 
     #[test]
@@ -3913,7 +4206,10 @@ mod tests {
     }
 
     #[test]
-    fn shape_count_builds_density_at_one_point() {
+    fn coincident_shapes_share_the_stroke_opacity() {
+        // Shapes of one dab land on the same spot unless scatter/jitter
+        // separates them: they are one paint event, so the ceiling stays
+        // the brush opacity instead of stacking shape_count times.
         let single = Brush {
             size: 20.0,
             opacity: 0.25,
@@ -3929,7 +4225,8 @@ mod tests {
             doc.dab(brush, Color::rgb(255, 0, 0), 24.0, 24.0);
             doc.layers[0].pixels.get((24 * 48 + 24) * 4 + 3)
         };
-        assert!(alpha(&multiple) > alpha(&single));
+        assert_eq!(alpha(&multiple), alpha(&single));
+        assert!(alpha(&single) <= 64, "{}", alpha(&single));
     }
 
     #[test]
@@ -4431,9 +4728,261 @@ mod tests {
     }
 
     #[test]
+    fn scaled_tip_edge_is_bilinear_not_blocky() {
+        // A 2x2 tip blown up to 32 px: nearest sampling flips a texel
+        // column 0 -> 255 within one pixel (visible steps on a big round
+        // brush); bilinear spreads the same edge over a texel.
+        let mut doc = Document::new(48, 48);
+        let brush = Brush {
+            size: 32.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            tip: Some(BrushTip {
+                w: 2,
+                h: 2,
+                mask: vec![0, 255, 0, 255],
+            }),
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 48 + x) * 4 + 3) as usize);
+        let row: Vec<u8> = (8..=40).map(|x| alpha(x, 24)).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial >= 3, "tip edge is blocky: {row:?}");
+        assert!(
+            row.iter().any(|&a| a > 200),
+            "tip lost its solid side: {row:?}"
+        );
+    }
+
+    #[test]
+    fn hard_dab_edge_is_anti_aliased() {
+        // A hard disc used to flip 0 -> 255 in one pixel, which is what
+        // makes thin strokes stair-step and short caps read as blunt cuts.
+        let mut doc = Document::new(64, 64);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(20, 90, 220), 32.3, 31.7);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 64 + x) * 4) as usize + 3);
+        let row: Vec<u8> = (15..=48).map(|x| alpha(x, 31)).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial >= 2, "rim has no partial coverage: {row:?}");
+        let solid = row.iter().filter(|&&a| a == 255).count();
+        assert!(solid >= 10, "core lost its solidity: {row:?}");
+    }
+
+    #[test]
+    fn hard_dab_edge_ramps_instead_of_jumping() {
+        // Neighbouring pixels across the rim never jump straight from
+        // transparent to opaque: every side of the disc shows a step.
+        let mut doc = Document::new(64, 64);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(20, 90, 220), 31.4, 32.6);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 64 + x) * 4) as usize + 3);
+        for y in 20..=44 {
+            let mut left = None;
+            for x in 16..=32 {
+                let a = alpha(x, y);
+                if a > 0 {
+                    left = Some(a);
+                    break;
+                }
+            }
+            if let Some(a) = left {
+                assert!(a < 255, "left rim of row {y} starts at 255 ({a})");
+            }
+        }
+    }
+
+    #[test]
+    fn default_brush_edge_is_nearly_hard() {
+        // The app boots into Brush::default() and the Round preset mirrors
+        // it. Softness above a quarter turns every fresh stroke into an
+        // airbrush: the solid core shrinks to 40% of the radius and the rim
+        // ramps over 6 px at size 24, which reads as out of focus next to a
+        // hard default round.
+        let default = Brush::default();
+        assert!(
+            default.softness <= 0.25,
+            "default softness {} paints an airbrush edge",
+            default.softness
+        );
+        let round = presets()
+            .into_iter()
+            .find(|(name, _)| *name == "Round")
+            .map(|(_, b)| b)
+            .expect("Round preset");
+        assert!(round.softness <= 0.25, "Round softness {}", round.softness);
+        // At most ~1 px of rim per side at size 24, and a solid core.
+        let mut doc = Document::new(64, 64);
+        doc.dab(&default, Color::rgb(20, 90, 220), 32.0, 32.0);
+        let alpha = |x: u32| doc.layers[0].pixels.get(((32 * 64 + x) * 4) as usize + 3);
+        let row: Vec<u8> = (18..=46).map(alpha).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial <= 6, "default rim ramps over {partial} px: {row:?}");
+        let solid = row.iter().filter(|&&a| a >= 250).count();
+        assert!(solid >= 16, "default core only {solid} px solid: {row:?}");
+    }
+
+    /// One straight stroke through the engine, chained like the app does.
+    fn stroke_flat(doc: &mut Document, brush: &Brush, y: f32, x0: f32, x1: f32) {
+        let mut last = None;
+        let mut left = 0.0;
+        let d = DabDynamics {
+            pressure: 1.0,
+            speed_norm: 0.0,
+            angle: 0.0,
+            taper: 1.0,
+        };
+        let mut x = x0;
+        while x <= x1 {
+            let (l, lo) =
+                doc.stroke_to_dyn(brush, Color::rgb(10, 10, 10), last, d, (x, y), d, left);
+            last = l;
+            left = lo;
+            x += 2.0;
+        }
+    }
+
+    fn max_alpha(doc: &Document) -> u8 {
+        (0..doc.h)
+            .flat_map(|y| (0..doc.w).map(move |x| (x, y)))
+            .map(|(x, y)| doc.layers[0].pixels.get(((y * doc.w + x) * 4) as usize + 3))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn one_stroke_stops_at_brush_opacity() {
+        // 0.25 opacity used to build to ~0.99 where dabs overlapped: every
+        // soft or translucent brush painted as a solid tube.
+        let mut doc = Document::new(140, 60);
+        let brush = Brush {
+            size: 16.0,
+            opacity: 0.25,
+            softness: 0.8,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let peak = max_alpha(&doc);
+        assert!(
+            (56..=70).contains(&peak),
+            "stroke should cap near 0.25*255, got {peak}"
+        );
+    }
+
+    #[test]
+    fn soft_stroke_keeps_its_feathered_edge() {
+        let mut doc = Document::new(140, 80);
+        let brush = Brush {
+            size: 40.0,
+            opacity: 1.0,
+            softness: 1.0,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 40.0, 12.0, 128.0);
+        let at = |dy: u32| {
+            doc.layers[0]
+                .pixels
+                .get((((40 - dy) * 140 + 70) * 4) as usize + 3)
+        };
+        // Sampled a quarter of the way out, the falloff must still read
+        // like a gradient instead of a saturated plateau.
+        assert!(at(0) > 240, "center {}", at(0));
+        assert!(at(15) < 140, "edge saturated at +15px: {}", at(15));
+        assert!(at(15) < at(0), "no gradient: {} vs {}", at(15), at(0));
+    }
+
+    #[test]
+    fn separate_strokes_still_build_up() {
+        let mut doc = Document::new(140, 60);
+        let brush = Brush {
+            size: 16.0,
+            opacity: 0.5,
+            softness: 0.6,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let first = max_alpha(&doc);
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let second = max_alpha(&doc);
+        assert!((120..=140).contains(&first), "first {first}");
+        assert!(second > 175, "second stroke did not build up: {second}");
+    }
+
+    #[test]
+    fn eraser_stroke_stops_at_its_opacity() {
+        let mut doc = Document::new(140, 60);
+        let paint = Brush {
+            size: 30.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &paint, 30.0, 12.0, 128.0);
+        let eraser = Brush {
+            eraser: true,
+            opacity: 0.5,
+            ..paint.clone()
+        };
+        stroke_flat(&mut doc, &eraser, 30.0, 12.0, 128.0);
+        let center = doc.layers[0].pixels.get(((30 * 140 + 70) * 4) as usize + 3);
+        assert!(
+            (110..=145).contains(&center),
+            "eraser at 0.5 left alpha {center}"
+        );
+    }
+
+    #[test]
     fn old_brush_files_default_the_new_depth_fields() {
         // Pre-M39 library JSON has no blend/wet/dual keys: same defaults.
-        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.6,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.6,"velocity_opacity":0.6,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
+        // Every present key mirrors Brush::default(), so the assertion stays
+        // about the absent ones.
+        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.6,"velocity_opacity":0.6,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
         let brush: Brush = serde_json::from_str(old).unwrap();
         assert_eq!(brush, Brush::default());
     }

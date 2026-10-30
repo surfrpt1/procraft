@@ -28,20 +28,27 @@ pub const CACHE_MOBILE: usize = 96 * 1024 * 1024;
 /// headroom for the neighbouring tiles.
 pub const CACHE_DESKTOP: usize = 320 * 1024 * 1024;
 
+/// Below this zoom the canvas texture is minified past what its bilinear
+/// sampling can hold, so the viewport path ([`view_pixels`], box-filtered)
+/// draws the canvas instead. At or above it the 1:1 texture stays exact.
+pub const MINIFIED_ZOOM: f32 = 0.75;
+
+/// Canvases above this side always draw through the viewport path. A
+/// canvas-sized RGBA texture costs 4 bytes per canvas pixel of VRAM and
+/// grows with the square of the side (2048² = 16 MiB, 4K = 64 MiB, 8K =
+/// 256 MiB), and on mobile it competes with the composite cache for the
+/// same unified memory. Sampling the visible rect costs a few ms of CPU;
+/// holding the whole canvas on the GPU costs hundreds of MiB everywhere.
+pub const VIEWPORT_SIDE: u32 = 2048;
+
 /// Whether the display takes the viewport-resolution fallback (spec §4)
-/// instead of one canvas-sized texture: forced for captures, native mobile
-/// above 4K, any canvas the GPU's texture limit cannot hold, or a legacy
-/// document above the 8K cap (target A was sized for the cap; a 16384²
-/// texture is ~1 GiB even when the GPU nominally allows the size).
-pub fn viewport_active(
-    forced: bool,
-    native_mobile: bool,
-    side: u32,
-    max_texture_side: usize,
-) -> bool {
+/// instead of one canvas-sized texture: forced for captures, any canvas
+/// above [`VIEWPORT_SIDE`], any canvas the GPU's texture limit cannot
+/// hold, or a legacy document above the 8K cap (target A was sized for the
+/// cap; a 16384² texture is ~1 GiB even when the GPU nominally allows it).
+pub fn viewport_active(forced: bool, side: u32, max_texture_side: usize) -> bool {
     forced
-        || (native_mobile && side > 4096)
-        || max_texture_side < MAX_CANVAS_SIDE as usize
+        || side > VIEWPORT_SIDE
         || side as usize > max_texture_side
         || side > MAX_CANVAS_SIDE
 }
@@ -69,6 +76,11 @@ pub(crate) fn maskless_view_blocks_fallback(
 /// Bytes of one full composite tile, which is what the engine returns.
 const TILE_BYTES: usize = (TILE * TILE * 4) as usize;
 
+/// Deepest cached mip level. Level L covers the composite at 1/2^L, so 4
+/// is a 16× reduction: an 8K canvas at fit zoom needs level 3 or 4, and a
+/// deeper chain would only add build time below a screen pixel.
+pub(crate) const MAX_MIP_LEVEL: u32 = 4;
+
 /// Composite tiles, least-recently-used first when over budget.
 pub struct CompositeCache {
     tiles: std::collections::HashMap<(u32, u32), Vec<u8>>,
@@ -76,6 +88,17 @@ pub struct CompositeCache {
     order: std::collections::VecDeque<(u32, u32)>,
     bytes: usize,
     budget: usize,
+    /// Levels 1..=`MAX_MIP_LEVEL`, keyed `(level, tx, ty)`: each texel is
+    /// the alpha-weighted average of the 2×2 texels below it. Minified
+    /// views sample these, so they get their own (smaller) budget rather
+    /// than competing with the level-0 tiles a 1:1 view needs.
+    mips: std::collections::HashMap<(u32, u32, u32), Vec<u8>>,
+    mip_order: std::collections::VecDeque<(u32, u32, u32)>,
+    mip_bytes: usize,
+    mip_budget: usize,
+    /// Set while a view pass prebuilds and then reads its tiles: a trim
+    /// would drop one underneath the threads that sample them.
+    pass: bool,
     /// Bumped by [`invalidate`](Self::invalidate). The viewport texture keys
     /// on it because a content-identity change (new/open/undo rebuild) can
     /// reset `Document::revision()`, so the revision alone cannot tell two
@@ -85,6 +108,10 @@ pub struct CompositeCache {
 
 impl CompositeCache {
     pub fn new(budget: usize) -> Self {
+        // A quarter of the level-0 budget holds every level above 1 for
+        // any canvas that fits in it, and at least four tiles so one parent
+        // and its children can coexist mid-build.
+        let mip_budget = (budget / 4).max(4 * TILE_BYTES);
         Self {
             tiles: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
@@ -92,13 +119,18 @@ impl CompositeCache {
             // One tile must always fit, or `tile` could not return the
             // tile it just composited.
             budget: budget.max(TILE_BYTES),
+            mips: std::collections::HashMap::new(),
+            mip_order: std::collections::VecDeque::new(),
+            mip_bytes: 0,
+            mip_budget,
+            pass: false,
             epoch: 0,
         }
     }
 
     /// Bytes currently held: the layers-panel memory readout.
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes + self.mip_bytes
     }
 
     /// Identity of the content the cached tiles belong to: changes on every
@@ -115,16 +147,193 @@ impl CompositeCache {
         self.tiles.clear();
         self.order.clear();
         self.bytes = 0;
+        self.mips.clear();
+        self.mip_order.clear();
+        self.mip_bytes = 0;
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Drop one tile so the next [`tile`](Self::tile) recomposites it.
-    /// The dirty-rect path evicts before reading: a cached tile there
-    /// would be the pre-edit composite of the very tile being repainted.
-    pub fn evict(&mut self, tx: u32, ty: u32) {
-        if let Some(old) = self.tiles.remove(&(tx, ty)) {
-            self.bytes -= old.len();
-            self.order.retain(|k| *k != (tx, ty));
+    /// Hold off trimming until [`end_pass`](Self::end_pass). A sampling
+    /// pass builds every tile it is about to read, and the sampling threads
+    /// cannot composite one back if it is dropped underneath them. The
+    /// overshoot is bounded by the tiles one pass touches.
+    pub fn begin_pass(&mut self) {
+        self.pass = true;
+    }
+
+    /// Release a [`begin_pass`](Self::begin_pass) and trim back to budget.
+    pub fn end_pass(&mut self) {
+        self.pass = false;
+        self.trim();
+        self.trim_mips();
+    }
+
+    /// Recomposite only `rect` (inclusive canvas bounds) of every cached
+    /// tile it touches. What a dab changed is a band, not the 256² tiles
+    /// around it: patching keeps the two-thirds of each tile the event did
+    /// not touch instead of recompositing the whole square. Tiles that are
+    /// not cached stay missing and are composited fresh on the next read.
+    pub fn patch(&mut self, doc: &Document, plan: &StackPlan, rect: (u32, u32, u32, u32)) {
+        let (x0, y0, x1, y1) = rect;
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        for ty in y0 / TILE..=y1 / TILE {
+            for tx in x0 / TILE..=x1 / TILE {
+                if let Some(tile) = self.tiles.get_mut(&(tx, ty)) {
+                    doc.composite_tile_into(plan, tx, ty, Some(rect), tile);
+                }
+            }
+        }
+        self.patch_mips(rect);
+    }
+
+    /// Bring the cached mip tiles overlapping `rect` up to date, bottom up:
+    /// each level is re-averaged from the level below, which was just
+    /// patched. Only texels whose 2^L square intersects the rect change, so
+    /// a dab costs a handful of averages per level instead of rebuilding
+    /// the tile. A tile whose children are not all cached is dropped and
+    /// rebuilt from the document on the next read.
+    fn patch_mips(&mut self, rect: (u32, u32, u32, u32)) {
+        let (x0, y0, x1, y1) = rect;
+        for level in 1..=MAX_MIP_LEVEL {
+            let span = TILE << level;
+            for ty in y0 / span..=y1 / span {
+                for tx in x0 / span..=x1 / span {
+                    let key = (level, tx, ty);
+                    if !self.mips.contains_key(&key) {
+                        continue;
+                    }
+                    let Some(mut tile) = self.mips.remove(&key) else {
+                        continue;
+                    };
+                    let complete = {
+                        let (ax, ay) = (tx * 2, ty * 2);
+                        let kids = [
+                            self.level_tile(level - 1, ax, ay),
+                            self.level_tile(level - 1, ax + 1, ay),
+                            self.level_tile(level - 1, ax, ay + 1),
+                            self.level_tile(level - 1, ax + 1, ay + 1),
+                        ];
+                        match kids.map(|k| k.filter(|t| t.len() == TILE_BYTES)) {
+                            [Some(a), Some(b), Some(c), Some(d)] => {
+                                let kids = [a, b, c, d];
+                                let mx0 = (x0 >> level).max(tx * TILE);
+                                let mx1 = (x1 >> level).min(tx * TILE + TILE - 1);
+                                let my0 = (y0 >> level).max(ty * TILE);
+                                let my1 = (y1 >> level).min(ty * TILE + TILE - 1);
+                                for my in my0..=my1 {
+                                    for mx in mx0..=mx1 {
+                                        average_texel(
+                                            kids,
+                                            (mx - tx * TILE) as usize,
+                                            (my - ty * TILE) as usize,
+                                            &mut tile,
+                                        );
+                                    }
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if complete {
+                        self.mips.insert(key, tile);
+                    } else {
+                        self.mip_bytes -= TILE_BYTES;
+                        self.mip_order.retain(|k| *k != key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A level tile from either the level-0 cache (level 0) or the mip
+    /// cache, by its tile index at that level.
+    fn level_tile(&self, level: u32, tx: u32, ty: u32) -> Option<&[u8]> {
+        if level == 0 {
+            self.tiles.get(&(tx, ty)).map(Vec::as_slice)
+        } else {
+            self.mips.get(&(level, tx, ty)).map(Vec::as_slice)
+        }
+    }
+
+    /// One tile of level `level` (1..=`MAX_MIP_LEVEL`), `TILE * TILE * 4`
+    /// bytes: a hit returns the cached bytes, a miss averages the level
+    /// below and caches the result. Level L tile `(tx, ty)` covers the
+    /// canvas square `tx * TILE << L`.
+    pub fn mip_tile(
+        &mut self,
+        doc: &Document,
+        plan: &StackPlan,
+        level: u32,
+        tx: u32,
+        ty: u32,
+    ) -> &[u8] {
+        let key = (level, tx, ty);
+        if !self.mips.contains_key(&key) {
+            let bytes = self.build_mip(doc, plan, level, tx, ty);
+            self.mip_bytes += bytes.len();
+            self.mips.insert(key, bytes);
+            self.mip_order.push_back(key);
+            self.trim_mips();
+        }
+        self.mips.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn build_mip(
+        &mut self,
+        doc: &Document,
+        plan: &StackPlan,
+        level: u32,
+        tx: u32,
+        ty: u32,
+    ) -> Vec<u8> {
+        let (ax, ay) = (tx * 2, ty * 2);
+        let children = [(ax, ay), (ax + 1, ay), (ax, ay + 1), (ax + 1, ay + 1)];
+        if level == 1 {
+            for (cx, cy) in children {
+                self.tile(doc, plan, cx, cy);
+            }
+        } else {
+            for (cx, cy) in children {
+                self.mip_tile(doc, plan, level - 1, cx, cy);
+            }
+        }
+        let mut out = vec![0u8; TILE_BYTES];
+        {
+            let kids = [
+                self.level_tile(level - 1, ax, ay),
+                self.level_tile(level - 1, ax + 1, ay),
+                self.level_tile(level - 1, ax, ay + 1),
+                self.level_tile(level - 1, ax + 1, ay + 1),
+            ];
+            let kids = match kids.map(|k| k.filter(|t| t.len() == TILE_BYTES)) {
+                [Some(a), Some(b), Some(c), Some(d)] => [a, b, c, d],
+                // A child that would not build (empty document): leave the
+                // tile transparent and let the next read rebuild it.
+                _ => return out,
+            };
+            for my in 0..TILE as usize {
+                for mx in 0..TILE as usize {
+                    average_texel(kids, mx, my, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    fn trim_mips(&mut self) {
+        if self.pass {
+            return;
+        }
+        while self.mip_bytes > self.mip_budget && self.mip_order.len() > 1 {
+            let Some(key) = self.mip_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.mips.remove(&key) {
+                self.mip_bytes -= old.len();
+            }
         }
     }
 
@@ -153,6 +362,9 @@ impl CompositeCache {
     }
 
     fn trim(&mut self) {
+        if self.pass {
+            return;
+        }
         while self.bytes > self.budget && self.order.len() > 1 {
             let Some(key) = self.order.pop_front() else {
                 break;
@@ -227,6 +439,41 @@ pub fn tile_image(doc: &Document, tile: &[u8], tx: u32, ty: u32) -> (Vec<u8>, us
     (out, w, h)
 }
 
+/// Crop the `rect` part (inclusive canvas bounds) of one composite tile to
+/// the canvas edge for `set_partial`, returning
+/// `(rgba, x, y, w, h)` at the clamped canvas-space origin. Empty when the
+/// rect misses the tile or the canvas.
+pub fn tile_image_region(
+    doc: &Document,
+    tile: &[u8],
+    tx: u32,
+    ty: u32,
+    rect: (u32, u32, u32, u32),
+) -> (Vec<u8>, usize, usize, usize, usize) {
+    let empty = (Vec::new(), 0, 0, 0, 0);
+    if tile.len() != TILE_BYTES {
+        return empty;
+    }
+    let (x0, y0) = (tx * TILE, ty * TILE);
+    let x0 = x0.min(doc.w);
+    let y0 = y0.min(doc.h);
+    let x1 = (x0 + TILE).min(doc.w).saturating_sub(1);
+    let y1 = (y0 + TILE).min(doc.h).saturating_sub(1);
+    let (rx0, ry0) = (rect.0.max(x0), rect.1.max(y0));
+    let (rx1, ry1) = (rect.2.min(x1), rect.3.min(y1));
+    if rx0 > rx1 || ry0 > ry1 {
+        return empty;
+    }
+    let (w, h) = ((rx1 - rx0 + 1) as usize, (ry1 - ry0 + 1) as usize);
+    let stride = TILE as usize * 4;
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in ry0 - y0..=ry1 - y0 {
+        let start = y as usize * stride + (rx0 - x0) as usize * 4;
+        out.extend_from_slice(&tile[start..start + w * 4]);
+    }
+    (out, rx0 as usize, ry0 as usize, w, h)
+}
+
 /// The canvas-pixel rect a viewport shows (target B): what the view
 /// texture samples, and where the draw path paints that texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -281,21 +528,6 @@ impl ViewRect {
     }
 }
 
-/// Evict every tile a dirty rect (inclusive canvas bounds) touches, so the
-/// next read recomposites them. Mirrors `ProCraftApp::refresh_texture`'s
-/// dirty loop: without it the viewport would sample pre-edit tiles.
-pub(crate) fn evict_tiles(cache: &mut CompositeCache, rect: (u32, u32, u32, u32)) {
-    let (x0, y0, x1, y1) = rect;
-    if x0 > x1 || y0 > y1 {
-        return;
-    }
-    for ty in y0 / TILE..=y1 / TILE {
-        for tx in x0 / TILE..=x1 / TILE {
-            cache.evict(tx, ty);
-        }
-    }
-}
-
 /// Output texels whose sample centers fall inside the canvas band
 /// `band_lo..band_hi`, as a half-open range clamped to `len`.
 fn texel_span(origin: f32, step: f32, len: usize, band_lo: f32, band_hi: f32) -> (usize, usize) {
@@ -309,14 +541,86 @@ fn texel_span(origin: f32, step: f32, len: usize, band_lo: f32, band_hi: f32) ->
     (lo, hi.max(lo))
 }
 
-/// Sample a viewport out of the composite tiles: `out` texels, nearest at
-/// each texel center, row-major RGBA. `region` is a half-open
-/// `[col0, row0, col1, row1]` texel rect to render (`None`: all of it).
+/// Taps per axis for one output texel: 1 while the canvas is at least
+/// screen resolution (nearest is exact), then a box filter widening with
+/// the footprint, capped at 4 per axis. The GPU texture path has no
+/// mipmaps (`mip_level_count: 1`), so minification has to be filtered
+/// here or 1-pixel details alias into stripes.
+fn tap_count(step: f32) -> usize {
+    if step <= 1.0 {
+        1
+    } else {
+        (step.ceil() as usize).clamp(2, 4)
+    }
+}
+
+/// Mip level to sample when a texel covers `dx`x`dy` canvas pixels: the
+/// deepest level whose texel is at most half the footprint, so a 2×2
+/// bilinear of mip texels spans it. Level 0 below 2:1 minification.
+///
+/// Without this a fit-zoomed 8K viewport reads 16 full-resolution pixels
+/// per texel (≈38 M reads per pass, 100+ ms); with it, 4 averaged ones.
+pub(crate) fn mip_shift(dx: f32, dy: f32) -> u32 {
+    let step = dx.min(dy);
+    if step <= 1.0 {
+        return 0;
+    }
+    (step.log2().floor() as i32).clamp(0, MAX_MIP_LEVEL as i32) as u32
+}
+
+/// One texel of a mip tile: the alpha-weighted mean of the 2×2 block in
+/// the four children (`a, b` top row; `c, d` bottom row, left to right).
+/// `mx`/`my` are tile-local texel coordinates of the parent.
+fn average_texel(kids: [&[u8]; 4], mx: usize, my: usize, out: &mut [u8]) {
+    let half = (TILE / 2) as usize;
+    let stride = TILE as usize * 4;
+    let (left, right) = if my < half {
+        (kids[0], kids[1])
+    } else {
+        (kids[2], kids[3])
+    };
+    let (child, sx) = if mx < half {
+        (left, mx * 2)
+    } else {
+        (right, (mx % half) * 2)
+    };
+    let sy = (my % half) * 2;
+    let o = sy * stride + sx * 4;
+    let (p0, p1) = (&child[o..o + 4], &child[o + 4..o + 8]);
+    let o2 = o + stride;
+    let (p2, p3) = (&child[o2..o2 + 4], &child[o2 + 4..o2 + 8]);
+    let (a0, a1, a2, a3) = (p0[3] as u32, p1[3] as u32, p2[3] as u32, p3[3] as u32);
+    let a_sum = a0 + a1 + a2 + a3;
+    let dst = (my * TILE as usize + mx) * 4;
+    if a_sum == 0 {
+        out[dst..dst + 4].fill(0);
+        return;
+    }
+    // Weighting by alpha keeps the canvas edge from darkening: level 0 is
+    // opaque on the canvas and transparent outside it.
+    for k in 0..3 {
+        let s = p0[k] as u32 * a0 + p1[k] as u32 * a1 + p2[k] as u32 * a2 + p3[k] as u32 * a3;
+        out[dst + k] = ((s + a_sum / 2) / a_sum) as u8;
+    }
+    // Opaque inside the canvas by construction: a partly covered edge texel
+    // keeps the edge colour rather than turning translucent, like level 0's
+    // clamped taps.
+    out[dst + 3] = 255;
+}
+
+/// Sample a viewport out of the composite tiles: `out` texels, row-major
+/// RGBA. `region` is a half-open `[col0, row0, col1, row1]` texel rect to
+/// render (`None`: all of it).
 ///
 /// Tile-major on purpose: a fit-zoomed viewport is millions of texels, and
 /// one cache lookup per texel would dominate the frame. Each canvas tile is
-/// fetched once, then every texel whose center lands in it is copied — the
-/// inner loop is pure sampling.
+/// fetched once, then every texel whose footprint lands in it is sampled —
+/// the inner loop is pure sampling.
+///
+/// At 1:1 or larger the texel takes its center pixel. Minified, it takes an
+/// alpha-weighted box of up to 4×4 taps across its footprint: each tap is
+/// accumulated under the tile that contains it, so a texel straddling a
+/// tile seam still averages both sides and every tile is read once.
 pub(crate) fn view_pixels(
     doc: &Document,
     plan: &StackPlan,
@@ -336,56 +640,485 @@ pub(crate) fn view_pixels(
         None => [0, 0, out[0], out[1]],
     };
     let (cols, rows) = (c1.saturating_sub(c0), r1.saturating_sub(r0));
-    let mut img = vec![0u8; cols * rows * 4];
     if cols == 0 || rows == 0 || doc.w == 0 || doc.h == 0 {
-        return img;
+        return vec![0u8; cols * rows * 4];
     }
     let (vx, vy) = (view.x1 - view.x0, view.y1 - view.y0);
     if vx <= 0.0 || vy <= 0.0 {
-        return img;
+        return vec![0u8; cols * rows * 4];
     }
     let dx = vx / out[0] as f32;
     let dy = vy / out[1] as f32;
+    let shift = mip_shift(dx, dy);
+    if shift > 0 {
+        return view_pixels_mip(doc, plan, cache, view, out, [c0, r0, c1, r1], shift);
+    }
     let tile = TILE as usize;
     let (max_x, max_y) = ((doc.w - 1) as f32, (doc.h - 1) as f32);
-    for ty in 0..doc.tiles_y() {
+    let (taps_x, taps_y) = (tap_count(dx), tap_count(dy));
+    let filtered = taps_x > 1 || taps_y > 1;
+    // A center past the tile grid is outside the document: the unfiltered
+    // path never visits those texels and leaves them transparent.
+    let grid = (doc.tiles_x() as usize * tile, doc.tiles_y() as usize * tile);
+    let (tiles_x, tiles_y) = (doc.tiles_x(), doc.tiles_y());
+    // Composite every tile the region samples before the bands start: they
+    // only read the cache, and trimming must not drop a tile a band still
+    // has to sample.
+    cache.begin_pass();
+    for ty in 0..tiles_y {
         let band = ((ty * TILE) as f32, ((ty + 1) * TILE) as f32);
-        let (row_a, row_b) = texel_span(view.y0, dy, out[1], band.0, band.1);
+        let half = if filtered { dy * 0.5 } else { 0.0 };
+        let (row_a, row_b) = texel_span(view.y0, dy, out[1], band.0 - half, band.1 + half);
         let (row_a, row_b) = (row_a.max(r0), row_b.min(r1));
         if row_a >= row_b {
             continue;
         }
-        for tx in 0..doc.tiles_x() {
+        for tx in 0..tiles_x {
             let band = ((tx * TILE) as f32, ((tx + 1) * TILE) as f32);
-            let (col_a, col_b) = texel_span(view.x0, dx, out[0], band.0, band.1);
+            let half = if filtered { dx * 0.5 } else { 0.0 };
+            let (col_a, col_b) = texel_span(view.x0, dx, out[0], band.0 - half, band.1 + half);
             let (col_a, col_b) = (col_a.max(c0), col_b.min(c1));
             if col_a >= col_b {
                 continue;
             }
-            // One cache read per tile: the loops below only copy bytes.
-            let pixels = cache.tile(doc, plan, tx, ty);
-            for row in row_a..row_b {
-                let y = (view.y0 + (row as f32 + 0.5) * dy)
-                    .floor()
-                    .clamp(0.0, max_y) as usize;
-                let src_row = (y % tile) * tile * 4;
-                let dst_row = (row - r0) * cols * 4;
-                for col in col_a..col_b {
-                    let x = (view.x0 + (col as f32 + 0.5) * dx)
-                        .floor()
-                        .clamp(0.0, max_x) as usize;
-                    let src = src_row + (x % tile) * 4;
-                    let dst = dst_row + (col - c0) * 4;
-                    if let (Some(px), Some(slot)) =
-                        (pixels.get(src..src + 4), img.get_mut(dst..dst + 4))
-                    {
-                        slot.copy_from_slice(px);
+            cache.tile(doc, plan, tx, ty);
+        }
+    }
+    let mut img = vec![0u8; cols * rows * 4];
+    let pass = TilePass {
+        cache: &*cache,
+        view,
+        out,
+        region: [c0, r0, c1, r1],
+        cols,
+        dx,
+        dy,
+        max_x,
+        max_y,
+        taps_x,
+        taps_y,
+        filtered,
+        grid,
+        tiles: (tiles_x, tiles_y),
+    };
+    sample_in_bands(&mut img, cols, r0..r1, |row_a, row_b, dst| {
+        pass.band(row_a, row_b, dst)
+    });
+    cache.end_pass();
+    img
+}
+
+/// Level-0 sampling of a band of output rows: the texel math of
+/// [`view_pixels`], with every projection clipped to `region` and every
+/// tile read from the (already built) cache.
+struct TilePass<'a> {
+    cache: &'a CompositeCache,
+    view: ViewRect,
+    out: [usize; 2],
+    region: [usize; 4],
+    cols: usize,
+    dx: f32,
+    dy: f32,
+    max_x: f32,
+    max_y: f32,
+    taps_x: usize,
+    taps_y: usize,
+    filtered: bool,
+    grid: (usize, usize),
+    tiles: (u32, u32),
+}
+
+impl TilePass<'_> {
+    fn band(&self, row_a: usize, row_b: usize, dst: &mut [u8]) {
+        let [c0, _, c1, _] = self.region;
+        let tile = TILE as usize;
+        let cols = self.cols;
+        // Alpha-weighted RGBA sums over each texel's taps: r*a, g*a, b*a, a.
+        let mut acc = if self.filtered {
+            vec![[0u32; 4]; (row_b - row_a) * cols]
+        } else {
+            Vec::new()
+        };
+        for ty in 0..self.tiles.1 {
+            let band = ((ty * TILE) as f32, ((ty + 1) * TILE) as f32);
+            let half = if self.filtered { self.dy * 0.5 } else { 0.0 };
+            let (ra, rb) = texel_span(self.view.y0, self.dy, self.out[1], band.0 - half, band.1 + half);
+            let (ra, rb) = (ra.max(row_a), rb.min(row_b));
+            if ra >= rb {
+                continue;
+            }
+            for tx in 0..self.tiles.0 {
+                let band = ((tx * TILE) as f32, ((tx + 1) * TILE) as f32);
+                let half = if self.filtered { self.dx * 0.5 } else { 0.0 };
+                let (ca, cb) =
+                    texel_span(self.view.x0, self.dx, self.out[0], band.0 - half, band.1 + half);
+                let (ca, cb) = (ca.max(c0), cb.min(c1));
+                if ca >= cb {
+                    continue;
+                }
+                let pixels = self
+                    .cache
+                    .level_tile(0, tx, ty)
+                    .expect("tile missing during a sampling pass");
+                for row in ra..rb {
+                    let dst_row = (row - row_a) * cols * 4;
+                    if !self.filtered {
+                        let y = (self.view.y0 + (row as f32 + 0.5) * self.dy)
+                            .floor()
+                            .clamp(0.0, self.max_y) as usize;
+                        let src_row = (y % tile) * tile * 4;
+                        for col in ca..cb {
+                            let x = (self.view.x0 + (col as f32 + 0.5) * self.dx)
+                                .floor()
+                                .clamp(0.0, self.max_x) as usize;
+                            let src = src_row + (x % tile) * 4;
+                            let slot_dst = dst_row + (col - c0) * 4;
+                            if let (Some(px), Some(slot)) =
+                                (pixels.get(src..src + 4), dst.get_mut(slot_dst..slot_dst + 4))
+                            {
+                                slot.copy_from_slice(px);
+                            }
+                        }
+                        continue;
+                    }
+                    let center_y = self.view.y0 + (row as f32 + 0.5) * self.dy;
+                    if center_y >= self.grid.1 as f32 {
+                        continue;
+                    }
+                    let mut tap_rows = [0usize; 4];
+                    let mut rows_here = 0;
+                    for (j, slot) in tap_rows.iter_mut().enumerate().take(self.taps_y) {
+                        let tap_y = self.view.y0
+                            + (row as f32 + (j as f32 + 0.5) / self.taps_y as f32) * self.dy;
+                        let py = tap_y.floor().clamp(0.0, self.max_y) as usize;
+                        *slot = py;
+                        rows_here += (py / tile == ty as usize) as usize;
+                    }
+                    if rows_here == 0 {
+                        continue;
+                    }
+                    for col in ca..cb {
+                        let center_x = self.view.x0 + (col as f32 + 0.5) * self.dx;
+                        if center_x >= self.grid.0 as f32 {
+                            continue;
+                        }
+                        let mut tap_cols = [0usize; 4];
+                        let mut cols_here = 0;
+                        for (i, slot) in tap_cols.iter_mut().enumerate().take(self.taps_x) {
+                            let tap_x = self.view.x0
+                                + (col as f32 + (i as f32 + 0.5) / self.taps_x as f32) * self.dx;
+                            let px = tap_x.floor().clamp(0.0, self.max_x) as usize;
+                            *slot = px;
+                            cols_here += (px / tile == tx as usize) as usize;
+                        }
+                        if cols_here == 0 {
+                            continue;
+                        }
+                        let mut sum = [0u32; 4];
+                        for &py in &tap_rows[..self.taps_y] {
+                            if py / tile != ty as usize {
+                                continue;
+                            }
+                            let src_row = (py % tile) * tile * 4;
+                            for &px in &tap_cols[..self.taps_x] {
+                                if px / tile != tx as usize {
+                                    continue;
+                                }
+                                let src = src_row + (px % tile) * 4;
+                                let slot = &pixels[src..src + 4];
+                                let a = slot[3] as u32;
+                                sum[0] += slot[0] as u32 * a;
+                                sum[1] += slot[1] as u32 * a;
+                                sum[2] += slot[2] as u32 * a;
+                                sum[3] += a;
+                            }
+                        }
+                        let s = &mut acc[(row - row_a) * cols + (col - c0)];
+                        for k in 0..4 {
+                            s[k] += sum[k];
+                        }
                     }
                 }
             }
         }
+        if !self.filtered {
+            return;
+        }
+        let taps = (self.taps_x * self.taps_y) as u32;
+        for (slot, s) in dst.chunks_mut(4).zip(acc) {
+            let a = s[3];
+            if a == 0 {
+                continue;
+            }
+            slot[0] = ((s[0] + a / 2) / a) as u8;
+            slot[1] = ((s[1] + a / 2) / a) as u8;
+            slot[2] = ((s[2] + a / 2) / a) as u8;
+            slot[3] = ((a + taps / 2) / taps) as u8;
+        }
     }
+}
+
+/// Output rows a view pass splits across threads: more workers than this
+/// only adds spawn cost, and a band under [`MIN_BAND_ROWS`] rows spends
+/// more time setting up than sampling.
+const MAX_SAMPLE_WORKERS: usize = 8;
+const MIN_BAND_ROWS: usize = 8;
+/// Below this many texels a pass is not worth spawning threads for.
+const MIN_PARALLEL_TEXELS: usize = 96 * 1024;
+
+/// Run `sample` over `rows` of a `cols`-wide RGBA image, one band per
+/// worker, and return the number of bands. Every band writes only its own
+/// rows and each texel accumulates only from tiles (never from another
+/// texel), so any split produces the same bytes as a single band.
+fn sample_in_bands(
+    img: &mut [u8],
+    cols: usize,
+    rows: std::ops::Range<usize>,
+    sample: impl Fn(usize, usize, &mut [u8]) + Sync,
+) -> usize {
+    let len = rows.len();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let workers = if cols * len < MIN_PARALLEL_TEXELS {
+        1
+    } else {
+        cores.min(MAX_SAMPLE_WORKERS).min((len / MIN_BAND_ROWS).max(1))
+    };
+    sample_in_bands_with(workers, img, cols, rows, sample)
+}
+
+/// [`sample_in_bands`] with the worker count given.
+fn sample_in_bands_with(
+    workers: usize,
+    img: &mut [u8],
+    cols: usize,
+    rows: std::ops::Range<usize>,
+    sample: impl Fn(usize, usize, &mut [u8]) + Sync,
+) -> usize {
+    if workers <= 1 {
+        sample(rows.start, rows.end, img);
+        return 1;
+    }
+    let per = rows.len().div_ceil(workers);
+    let mut bands = 0;
+    std::thread::scope(|scope| {
+        let mut rest = img;
+        let mut a = rows.start;
+        while a < rows.end {
+            let b = (a + per).min(rows.end);
+            let (head, tail) = rest.split_at_mut((b - a) * cols * 4);
+            rest = tail;
+            let sample = &sample;
+            scope.spawn(move || sample(a, b, head));
+            bands += 1;
+            a = b;
+        }
+    });
+    bands
+}
+
+/// Minified sampling: a 2×2 bilinear of level-`shift` mip texels per output
+/// texel. Same tile-major shape as [`view_pixels`] (each mip tile is read
+/// once, taps land in the tile that owns them), with weights instead of a
+/// uniform box because the mip texel is not aligned to the footprint.
+fn view_pixels_mip(
+    doc: &Document,
+    plan: &StackPlan,
+    cache: &mut CompositeCache,
+    view: ViewRect,
+    out: [usize; 2],
+    region: [usize; 4],
+    shift: u32,
+) -> Vec<u8> {
+    let [c0, r0, c1, r1] = region;
+    let (cols, rows) = (c1 - c0, r1 - r0);
+    let dx = (view.x1 - view.x0) / out[0] as f32;
+    let dy = (view.y1 - view.y0) / out[1] as f32;
+    let scale = (1u32 << shift) as f32;
+    let mw = (doc.w + (1 << shift) - 1) >> shift;
+    let mh = (doc.h + (1 << shift) - 1) >> shift;
+    if mw == 0 || mh == 0 {
+        return vec![0u8; cols * rows * 4];
+    }
+    let (max_x, max_y) = ((mw - 1) as f32, (mh - 1) as f32);
+    let (mtx, mty) = (mw.div_ceil(TILE) as usize, mh.div_ceil(TILE) as usize);
+    let (mw_us, mh_us) = (mw as usize, mh as usize);
+    let tile = TILE as usize;
+    // Build every mip tile the region samples before the bands start: the
+    // bands only read the cache. A fit-zoomed 8K pass needs all of level 1
+    // (64 MiB of mips) just to average level 2, more than the mip budget.
+    cache.begin_pass();
+    for mt_y in 0..mty {
+        let band = (
+            (mt_y * tile) as f32 * scale,
+            ((mt_y + 1) * tile) as f32 * scale,
+        );
+        let (row_a, row_b) = texel_span(view.y0, dy, out[1], band.0 - dy * 0.5, band.1 + dy * 0.5);
+        let (row_a, row_b) = (row_a.max(r0), row_b.min(r1));
+        if row_a >= row_b {
+            continue;
+        }
+        for mt_x in 0..mtx {
+            let band = (
+                (mt_x * tile) as f32 * scale,
+                ((mt_x + 1) * tile) as f32 * scale,
+            );
+            let (col_a, col_b) = texel_span(view.x0, dx, out[0], band.0 - dx * 0.5, band.1 + dx * 0.5);
+            let (col_a, col_b) = (col_a.max(c0), col_b.min(c1));
+            if col_a >= col_b {
+                continue;
+            }
+            cache.mip_tile(doc, plan, shift, mt_x as u32, mt_y as u32);
+        }
+    }
+    let mut img = vec![0u8; cols * rows * 4];
+    let pass = MipPass {
+        cache: &*cache,
+        view,
+        out,
+        region,
+        cols,
+        shift,
+        scale,
+        dx,
+        dy,
+        mw: mw_us,
+        mh: mh_us,
+        max_x,
+        max_y,
+        mtx,
+        mty,
+    };
+    sample_in_bands(&mut img, cols, r0..r1, |row_a, row_b, dst| {
+        pass.band(row_a, row_b, dst)
+    });
+    cache.end_pass();
     img
+}
+
+/// Minified sampling of a band of output rows: the texel math of
+/// [`view_pixels_mip`], with the tile walk clipped to the band.
+struct MipPass<'a> {
+    cache: &'a CompositeCache,
+    view: ViewRect,
+    out: [usize; 2],
+    region: [usize; 4],
+    cols: usize,
+    shift: u32,
+    scale: f32,
+    dx: f32,
+    dy: f32,
+    mw: usize,
+    mh: usize,
+    max_x: f32,
+    max_y: f32,
+    mtx: usize,
+    mty: usize,
+}
+
+impl MipPass<'_> {
+    fn band(&self, row_a: usize, row_b: usize, dst: &mut [u8]) {
+        let [c0, _, c1, _] = self.region;
+        let tile = TILE as usize;
+        let stride = tile * 4;
+        let cols = self.cols;
+        // Alpha-weighted sums per texel: r·a·w, g·a·w, b·a·w, a·w. Weights
+        // are 0..=255 per axis, so a texel's weights sum to 65025 and the
+        // largest term (255·255·65025) still fits u32.
+        let mut acc = vec![[0u32; 4]; (row_b - row_a) * cols];
+        for mt_y in 0..self.mty {
+            let band = (
+                (mt_y * tile) as f32 * self.scale,
+                ((mt_y + 1) * tile) as f32 * self.scale,
+            );
+            let (ra, rb) = texel_span(
+                self.view.y0,
+                self.dy,
+                self.out[1],
+                band.0 - self.dy * 0.5,
+                band.1 + self.dy * 0.5,
+            );
+            let (ra, rb) = (ra.max(row_a), rb.min(row_b));
+            if ra >= rb {
+                continue;
+            }
+            for mt_x in 0..self.mtx {
+                let band = (
+                    (mt_x * tile) as f32 * self.scale,
+                    ((mt_x + 1) * tile) as f32 * self.scale,
+                );
+                let (ca, cb) = texel_span(
+                    self.view.x0,
+                    self.dx,
+                    self.out[0],
+                    band.0 - self.dx * 0.5,
+                    band.1 + self.dx * 0.5,
+                );
+                let (ca, cb) = (ca.max(c0), cb.min(c1));
+                if ca >= cb {
+                    continue;
+                }
+                let pixels = self
+                    .cache
+                    .level_tile(self.shift, mt_x as u32, mt_y as u32)
+                    .expect("mip tile missing during a sampling pass");
+                for row in ra..rb {
+                    let u = (self.view.y0 + (row as f32 + 0.5) * self.dy) / self.scale - 0.5;
+                    let y0f = u.floor();
+                    let fy = ((u - y0f).clamp(0.0, 1.0) * 255.0).round() as u32;
+                    let wy = [255 - fy, fy];
+                    let ya = [
+                        y0f.clamp(0.0, self.max_y) as usize,
+                        (y0f + 1.0).clamp(0.0, self.max_y) as usize,
+                    ];
+                    for col in ca..cb {
+                        let ux = (self.view.x0 + (col as f32 + 0.5) * self.dx) / self.scale - 0.5;
+                        let x0f = ux.floor();
+                        let fx = ((ux - x0f).clamp(0.0, 1.0) * 255.0).round() as u32;
+                        let wx = [255 - fx, fx];
+                        let xa = [
+                            x0f.clamp(0.0, self.max_x) as usize,
+                            (x0f + 1.0).clamp(0.0, self.max_x) as usize,
+                        ];
+                        let mut sum = [0u32; 4];
+                        for (j, &my) in ya.iter().enumerate() {
+                            if my / tile != mt_y || my >= self.mh {
+                                continue;
+                            }
+                            let src_row = (my % tile) * stride;
+                            for (i, &mx) in xa.iter().enumerate() {
+                                if mx / tile != mt_x || mx >= self.mw {
+                                    continue;
+                                }
+                                let w = wx[i] * wy[j];
+                                let src = src_row + (mx % tile) * 4;
+                                let px = &pixels[src..src + 4];
+                                let a = px[3] as u32 * w;
+                                sum[0] += px[0] as u32 * a;
+                                sum[1] += px[1] as u32 * a;
+                                sum[2] += px[2] as u32 * a;
+                                sum[3] += a;
+                            }
+                        }
+                        let s = &mut acc[(row - row_a) * cols + (col - c0)];
+                        for k in 0..4 {
+                            s[k] += sum[k];
+                        }
+                    }
+                }
+            }
+        }
+        const TOTAL: u32 = 255 * 255;
+        for (slot, s) in dst.chunks_mut(4).zip(acc) {
+            let a = s[3];
+            if a == 0 {
+                continue;
+            }
+            slot[0] = ((s[0] + a / 2) / a) as u8;
+            slot[1] = ((s[1] + a / 2) / a) as u8;
+            slot[2] = ((s[2] + a / 2) / a) as u8;
+            slot[3] = ((a + TOTAL / 2) / TOTAL).min(255) as u8;
+        }
+    }
 }
 
 /// Output texel rect covering a dirty rect's canvas pixels, or `None` when
@@ -535,12 +1268,38 @@ impl ViewTex {
         // The viewport path is the only dirty consumer while it is active
         // (`refresh_texture` returns early), so this is its one drain.
         let dirty = doc.take_dirty();
+        // One plan for the patch and the sampling pass: it snapshots the
+        // revision, which the next dab bumps.
+        let plan = doc.stack_plan();
         if let Some(rect) = dirty {
-            evict_tiles(cache, rect);
+            cache.patch(doc, &plan, rect);
         }
-        match plan_update(self.key == Some(key), rev == self.rev, dirty, view, out) {
-            ViewUpdate::Full => self.full(ctx, doc, cache, view, out),
-            ViewUpdate::Partial(region) => self.partial(doc, cache, view, out, region),
+        let update = plan_update(self.key == Some(key), rev == self.rev, dirty, view, out);
+        // A dirty mip texel averages a 2^shift square, so the change spills
+        // up to that far past the dirty rect in canvas pixels; widen the
+        // re-sampled texels to cover it. Level 0 has no spill.
+        let update = match update {
+            ViewUpdate::Partial([c0, r0, c1, r1]) => {
+                let dx = (view.x1 - view.x0) / out[0] as f32;
+                let dy = (view.y1 - view.y0) / out[1] as f32;
+                let shift = mip_shift(dx, dy);
+                let pad = if shift == 0 {
+                    0
+                } else {
+                    ((1u32 << shift) as f32 / dx.min(dy)).ceil() as usize + 1
+                };
+                ViewUpdate::Partial([
+                    c0.saturating_sub(pad),
+                    r0.saturating_sub(pad),
+                    (c1 + pad).min(out[0]),
+                    (r1 + pad).min(out[1]),
+                ])
+            }
+            other => other,
+        };
+        match update {
+            ViewUpdate::Full => self.full(ctx, doc, &plan, cache, view, out),
+            ViewUpdate::Partial(region) => self.partial(doc, &plan, cache, view, out, region),
             ViewUpdate::None => {}
         }
         // Every path, including the no-op one, records what the texture now
@@ -555,12 +1314,12 @@ impl ViewTex {
         &mut self,
         ctx: &egui::Context,
         doc: &Document,
+        plan: &StackPlan,
         cache: &mut CompositeCache,
         view: ViewRect,
         out: [usize; 2],
     ) {
-        let plan = doc.stack_plan();
-        let pixels = view_pixels(doc, &plan, cache, view, out, None);
+        let pixels = view_pixels(doc, plan, cache, view, out, None);
         let image = egui::ColorImage::from_rgba_unmultiplied(out, &pixels);
         // Update in place when possible: a reload would churn the texture id
         // and free the old one on every full pass (forced/desktop wheel).
@@ -574,14 +1333,14 @@ impl ViewTex {
     fn partial(
         &mut self,
         doc: &Document,
+        plan: &StackPlan,
         cache: &mut CompositeCache,
         view: ViewRect,
         out: [usize; 2],
         region: [usize; 4],
     ) {
         let [c0, r0, c1, r1] = region;
-        let plan = doc.stack_plan();
-        let pixels = view_pixels(doc, &plan, cache, view, out, Some(region));
+        let pixels = view_pixels(doc, plan, cache, view, out, Some(region));
         let image = egui::ColorImage::from_rgba_unmultiplied([c1 - c0, r1 - r0], &pixels);
         if let Some(handle) = &mut self.tex {
             handle.set_partial([c0, r0], image, egui::TextureOptions::LINEAR);
@@ -674,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_serves_the_cached_tile_until_it_is_evicted() {
+    fn cache_serves_the_cached_tile_until_the_dirty_rect_is_patched() {
         let mut doc = painted(512, 512, [10, 20, 30, 255]);
         let plan = doc.stack_plan();
         let mut cache = CompositeCache::new(CACHE_DESKTOP);
@@ -688,8 +1447,8 @@ mod tests {
         let plan = doc.stack_plan();
         assert_eq!(&cache.tile(&doc, &plan, 0, 0)[0..4], &[10, 20, 30, 255]);
 
-        // Evicting the tile is what makes the dirty path recomposite it.
-        cache.evict(0, 0);
+        // Patching the dirty rect is what makes the cached tile current.
+        cache.patch(&doc, &plan, (0, 0, 0, 0));
         assert_eq!(&cache.tile(&doc, &plan, 0, 0)[0..4], &[40, 50, 60, 255]);
     }
 
@@ -747,6 +1506,26 @@ mod tests {
     }
 
     #[test]
+    fn tile_image_region_clamps_to_tile_and_canvas() {
+        let doc = Document::new(300, 5);
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(256 * 1024);
+        let tile = cache.tile(&doc, &plan, 1, 0).to_vec();
+        // A rect straddling the tile seam: the upload covers only the part
+        // inside tile (1,0) and the canvas (x < 300).
+        let (rgba, ox, oy, w, h) =
+            tile_image_region(&doc, &tile, 1, 0, (250, 2, 320, 900));
+        assert_eq!((ox, oy, w, h), (256, 2, 44, 3));
+        assert_eq!(rgba.len(), 44 * 3 * 4);
+        // The first byte is canvas (256, 2): tile-local (0, 2).
+        assert_eq!(&rgba[0..4], &tile[(2 * TILE * 4) as usize..][0..4]);
+        // A rect that misses the tile yields nothing to upload.
+        let (empty, _, _, w, _) = tile_image_region(&doc, &tile, 1, 0, (0, 0, 255, 4));
+        assert!(empty.is_empty());
+        assert_eq!(w, 0);
+    }
+
+    #[test]
     fn tile_image_keeps_interior_tiles_whole() {
         let mut doc = Document::new(512, 300);
         doc.layers[0].pixels.set4(0, [1, 2, 3, 255]);
@@ -777,12 +1556,17 @@ mod tests {
         // Hits are not double counted.
         cache.tile(&doc, &plan, 0, 0);
         assert_eq!(cache.bytes(), 3 * TILE_BYTES);
-        cache.evict(0, 0);
-        assert_eq!(cache.bytes(), 2 * TILE_BYTES);
+        // Mips are counted too, and cleared with the level-0 tiles.
+        cache.mip_tile(&doc, &plan, 1, 0, 0);
+        assert_eq!(
+            cache.bytes(),
+            (cache.tiles.len() + cache.mips.len()) * TILE_BYTES
+        );
         cache.invalidate();
         assert_eq!(cache.bytes(), 0);
         assert!(cache.tiles.is_empty());
         assert!(cache.order.is_empty());
+        assert!(cache.mips.is_empty());
     }
 
     #[test]
@@ -865,26 +1649,26 @@ mod tests {
 
     #[test]
     fn viewport_trigger_follows_size_and_texture_limit() {
-        assert!(!viewport_active(false, false, 8192, 8192));
-        assert!(viewport_active(false, true, 8192, 8192), "mobile above 4K");
         assert!(
-            !viewport_active(false, true, 4096, 8192),
-            "4K still fits on mobile"
+            !viewport_active(false, 2048, 16384),
+            "2K is the largest canvas texture worth holding"
         );
+        assert!(viewport_active(false, 4096, 16384), "4K takes the viewport");
+        assert!(viewport_active(false, 8192, 16384), "8K takes the viewport");
         assert!(
-            viewport_active(false, false, 8192, 4096),
+            viewport_active(false, 8192, 4096),
             "GPU cannot hold the canvas"
         );
         assert!(
-            viewport_active(true, false, 1024, 8192),
+            viewport_active(true, 1024, 16384),
             "forced for captures"
         );
         assert!(
-            viewport_active(false, false, 1024, 4096),
-            "GPU below the 8K ceiling takes the fallback"
+            !viewport_active(false, 1024, 4096),
+            "a small canvas still fits a 4K GPU"
         );
         assert!(
-            viewport_active(false, false, 16384, 16384),
+            viewport_active(false, 16384, 16384),
             "a legacy oversized canvas never asks for a too-large texture"
         );
     }
@@ -974,22 +1758,277 @@ mod tests {
         }
         let plan = doc.stack_plan();
         let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        // Shifted half a pixel: each texel center lands a whole pixel right
+        // and down, so which pixel a texel took is readable from the bytes.
+        let view = ViewRect {
+            x0: 0.5,
+            y0: 0.5,
+            x1: w as f32 + 0.5,
+            y1: h as f32 + 0.5,
+        };
+        let got = view_pixels(
+            &doc,
+            &plan,
+            &mut cache,
+            view,
+            [w as usize, h as usize],
+            None,
+        );
+        let mut want = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                want.extend_from_slice(&color((x + 1).min(w - 1), (y + 1).min(h - 1)));
+            }
+        }
+        assert_same_bytes(&got, &want, "texel centers");
+        assert_ne!(&got[0..4], &color(0, 0), "top-left corner is not sampled");
+    }
+
+    #[test]
+    fn minified_view_averages_its_footprint() {
+        // 4 px stripes minified 8x: point sampling returns pure black and
+        // white texels (the stairstep strokes show at fit zoom); a box
+        // filter returns the mean.
+        let (w, h) = (64u32, 64u32);
+        let mut doc = Document::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x / 4) % 2 == 0 { 255u8 } else { 0 };
+                doc.layers[0]
+                    .pixels
+                    .set4((y as usize * w as usize + x as usize) * 4, [v, v, v, 255]);
+            }
+        }
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
         let view = ViewRect {
             x0: 0.0,
             y0: 0.0,
             x1: w as f32,
             y1: h as f32,
         };
-        // Half size: centers fall on canvas (1,1), (3,1) ... not (0,0).
-        let got = view_pixels(&doc, &plan, &mut cache, view, [4, 2], None);
-        let mut want = Vec::new();
-        for y in [1u32, 3] {
-            for x in [1u32, 3, 5, 7] {
-                want.extend_from_slice(&color(x, y));
+        let got = view_pixels(&doc, &plan, &mut cache, view, [8, 8], None);
+        for texel in got.chunks(4) {
+            assert!(
+                (100..=160).contains(&texel[0]),
+                "aliased texel {}",
+                texel[0]
+            );
+            assert_eq!(texel[3], 255);
+        }
+    }
+
+    #[test]
+    fn minified_view_averages_across_tile_seams() {
+        // Red tile side, blue tile side, one texel wide enough (7.88 px) to
+        // straddle the seam at x = 256: it must mix, not pick a side.
+        let (w, h) = (512u32, 8u32);
+        let mut doc = Document::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let px = if x < 256 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                doc.layers[0]
+                    .pixels
+                    .set4((y as usize * w as usize + x as usize) * 4, px);
             }
         }
-        assert_same_bytes(&got, &want, "texel centers");
-        assert_ne!(&got[0..4], &color(0, 0), "top-left corner is not sampled");
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w as f32,
+            y1: h as f32,
+        };
+        let got = view_pixels(&doc, &plan, &mut cache, view, [65, 1], None);
+        let seam = (256.0 / (w as f32 / 65.0)).floor() as usize;
+        let texel = &got[seam * 4..seam * 4 + 4];
+        assert!(
+            (60..=195).contains(&texel[0]) && (60..=195).contains(&texel[2]),
+            "seam texel did not mix: {texel:?}"
+        );
+        assert_eq!(texel[3], 255);
+        // Away from the seam the sides stay pure.
+        assert_eq!(&got[0..4], [255, 0, 0, 255]);
+        assert_eq!(&got[(64 * 4)..(64 * 4 + 4)], [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn mip_level_follows_the_texel_footprint() {
+        // Below 2:1 the full-resolution path is exact; above it each
+        // octave halves the mip resolution, capped at the deepest level.
+        assert_eq!(mip_shift(1.0, 1.0), 0);
+        assert_eq!(mip_shift(1.9, 1.9), 0);
+        assert_eq!(mip_shift(2.0, 2.0), 1);
+        assert_eq!(mip_shift(3.9, 3.9), 1);
+        assert_eq!(mip_shift(13.0, 13.0), 3);
+        assert_eq!(mip_shift(100.0, 100.0), MAX_MIP_LEVEL);
+    }
+
+    #[test]
+    fn mip_tiles_average_the_level_below() {
+        // 1024² opaque ramp, so level 2 has a full 2×2 of level-1 parents.
+        let (w, h) = (1024u32, 1024u32);
+        let mut doc = Document::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                doc.layers[0]
+                    .pixels
+                    .set4((y as usize * w as usize + x as usize) * 4, [x as u8, y as u8, 9, 255]);
+            }
+        }
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let base = cache.tile(&doc, &plan, 0, 0).to_vec();
+        let m1 = cache.mip_tile(&doc, &plan, 1, 0, 0).to_vec();
+        for my in 0..32usize {
+            for mx in 0..32usize {
+                let o = (my * TILE as usize + mx) * 4;
+                let p = |x: usize, y: usize| -> [u8; 4] {
+                    let s = ((y * 2) * TILE as usize + x * 2) * 4;
+                    [base[s], base[s + 1], base[s + 2], base[s + 3]]
+                };
+                let (a, b, c, d) = (p(mx, my), p(mx + 1, my), p(mx, my + 1), p(mx + 1, my + 1));
+                for k in 0..3 {
+                    let want = (a[k] as u32 + b[k] as u32 + c[k] as u32 + d[k] as u32 + 2) / 4;
+                    assert_eq!(m1[o + k], want as u8, "level 1 {mx},{my} channel {k}");
+                }
+                assert_eq!(m1[o + 3], 255);
+            }
+        }
+        let m2 = cache.mip_tile(&doc, &plan, 2, 0, 0).to_vec();
+        // Parent texel (0,0) averages the 2×2 of its first child tile.
+        let q = |x: usize, y: usize| m1[(y * TILE as usize + x) * 4];
+        let want = (q(0, 0) as u32 + q(1, 0) as u32 + q(0, 1) as u32 + q(1, 1) as u32 + 2) / 4;
+        assert_eq!(m2[0], want as u8, "level 2 is the mean of level 1");
+    }
+
+    #[test]
+    fn solid_canvas_stays_solid_at_every_mip_level() {
+        // Seams and translucent edges would show as a different colour at
+        // the mip boundary; a flat canvas must render flat at every zoom.
+        let (w, h) = (1000u32, 760u32);
+        let mut doc = Document::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                doc.layers[0]
+                    .pixels
+                    .set4((y as usize * w as usize + x as usize) * 4, [30, 120, 200, 255]);
+            }
+        }
+        let plan = doc.stack_plan();
+        for out in [[500, 380], [250, 190], [125, 95], [63, 48]] {
+            let mut cache = CompositeCache::new(CACHE_DESKTOP);
+            let view = ViewRect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: w as f32,
+                y1: h as f32,
+            };
+            assert!(mip_shift(w as f32 / out[0] as f32, h as f32 / out[1] as f32) > 0);
+            let got = view_pixels(&doc, &plan, &mut cache, view, out, None);
+            for (i, texel) in got.chunks(4).enumerate() {
+                assert_eq!(texel, [30, 120, 200, 255], "texel {i} at out {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_patch_updates_the_mips_over_it() {
+        let (w, h) = (1024u32, 512u32);
+        let mut doc = Document::new(w, h);
+        doc.background = [0, 0, 0, 255];
+        // A transparent layer over a black page: the composite is pure
+        // black, so the dab is the only content to average.
+        doc.layers[0].pixels.fill(0);
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        // One level-1 tile spans 512 canvas px, one level-2 tile 1024.
+        for level in 1..=2 {
+            for tx in 0..(w >> (8 + level)) {
+                cache.mip_tile(&doc, &plan, level, tx, 0);
+            }
+        }
+        assert_eq!(cache.mips.len(), 5, "four level-1 tiles and one level-2");
+        let l2_before = cache.mip_tile(&doc, &plan, 2, 0, 0).to_vec();
+        let m0_before = cache.mip_tile(&doc, &plan, 1, 0, 0).to_vec();
+
+        // Dab at canvas (600, 10): level-1 tile 1, texel (44, 5).
+        doc.layers[0]
+            .pixels
+            .set4((10 * w + 600) as usize * 4, [200, 200, 200, 255]);
+        let plan = doc.stack_plan();
+        cache.patch(&doc, &plan, (600, 10, 600, 10));
+
+        // The mip tiles stay cached but their affected texels are re-averaged:
+        // one opaque pixel among three transparent ones.
+        assert_eq!(cache.mips.len(), 5, "nothing dropped");
+        let m1 = cache.mip_tile(&doc, &plan, 1, 1, 0).to_vec();
+        let local = (5 * TILE as usize + 44) * 4;
+        assert_eq!(&m1[local..local + 4], &[50, 50, 50, 255], "level 1 texel");
+        let untouched = (5 * TILE as usize + 40) * 4;
+        assert_eq!(&m1[untouched..untouched + 4], &[0, 0, 0, 255]);
+        let m2 = cache.mip_tile(&doc, &plan, 2, 0, 0).to_vec();
+        assert_ne!(m2, l2_before, "level 2 re-averaged from level 1");
+        let m0 = cache.mip_tile(&doc, &plan, 1, 0, 0).to_vec();
+        assert_eq!(m0, m0_before, "a tile the dab missed is untouched");
+    }
+
+    #[test]
+    fn minified_partial_after_a_dab_matches_a_full_pass() {
+        // The dirty rect is widened for the mip spill; if it is not, a
+        // texel next to the repainted one keeps the stale average.
+        let (w, h) = (2048u32, 1024u32);
+        let mut doc = Document::new(w, h);
+        doc.layers[0].pixels.fill(255);
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w as f32,
+            y1: h as f32,
+        };
+        let out = [160, 80];
+        assert!(mip_shift(w as f32 / out[0] as f32, h as f32 / out[1] as f32) > 0);
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let first = view_pixels(&doc, &plan, &mut cache, view, out, None);
+        let before = dirty_texels(view, out, (1000, 500, 1100, 560)).unwrap();
+        assert!(first.chunks(4).all(|t| t == [255, 255, 255, 255]));
+
+        // A dab marks the doc dirty; patch the tiles and the mips, then
+        // re-sample only the region the app would.
+        for y in 500..=560 {
+            for x in 1000..=1100 {
+                doc.layers[0]
+                    .pixels
+                    .set4((y as usize * w as usize + x as usize) * 4, [20, 20, 20, 255]);
+            }
+        }
+        doc.mark_full_dirty();
+        doc.take_dirty();
+        let plan = doc.stack_plan();
+        cache.patch(&doc, &plan, (1000, 500, 1100, 560));
+        let pad = ((1u32 << 4) as f32 / 12.8).ceil() as usize + 1;
+        let [c0, r0, c1, r1] = before;
+        let region = [
+            c0.saturating_sub(pad),
+            r0.saturating_sub(pad),
+            (c1 + pad).min(out[0]),
+            (r1 + pad).min(out[1]),
+        ];
+        let part = view_pixels(&doc, &plan, &mut cache, view, out, Some(region));
+        let full = view_pixels(&doc, &plan, &mut cache, view, out, None);
+        let (pw, ph) = ((region[2] - region[0]), (region[3] - region[1]));
+        let mut want = Vec::new();
+        for row in 0..ph {
+            let start = ((row + region[1]) * out[0] + region[0]) * 4;
+            want.extend_from_slice(&full[start..start + pw * 4]);
+        }
+        assert_same_bytes(&part, &want, "minified partial");
     }
 
     #[test]
@@ -1021,7 +2060,7 @@ mod tests {
 
     #[test]
     fn view_render_uses_fresh_tiles_after_a_dab() {
-        // 600 x 150 is three tiles wide, so evicting tile (1,0) is visible
+        // 600 x 150 is three tiles wide, so patching tile (1,0) is visible
         // in the cache contents as well as in the pixels.
         let (w, h) = (600u32, 150u32);
         let mut doc = Document::new(w, h);
@@ -1041,8 +2080,8 @@ mod tests {
         assert_eq!(&first[px..px + 4], &[10, 20, 30, 255]);
         assert!(cache.tiles.contains_key(&(1, 0)));
 
-        // A dab inside tile (1,0). Sampling before the eviction serves the
-        // cached pre-edit tile, which is exactly why it must be evicted.
+        // A dab inside tile (1,0). Sampling before the patch serves the
+        // cached pre-edit tile, which is exactly why it must be patched.
         doc.layers[0].pixels.set4(at(300, 50), [200, 100, 50, 255]);
         doc.mark_full_dirty();
         let dirty = doc.take_dirty().expect("dab marked the doc dirty");
@@ -1051,13 +2090,71 @@ mod tests {
         let stale = view_pixels(&doc, &plan, &mut cache, view, out, None);
         assert_eq!(&stale[px..px + 4], &[10, 20, 30, 255], "cached tile");
 
-        // The app evicts the tiles the dab's rect touches, then samples.
-        evict_tiles(&mut cache, (300, 50, 300, 50));
-        assert!(!cache.tiles.contains_key(&(1, 0)), "dirty tile evicted");
-        assert!(cache.tiles.contains_key(&(0, 0)));
-        assert!(cache.tiles.contains_key(&(2, 0)));
+        // The app patches only the dab's rect, then samples. The tile stays
+        // cached (its other pixels are still valid) but its rect is fresh.
+        cache.patch(&doc, &plan, (300, 50, 300, 50));
+        let local = ((50 * TILE + (300 - TILE)) * 4) as usize;
+        let tile = cache.tile(&doc, &plan, 1, 0);
+        assert_eq!(&tile[local..local + 4], &[200, 100, 50, 255], "patched tile");
         let fresh = view_pixels(&doc, &plan, &mut cache, view, out, None);
-        assert_eq!(&fresh[px..px + 4], &[200, 100, 50, 255], "recomposited");
+        assert_eq!(&fresh[px..px + 4], &[200, 100, 50, 255], "patched");
+    }
+
+    #[test]
+    fn band_splits_write_disjoint_rows() {
+        // Each band owns exactly its rows of the image, in order: the
+        // threads must never overlap, or a pass would be nondeterministic.
+        let (cols, rows) = (3usize, 64usize);
+        let mut img = vec![0u8; cols * rows * 4];
+        let bands = sample_in_bands_with(4, &mut img, cols, 0..rows, |a, _b, dst| {
+            for (i, px) in dst.chunks_mut(4).enumerate() {
+                let row = a + i / cols;
+                px.copy_from_slice(&[row as u8, (i % cols) as u8, 7, 255]);
+            }
+        });
+        assert!(bands > 1, "4 workers over 64 rows must split");
+        for row in 0..rows {
+            for col in 0..cols {
+                let o = (row * cols + col) * 4;
+                assert_eq!(&img[o..o + 4], &[row as u8, col as u8, 7, 255], "{row},{col}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_pass_matches_one_row_at_a_time() {
+        // The threaded full pass must produce the same bytes as sampling
+        // every row on its own (which is below the parallel threshold).
+        let (w, h) = (800u32, 800u32);
+        let mut doc = Document::new(w, h);
+        doc.layers[0].pixels.fill(255);
+        let stride = w as usize;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                if (x / 40 + y / 40) % 3 == 0 {
+                    doc.layers[0]
+                        .pixels
+                        .set4((y * stride + x) * 4, [200, 30, 90, 255]);
+                }
+            }
+        }
+        let view = ViewRect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: w as f32,
+            y1: h as f32,
+        };
+        let out = [400, 400];
+        let plan = doc.stack_plan();
+        let mut cache = CompositeCache::new(CACHE_DESKTOP);
+        let full = view_pixels(&doc, &plan, &mut cache, view, out, None);
+        assert_eq!(full.len(), 400 * 400 * 4);
+        let mut serial = Vec::with_capacity(full.len());
+        for row in 0..out[1] {
+            let band = view_pixels(&doc, &plan, &mut cache, view, out, Some([0, row, out[0], row + 1]));
+            serial.extend_from_slice(&band);
+        }
+        assert_eq!(full, serial);
     }
 
     /// The texel columns/rows whose sample centers land on dirty canvas

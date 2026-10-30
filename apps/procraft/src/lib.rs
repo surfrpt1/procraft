@@ -1190,6 +1190,14 @@ struct ProCraftApp {
     // Segments of the live brush stroke, replayed on release when the
     // brush has a start/end taper.
     stroke_record: RecordedStroke,
+    // Input samples that did not fit this frame's stamping budget. A flick
+    // delivers a canvas-length of travel in one frame; stamping it whole
+    // stalls the frame, so the tail carries over (see `STAMP_BUDGET`).
+    pending_pts: Vec<egui::Pos2>,
+    // Taper replay running across frames after a lift (see `TaperReplay`),
+    // plus whether the lift still owes its timelapse frame.
+    taper_job: Option<TaperReplay>,
+    taper_capture: bool,
     sel_anchor: Option<(f32, f32)>,
     sel_current: Option<(f32, f32)>,
     /// Drag-crop state: the live drag plus the committed rect (inclusive
@@ -1225,6 +1233,10 @@ struct ProCraftApp {
     /// last write time and whether to offer it at startup.
     recovery_path: std::path::PathBuf,
     last_autosave: f64,
+    /// Autosave encode in flight: a worker deflates a copy-on-write
+    /// document snapshot (tiles are shared `Arc`s, so the clone is cheap)
+    /// and sends the bytes back for the UI thread to write.
+    autosave_job: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
     recovery_offer: bool,
     fill_tolerance: u8,
     fill_grow: u8,
@@ -1305,6 +1317,9 @@ struct ProCraftApp {
     #[cfg(target_os = "android")]
     android_inset_top: f32,
     preview_theme: Option<Theme>,
+    /// Display scale the preview textures were built at: a window dragged to
+    /// another monitor needs them re-rendered or every thumbnail resamples.
+    preview_scale: f32,
     custom_brushes: Vec<BrushPreset>,
     brush_slot: Option<BrushSlot>,
     new_brush_name: String,
@@ -1493,6 +1508,9 @@ impl ProCraftApp {
             smooth_pressure: 1.0,
             stroke_curve: StrokeCurve::new(),
             stroke_record: RecordedStroke::default(),
+            pending_pts: Vec::new(),
+            taper_job: None,
+            taper_capture: false,
             sel_anchor: None,
             sel_current: None,
             crop_anchor: None,
@@ -1512,6 +1530,7 @@ impl ProCraftApp {
             tap_track: None,
             recovery_path: recovery_path.clone(),
             last_autosave: 0.0,
+            autosave_job: None,
             recovery_offer: std::path::Path::new(&recovery_path).exists(),
             fill_tolerance: 32,
             fill_grow: 2,
@@ -1568,6 +1587,7 @@ impl ProCraftApp {
             #[cfg(target_os = "android")]
             android_inset_top: -1.0,
             preview_theme: None,
+            preview_scale: 1.0,
             custom_brushes: Vec::new(),
             brush_slot: None,
             new_brush_name: String::new(),
@@ -2238,16 +2258,18 @@ impl ProCraftApp {
 
     /// Whether the viewport-resolution fallback (spec §4) drives the canvas
     /// this frame. Mask view and Animation Assist opt out: they keep their
-    /// own full uploads.
+    /// own full uploads. Zoomed far out also takes the fallback, because the
+    /// canvas texture is minified with bilinear sampling only (no mipmaps on
+    /// wgpu) and thin strokes alias into stripes.
     fn viewport_canvas(&self, ctx: &egui::Context) -> bool {
         !self.view_mask
             && !self.anim_assist
-            && canvas::viewport_active(
-                viewport_forced(),
-                cfg!(any(target_os = "android", target_os = "ios")),
-                self.doc.w.max(self.doc.h),
-                ctx.input(|i| i.max_texture_side),
-            )
+            && (self.zoom < canvas::MINIFIED_ZOOM
+                || canvas::viewport_active(
+                    viewport_forced(),
+                    self.doc.w.max(self.doc.h),
+                    ctx.input(|i| i.max_texture_side),
+                ))
     }
 
     /// Upload only what changed since the last frame (no-op when clean).
@@ -2269,7 +2291,6 @@ impl ProCraftApp {
             self.anim_assist,
             canvas::viewport_active(
                 viewport_forced(),
-                cfg!(any(target_os = "android", target_os = "ios")),
                 self.doc.w.max(self.doc.h),
                 ctx.input(|i| i.max_texture_side),
             ),
@@ -2468,23 +2489,21 @@ impl ProCraftApp {
                 x1.min(self.doc.w.saturating_sub(1)),
                 y1.min(self.doc.h.saturating_sub(1)),
             );
+            // Recomposite only the dirty band of each cached tile: the rest
+            // of the 256² square is still valid from the previous event.
+            let rect = (x0, y0, x1, y1);
+            self.composite.patch(&self.doc, &plan, rect);
             for ty in y0 / TILE..=y1 / TILE {
                 for tx in x0 / TILE..=x1 / TILE {
-                    // A cached hit would be the pre-edit composite of the
-                    // very tile this dab touched, so drop it first.
-                    self.composite.evict(tx, ty);
                     let tile = self.composite.tile(&self.doc, &plan, tx, ty);
-                    let (rgba, w, h) = canvas::tile_image(&self.doc, tile, tx, ty);
+                    let (rgba, ox, oy, w, h) =
+                        canvas::tile_image_region(&self.doc, tile, tx, ty, rect);
                     if w == 0 || h == 0 {
                         continue;
                     }
                     let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                     if let Some(handle) = &mut self.texture {
-                        handle.set_partial(
-                            [(tx * TILE) as usize, (ty * TILE) as usize],
-                            image,
-                            TextureOptions::LINEAR,
-                        );
+                        handle.set_partial([ox, oy], image, TextureOptions::LINEAR);
                     }
                 }
             }
@@ -2635,26 +2654,26 @@ impl ProCraftApp {
     /// Built-ins come first, then the user's custom brushes in order.
     fn build_preset_previews(&mut self, ctx: &egui::Context, ink: Color) {
         self.preset_textures.clear();
+        let scale = ctx.pixels_per_point();
+        let (pw, ph) = preview_size(scale);
         let brushes: Vec<Brush> = procraft_engine::presets()
             .into_iter()
             .map(|(_, b)| b)
             .chain(self.custom_brushes.iter().map(|p| p.brush.clone()))
             .collect();
         for (idx, preset) in brushes.into_iter().enumerate() {
-            let mut doc = Document::new(144, 36);
-            let brush = Brush {
-                eraser: false,
-                ..preset
-            };
+            let mut doc = Document::new(pw, ph);
+            let brush = preview_brush(&preset, ph as f32);
             paint_preview_stroke(&mut doc, &brush, ink);
             let img =
-                ColorImage::from_rgba_unmultiplied([144, 36], &doc.layers[0].pixels.to_dense());
+                ColorImage::from_rgba_unmultiplied([pw as usize, ph as usize], &doc.layers[0].pixels.to_dense());
             self.preset_textures.push(ctx.load_texture(
                 format!("brush-{idx}"),
                 img,
                 TextureOptions::LINEAR,
             ));
         }
+        self.preview_scale = scale;
     }
 
     /// Total preview cards currently needed (built-ins + customs).
@@ -2689,17 +2708,53 @@ fn mask_action(view_mask: bool, has_mask: bool, mask_shown: bool) -> MaskAction 
     }
 }
 
-fn brush_preview_path() -> Vec<(f32, f32)> {
+/// Brush preview strip in points, as laid out in the panel.
+pub const PREVIEW_W: f32 = 96.0;
+pub const PREVIEW_H: f32 = 24.0;
+
+/// Preview stroke diameter as a fraction of the strip height. Presets carry
+/// their own size (Airbrush is 64 px) and a full-size stroke on a 24 pt strip
+/// is a cropped band, not a preview of the edge.
+const PREVIEW_SIZE_FRAC: f32 = 0.45;
+
+/// Texture size for the preview strip: one texel per device pixel, so the
+/// thumbnail is copied to the screen 1:1 instead of being resampled.
+fn preview_size(scale: f32) -> (u32, u32) {
+    let s = if scale.is_finite() { scale.max(1.0) } else { 1.0 };
+    (
+        (PREVIEW_W * s).round().max(1.0) as u32,
+        (PREVIEW_H * s).round().max(1.0) as u32,
+    )
+}
+
+/// The preset as it should be previewed: same edge, sized to fit the strip.
+fn preview_brush(brush: &Brush, strip_h: f32) -> Brush {
+    let mut b = Brush {
+        eraser: false,
+        ..brush.clone()
+    };
+    b.size = b.size.min(strip_h * PREVIEW_SIZE_FRAC).max(1.0);
+    b
+}
+
+fn brush_preview_path(w: f32, h: f32) -> Vec<(f32, f32)> {
+    // Fractions of the strip, so the wave keeps its shape at any preview
+    // size (144x36 reproduces the original 8..136, mid 18, amplitude 8).
+    let (x0, x1) = (w * (8.0 / 144.0), w * (136.0 / 144.0));
+    let (mid, amp) = (h * 0.5, h * (8.0 / 36.0));
+    let step = (w / 72.0).max(1.0);
     let mut points = Vec::new();
-    let mut x = 8.0;
-    while x <= 136.0 {
-        let y = 18.0 + 8.0 * ((x - 8.0) / 128.0 * std::f32::consts::PI * 2.0).sin();
+    let mut x = x0;
+    while x <= x1 {
+        let t = (x - x0) / (x1 - x0);
+        let y = mid + amp * (t * std::f32::consts::PI * 2.0).sin();
         points.push((x, y));
-        x += 2.0;
+        x += step;
     }
     points
 }
 
+/// Cumulative distance (canvas px) along `points`, starting at 0.
 fn preview_path_progress(points: &[(f32, f32)]) -> Vec<f32> {
     let mut progress = Vec::with_capacity(points.len());
     progress.push(0.0);
@@ -2709,17 +2764,13 @@ fn preview_path_progress(points: &[(f32, f32)]) -> Vec<f32> {
         total += (dx * dx + dy * dy).sqrt();
         progress.push(total);
     }
-    if total > 0.0 {
-        for value in &mut progress {
-            *value /= total;
-        }
-    }
     progress
 }
 
 fn paint_preview_stroke(doc: &mut Document, brush: &Brush, ink: Color) {
-    let points = brush_preview_path();
+    let points = brush_preview_path(doc.w as f32, doc.h as f32);
     let progress = preview_path_progress(&points);
+    let total = progress.last().copied().unwrap_or(0.0);
     let mut last = None;
     let mut left = 0.0;
     for (idx, &to) in points.iter().enumerate() {
@@ -2730,21 +2781,27 @@ fn paint_preview_stroke(doc: &mut Document, brush: &Brush, ink: Color) {
             let next = points[1];
             (next.1 - to.1).atan2(next.0 - to.0)
         };
-        let from_u = if idx == 0 { 0.0 } else { progress[idx - 1] };
+        let from_dist = progress[idx.saturating_sub(1)];
         let from_dyn = DabDynamics {
             angle,
-            taper: brush.taper.factor_at(from_u),
+            taper: brush
+                .taper
+                .distance_factor(from_dist, total - from_dist, brush.size),
             ..Default::default()
         };
+        let to_dist = progress[idx];
         let to_dyn = DabDynamics {
             angle,
-            taper: brush.taper.factor_at(progress[idx]),
+            taper: brush
+                .taper
+                .distance_factor(to_dist, total - to_dist, brush.size),
             ..Default::default()
         };
         let (l, lo) = doc.stroke_to_dyn(brush, ink, last, from_dyn, to, to_dyn, left);
         last = l;
         left = lo;
     }
+    doc.end_stroke();
 }
 
 /// Dispatch a palette file by extension (shared by the desktop Import arm
@@ -2951,7 +3008,19 @@ impl ProCraftApp {
             if ui.button("−").clicked() {
                 self.zoom = (self.zoom / 1.25).clamp(0.1, 8.0);
             }
-            ui.label(format!("{}%", (self.zoom * 100.0).round() as u32));
+            // The ladder is 1.25x off a fractional fit zoom, so 100 % is not
+            // on it. The percentage is the way there (and where the canvas
+            // lands on whole pixels instead of being resampled).
+            if ui
+                .add(
+                    egui::Label::new(format!("{}%", (self.zoom * 100.0).round() as u32))
+                        .sense(Sense::click()),
+                )
+                .on_hover_text("Click for 100%")
+                .clicked()
+            {
+                self.zoom = 1.0;
+            }
             if ui.button("+").clicked() {
                 self.zoom = (self.zoom * 1.25).clamp(0.1, 8.0);
             }
@@ -3348,6 +3417,7 @@ impl ProCraftApp {
                 };
                 if self.preview_theme != Some(self.theme)
                     || self.preset_textures.len() != self.preview_count()
+                    || (self.preview_scale - ui.ctx().pixels_per_point()).abs() > 0.01
                 {
                     let ctx = ui.ctx().clone();
                     self.build_preset_previews(&ctx, ink);
@@ -3367,7 +3437,7 @@ impl ProCraftApp {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 if let Some(tex) = self.preset_textures.get(idx) {
                                     let thumb = ui.add(
-                                        egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
+                                        egui::Image::new((tex.id(), Vec2::new(PREVIEW_W, PREVIEW_H)))
                                             .sense(Sense::click()),
                                     );
                                     if thumb.clicked() {
@@ -3488,7 +3558,7 @@ impl ProCraftApp {
                                     egui::Frame::group(ui.style()).show(ui, |ui| {
                                         if let Some(tex) = self.preset_textures.get(base + idx) {
                                             let thumb = ui.add(
-                                                egui::Image::new((tex.id(), Vec2::new(96.0, 24.0)))
+                                                egui::Image::new((tex.id(), Vec2::new(PREVIEW_W, PREVIEW_H)))
                                                     .sense(Sense::click()),
                                             );
                                             if thumb.clicked() {
@@ -4284,9 +4354,8 @@ impl ProCraftApp {
                                     self.renaming_text.clear();
                                 }
                             } else {
-                                let resp = ui
-                                    .selectable_label(selected, &layer.name)
-                                    .on_hover_text(
+                                let resp =
+                                    ui.selectable_label(selected, &layer.name).on_hover_text(
                                         "Ctrl/Shift-click or long-press to select several layers",
                                     );
                                 let long = resp.long_touched();
@@ -4301,8 +4370,10 @@ impl ProCraftApp {
                                     );
                                     select = Some(i);
                                     if self.layer_selection.len() > 1 {
-                                        self.status =
-                                            format!("{} layers selected.", self.layer_selection.len());
+                                        self.status = format!(
+                                            "{} layers selected.",
+                                            self.layer_selection.len()
+                                        );
                                     }
                                 }
                                 if resp.double_clicked() {
@@ -6913,8 +6984,10 @@ impl ProCraftApp {
     }
 
     /// Best-effort delete of the autosave recovery file (after an explicit
-    /// save, load, or clean exit — anything that makes it stale).
-    fn clear_recovery(&self) {
+    /// save, load, or clean exit — anything that makes it stale). Drops any
+    /// encode in flight so it cannot land after the delete.
+    fn clear_recovery(&mut self) {
+        self.autosave_job = None;
         let _ = std::fs::remove_file(&self.recovery_path);
     }
 
@@ -7428,6 +7501,22 @@ fn center_offset(content: egui::Vec2, avail: egui::Vec2) -> egui::Vec2 {
         ((avail.x - content.x) * 0.5).max(0.0),
         ((avail.y - content.y) * 0.5).max(0.0),
     )
+}
+
+/// Land the canvas origin on a physical pixel when the view sits on a whole
+/// device-pixel zoom (100 %, 200 % ...). A fractional origin makes the GPU
+/// bilinearly resample every edge on the page — the raster is sharp, the
+/// picture is not. Fractional zooms and rotation are left alone: there is no
+/// grid to land on, and snapping would fight the pan.
+fn snap_canvas_origin(min: egui::Pos2, zoom: f32, ppp: f32, angle: f32) -> egui::Pos2 {
+    if angle != 0.0 || !ppp.is_finite() || ppp <= 0.0 {
+        return min;
+    }
+    let device = zoom * ppp;
+    if (device - device.round()).abs() > 1e-3 {
+        return min;
+    }
+    egui::pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp)
 }
 
 fn board_dot_step(zoom: f32) -> f32 {
@@ -9550,6 +9639,7 @@ fn sample_pointer(
     target: (f32, f32),
     a: f32,
     dt: f32,
+    zoom: f32,
 ) -> ((f32, f32), f32) {
     let smooth = match smooth_pt {
         Some((px, py)) => (
@@ -9561,7 +9651,10 @@ fn sample_pointer(
     let speed = match last_target {
         Some((lx, ly)) => {
             let dist = ((target.0 - lx).powi(2) + (target.1 - ly).powi(2)).sqrt();
-            (dist / dt.max(f32::EPSILON) / SPEED_NORM_PX_PER_SEC).clamp(0.0, 1.0)
+            // Target is canvas space; velocity dynamics are a hand motion,
+            // so convert to screen pixels before normalizing or speed
+            // tapering would change with every zoom level.
+            (dist * zoom / dt.max(f32::EPSILON) / SPEED_NORM_PX_PER_SEC).clamp(0.0, 1.0)
         }
         None => 0.0,
     };
@@ -9636,6 +9729,15 @@ fn stroke_steps(len: f32) -> usize {
     (len / 4.0).ceil().clamp(1.0, 64.0) as usize
 }
 
+/// How long one frame may spend stamping a live stroke. A dab is ~35 us on
+/// an 8K canvas, so a full-canvas flick (thousands of dabs) would block for
+/// most of a second if stamped in one frame; past this the batch tail waits
+/// for the next frame (see `pending_pts`).
+const STAMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Seconds between autosave recovery snapshots.
+const AUTOSAVE_SECS: f64 = 120.0;
+
 #[derive(Clone, Copy)]
 struct RecordedSegment {
     from: Option<(f32, f32)>,
@@ -9675,45 +9777,129 @@ impl RecordedStroke {
     }
 }
 
-/// Rewind the live stroke and redraw it with Procreate's start/end taper.
-/// The checkpoint stays on the undo stack, so one undo still removes the
-/// whole stroke.
-fn taper_replay(doc: &mut Document, brush: &Brush, color: Color, stroke: &RecordedStroke) -> bool {
+/// Taper factor for a live dab ending `leg` px after `travelled` px of
+/// stroke. The end ramp is not knowable while the pen is down; it is applied
+/// once by [`taper_replay`] on release. Asking for it live would paint the
+/// whole stroke thin and repaint it full-width at lift.
+fn live_taper_at(brush: &Brush, travelled: f32, leg: f32) -> f32 {
+    brush.taper.live_factor(travelled + leg, brush.size)
+}
+
+/// A taper replay in progress. A long 8K stroke is thousands of dabs, so
+/// re-stamping it with the end ramp in one go froze the frame the pen was
+/// lifted on; [`taper_step`] spends one frame's stamping budget at a time
+/// instead, and the canvas shows the partial redraw.
+struct TaperReplay {
+    brush: Brush,
+    color: Color,
+    /// Next recorded segment to stamp and the path length before it.
+    cursor: usize,
+    travelled: f32,
+    leftover: f32,
+    /// Content revision after the last step. Anything else changing pixels
+    /// (undo, a new stroke) cancels the replay rather than stamping over it.
+    rev: u64,
+}
+
+/// What one [`taper_step`] did.
+enum TaperStep {
+    More,
+    Done,
+    /// The document moved on (undo, a new stroke): the replay is void and
+    /// its stroke state must be left alone.
+    Cancelled,
+}
+
+/// Start a taper replay: rewind the live stroke to the checkpoint inside
+/// `rect` (the bbox it painted) and prepare to redraw it with the end ramp.
+/// The start ramp already matches because live dabs use the same distance
+/// scale. The checkpoint stays on the undo stack, so one undo still
+/// removes the whole stroke.
+fn taper_begin(
+    doc: &mut Document,
+    brush: &Brush,
+    color: Color,
+    stroke: &RecordedStroke,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Option<TaperReplay> {
     if stroke.segments.is_empty() || stroke.total_len <= 0.0 {
-        return false;
+        return None;
     }
     if brush.taper.start <= 0.0 && brush.taper.end <= 0.0 {
-        return false;
+        return None;
     }
-    if !doc.restore_last_checkpoint() {
-        return false;
+    let restored = match rect {
+        Some(rect) => doc.restore_checkpoint_region(rect),
+        None => doc.restore_last_checkpoint(),
+    };
+    if !restored {
+        return None;
     }
-    let mut travelled = 0.0;
-    let mut leftover = 0.0;
-    for segment in &stroke.segments {
+    Some(TaperReplay {
+        brush: brush.clone(),
+        color,
+        cursor: 0,
+        travelled: 0.0,
+        leftover: 0.0,
+        rev: doc.revision(),
+    })
+}
+
+/// Stamp the replay for at most `STAMP_BUDGET`, resuming exactly where the
+/// last call stopped. Segments are independent in order, so slicing the
+/// work across frames paints the same bytes a single pass would.
+fn taper_step(doc: &mut Document, job: &mut TaperReplay, stroke: &RecordedStroke) -> TaperStep {
+    taper_step_with(STAMP_BUDGET, doc, job, stroke)
+}
+
+fn taper_step_with(
+    budget: std::time::Duration,
+    doc: &mut Document,
+    job: &mut TaperReplay,
+    stroke: &RecordedStroke,
+) -> TaperStep {
+    if doc.revision() != job.rev {
+        return TaperStep::Cancelled;
+    }
+    let started = std::time::Instant::now();
+    while job.cursor < stroke.segments.len() {
+        let segment = &stroke.segments[job.cursor];
         let leg = match segment.from {
             Some((fx, fy)) => ((segment.to.0 - fx).powi(2) + (segment.to.1 - fy).powi(2)).sqrt(),
             None => 0.0,
         };
-        let from_u = (travelled / stroke.total_len).clamp(0.0, 1.0);
-        travelled += leg;
-        let to_u = (travelled / stroke.total_len).clamp(0.0, 1.0);
+        let from_dist = job.travelled;
+        job.travelled += leg;
+        let to_dist = job.travelled;
         let mut from_dyn = segment.from_dyn;
-        from_dyn.taper = brush.taper.factor_at(from_u);
+        from_dyn.taper = job.brush.taper.distance_factor(
+            from_dist,
+            stroke.total_len - from_dist,
+            job.brush.size,
+        );
         let mut to_dyn = segment.to_dyn;
-        to_dyn.taper = brush.taper.factor_at(to_u);
+        to_dyn.taper = job.brush.taper.distance_factor(
+            to_dist,
+            stroke.total_len - to_dist,
+            job.brush.size,
+        );
         let (_, lo) = doc.stroke_to_dyn(
-            brush,
-            color,
+            &job.brush,
+            job.color,
             segment.from,
             from_dyn,
             segment.to,
             to_dyn,
-            leftover,
+            job.leftover,
         );
-        leftover = lo;
+        job.leftover = lo;
+        job.cursor += 1;
+        if started.elapsed() >= budget && job.cursor < stroke.segments.len() {
+            job.rev = doc.revision();
+            return TaperStep::More;
+        }
     }
-    true
+    TaperStep::Done
 }
 
 /// Flush the smoothed stroke's final tail (curve cursor -> last raw
@@ -9988,6 +10174,27 @@ impl eframe::App for ProCraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Advance a taper replay from the last lift. It runs before input
+        // so its dabs reach this frame's composite, and it stops if
+        // anything else touches the document.
+        if let Some(job) = self.taper_job.as_mut() {
+            match taper_step(&mut self.doc, job, &self.stroke_record) {
+                TaperStep::More => ui.ctx().request_repaint(),
+                TaperStep::Done => {
+                    self.taper_job = None;
+                    self.doc.end_stroke();
+                    self.stroke_record.reset();
+                    if std::mem::take(&mut self.taper_capture) {
+                        self.capture_timelapse();
+                    }
+                }
+                TaperStep::Cancelled => {
+                    self.taper_job = None;
+                    self.stroke_record.reset();
+                    self.taper_capture = false;
+                }
+            }
+        }
         let class = effective_layout(
             ui.ctx().viewport_rect().width(),
             cfg!(any(target_os = "ios", target_os = "android")),
@@ -10122,17 +10329,43 @@ impl eframe::App for ProCraftApp {
                 }
             }
         }
-        // Autosave: silent v8 snapshot every 120 s (unconditional — a few
-        // ms on typical canvases, and no change can slip through dirty
-        // tracking). Failures surface once in the status line.
+        // Autosave: silent snapshot every 120 s. Encoding an 8K document
+        // deflates every tile (~600 ms), which used to freeze the frame it
+        // landed on, so the encode runs on a worker thread over a cheap
+        // copy-on-write clone and only the write happens here. Failures
+        // surface once in the status line.
         {
             let now = ui.ctx().input(|i| i.time);
-            if now - self.last_autosave >= 120.0 {
-                self.last_autosave = now;
-                if let Err(e) = self.doc.save_project(&self.recovery_path) {
-                    self.status = format!("Autosave failed: {e}");
+            if let Some(job) = self.autosave_job.take() {
+                match job.try_recv() {
+                    Ok(Ok(bytes)) => {
+                        if let Err(e) = std::fs::write(&self.recovery_path, bytes) {
+                            self.status = format!("Autosave failed: {e}");
+                        }
+                    }
+                    Ok(Err(e)) => self.status = format!("Autosave failed: {e}"),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        self.autosave_job = Some(job);
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
                 }
             }
+            if now - self.last_autosave >= AUTOSAVE_SECS && self.autosave_job.is_none() {
+                self.last_autosave = now;
+                let doc = self.doc.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(doc.save_project_bytes());
+                });
+                self.autosave_job = Some(rx);
+            }
+            // eframe paints on demand, so an idle window would never reach
+            // the tick above: wake once when the next snapshot is due.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(
+                    (self.last_autosave + AUTOSAVE_SECS - now).max(1.0),
+                ));
         }
         // Keep frames coming while painting, selecting, lassoing, moving,
         // liquifying, shaping, or marching ants.
@@ -11207,8 +11440,19 @@ impl eframe::App for ProCraftApp {
                 // page keeps the viewport origin so panning still works.
                 let rect = rect.translate(center_offset(rect.size(), avail));
                 // Pan applies to the drawn canvas and every overlay/mapping
-                // below (sizes are translation-invariant).
+                // below (sizes are translation-invariant). At a whole-pixel
+                // zoom the origin lands on a physical pixel: a fractional
+                // one makes the GPU resample every edge on the page.
                 let rect = rect.translate(self.view_offset);
+                let rect = egui::Rect::from_min_size(
+                    snap_canvas_origin(
+                        rect.min,
+                        z,
+                        ui.ctx().pixels_per_point(),
+                        self.view_angle,
+                    ),
+                    rect.size(),
+                );
                 // Rotation about the view center: canvas (x, y) maps through
                 // the unrotated rect, then spins into place.
                 let ang = self.view_angle;
@@ -12837,6 +13081,7 @@ impl eframe::App for ProCraftApp {
                     self.smooth_pt = None;
                     self.stroke_curve.reset();
                     self.stroke_record.reset();
+                    self.pending_pts.clear();
                     self.smooth_pressure = 1.0;
                     self.last_t = ctx.input(|i| i.time);
                     // Drawing Assist: remember the stroke start; the lock
@@ -12888,6 +13133,7 @@ impl eframe::App for ProCraftApp {
                             self.leftover = leftover;
                             self.last_dyn = to_dyn;
                             self.stroke_painted = true;
+                            self.doc.end_stroke();
                         }
                         if self.stroke_painted {
                             self.stroke_painted = false;
@@ -12901,29 +13147,51 @@ impl eframe::App for ProCraftApp {
                         self.assist_lock = None;
                     }
                 }
-                if self.painting && resp.dragged() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        // Stamp through every pointer position the backend
-                        // recorded this frame (device rate), not just the
-                        // frame-end hover point: fast strokes stop turning
-                        // into straight chords between frames. Frames with
-                        // no extra events keep the exact old behavior.
-                        let mut pts: Vec<egui::Pos2> = ctx.input(|i| {
-                            i.events
-                                .iter()
-                                .filter_map(|e| match e {
-                                    egui::Event::PointerMoved(p) => Some(*p),
-                                    _ => None,
-                                })
-                                .collect()
-                        });
-                        if pts.last() != Some(&pos) {
-                            pts.push(pos);
+                // A flick hands us a canvas-length of travel in one frame.
+                // Stamping it whole stalls the frame, and the next frame
+                // then arrives later with even more samples queued, so the
+                // batch is capped at `STAMP_BUDGET` and the tail carries
+                // over. The release frame has no drag event and stamps the
+                // rest before the tail flush, so a lift never loses ink.
+                let backlog = !self.pending_pts.is_empty();
+                if self.painting && (resp.dragged() || backlog) {
+                    let mut pts = std::mem::take(&mut self.pending_pts);
+                    let mut fresh = 0;
+                    let mut live = false;
+                    if resp.dragged() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            live = true;
+                            // Stamp through every pointer position the
+                            // backend recorded this frame (device rate), not
+                            // just the frame-end hover point: fast strokes
+                            // stop turning into straight chords between
+                            // frames.
+                            let moved: Vec<egui::Pos2> = ctx.input(|i| {
+                                i.events
+                                    .iter()
+                                    .filter_map(|e| match e {
+                                        egui::Event::PointerMoved(p) => Some(*p),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            });
+                            fresh = moved.len();
+                            pts.extend(moved);
+                            if pts.last() != Some(&pos) {
+                                pts.push(pos);
+                                fresh += 1;
+                            }
                         }
+                    }
+                    if !pts.is_empty() {
                         let now = ctx.input(|i| i.time);
                         let frame_dt = (now - self.last_t).max(1.0 / 240.0) as f32;
                         self.last_t = now;
-                        let dt = frame_dt / pts.len() as f32;
+                        // A carried-over sample was paced by an earlier
+                        // frame; keeping "fresh" out of the divisor leaves
+                        // the live dt device-rate instead of pretending the
+                        // backlog arrived this frame.
+                        let dt = frame_dt / fresh.max(1) as f32;
                         let brush = self.base_brush();
                         // Pressure: Pencil/touch force when the backend
                         // forwards it, else full pressure (mice have no
@@ -12934,16 +13202,26 @@ impl eframe::App for ProCraftApp {
                         // across the trail points so per-frame convergence
                         // (and with it the feel) matches the single-step form.
                         let a = brush.stabilizer.clamp(0.0, 1.0) * 0.85;
-                        let a = stabilizer_substep(a, pts.len());
-                        for pt in pts {
+                        let a = stabilizer_substep(a, fresh.max(1));
+                        let started = std::time::Instant::now();
+                        let mut next = 0;
+                        while next < pts.len() {
+                            let pt = pts[next];
+                            next += 1;
                             let (x, y) = to_canvas(pt);
                             // Clamp: off-page drags paint nothing instead of
                             // streaking the canvas edge (and poisoning the
                             // dirty rect, which used to quit the app).
                             let (x, y) = clamp_pt(x, y);
                             let target = (x, y);
-                            let ((sx, sy), speed_norm) =
-                                sample_pointer(self.smooth_pt, self.last_target, target, a, dt);
+                            let ((sx, sy), speed_norm) = sample_pointer(
+                                self.smooth_pt,
+                                self.last_target,
+                                target,
+                                a,
+                                dt,
+                                self.zoom,
+                            );
                             self.smooth_pt = Some((sx, sy));
                             self.last_target = Some(target);
                             // Drawing Assist: ride an engaged ray/axis lock,
@@ -12991,12 +13269,26 @@ impl eframe::App for ProCraftApp {
                             } else {
                                 DabDynamics::default()
                             };
-                            let to_dyn = DabDynamics {
+                            let base_dyn = DabDynamics {
                                 pressure: self.smooth_pressure,
                                 speed_norm,
                                 angle,
                                 taper: 1.0,
                             };
+                            // Live taper: only the start ramp is known while
+                            // the pen is down. The end ramp needs the final
+                            // length, so it is applied once on release — the
+                            // live dab must not use it, or the stroke paints
+                            // thin and is repainted full-width at lift.
+                            let base_len = self.stroke_record.total_len;
+                            let taper_of = |from: Option<(f32, f32)>, to: (f32, f32)| {
+                                let leg = from.map_or(0.0, |(fx, fy)| {
+                                    ((to.0 - fx).powi(2) + (to.1 - fy).powi(2)).sqrt()
+                                });
+                                live_taper_at(&brush, base_len, leg)
+                            };
+                            let mut last_taper = from_dyn.taper;
+                            let mut stamped_dyn = base_dyn;
                             let color = self.current_color();
                             // Ink the smoothed path (see StrokeCurve): the
                             // stroke's first point lands a dab, every later
@@ -13005,6 +13297,12 @@ impl eframe::App for ProCraftApp {
                             match self.stroke_curve.push((sx, sy)) {
                                 None => {
                                     let from = self.last;
+                                    let mut from_dyn = from_dyn;
+                                    from_dyn.taper = last_taper;
+                                    let to_dyn = DabDynamics {
+                                        taper: taper_of(from, (sx, sy)),
+                                        ..base_dyn
+                                    };
                                     let (last, leftover) = self.doc.stroke_to_dyn(
                                         &brush,
                                         color,
@@ -13017,6 +13315,7 @@ impl eframe::App for ProCraftApp {
                                     self.stroke_record.push(from, from_dyn, (sx, sy), to_dyn);
                                     self.last = last;
                                     self.leftover = leftover;
+                                    stamped_dyn = to_dyn;
                                 }
                                 Some((p0, ctrl, p1)) => {
                                     let piece =
@@ -13026,6 +13325,12 @@ impl eframe::App for ProCraftApp {
                                         let t = k as f32 / steps as f32;
                                         let (px, py) = stroke_quad_pt(p0, ctrl, p1, t);
                                         let from = self.last;
+                                        let mut from_dyn = from_dyn;
+                                        from_dyn.taper = last_taper;
+                                        let to_dyn = DabDynamics {
+                                            taper: taper_of(from, (px, py)),
+                                            ..base_dyn
+                                        };
                                         let (last, leftover) = self.doc.stroke_to_dyn(
                                             &brush,
                                             color,
@@ -13038,11 +13343,20 @@ impl eframe::App for ProCraftApp {
                                         self.stroke_record.push(from, from_dyn, (px, py), to_dyn);
                                         self.last = last;
                                         self.leftover = leftover;
+                                        last_taper = to_dyn.taper;
+                                        stamped_dyn = to_dyn;
                                     }
                                 }
                             }
-                            self.last_dyn = to_dyn;
+                            self.last_dyn = stamped_dyn;
                             self.stroke_painted = true;
+                            // Out of budget while the pen is still down:
+                            // hand the rest to the next frame. A release
+                            // (no live drag) always finishes the batch.
+                            if live && started.elapsed() >= STAMP_BUDGET && next < pts.len() {
+                                self.pending_pts.extend_from_slice(&pts[next..]);
+                                break;
+                            }
                         }
                     }
                 }
@@ -13062,14 +13376,34 @@ impl eframe::App for ProCraftApp {
                         ) {
                             self.stroke_painted = true;
                         }
+                        // The replay rewinds only the stroke bbox, so grab
+                        // it before closing the stroke scope.
+                        let rect = self.doc.stroke_rect().map(|(x0, y0, x1, y1)| {
+                            (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2)
+                        });
+                        // Close the live stroke before the tapered replay:
+                        // the replay re-renders from the checkpoint and
+                        // opens its own coverage peak.
+                        self.doc.end_stroke();
                         if self.stroke_painted {
-                            taper_replay(&mut self.doc, &brush, color, &self.stroke_record);
+                            self.taper_job =
+                                taper_begin(&mut self.doc, &brush, color, &self.stroke_record, rect);
                         }
-                        self.stroke_record.reset();
+                        // A replay owns the record until it finishes (a long
+                        // 8K stroke would otherwise freeze the lift frame).
+                        if self.taper_job.is_none() {
+                            self.stroke_record.reset();
+                        }
                     }
                     if self.stroke_painted {
                         self.stroke_painted = false;
-                        self.capture_timelapse();
+                        // The timelapse frame should show the tapered
+                        // result, so a pending replay captures on finish.
+                        if self.taper_job.is_none() {
+                            self.capture_timelapse();
+                        } else {
+                            self.taper_capture = true;
+                        }
                     }
                     self.painting = false;
                     self.last = None;
@@ -13157,6 +13491,26 @@ fn android_main(app: android_activity::AndroidApp) {
 mod tests {
     use super::*;
     use procraft_engine::Taper;
+
+    /// Drive a taper replay to completion the way the frame loop does.
+    fn taper_replay_all(
+        doc: &mut Document,
+        brush: &Brush,
+        color: Color,
+        stroke: &RecordedStroke,
+        rect: Option<(u32, u32, u32, u32)>,
+    ) -> bool {
+        let Some(mut job) = taper_begin(doc, brush, color, stroke, rect) else {
+            return false;
+        };
+        loop {
+            match taper_step(doc, &mut job, stroke) {
+                TaperStep::More => {}
+                TaperStep::Done => return true,
+                TaperStep::Cancelled => return false,
+            }
+        }
+    }
 
     #[test]
     fn brush_and_tip_filters_cover_every_importable_type() {
@@ -13399,7 +13753,8 @@ mod tests {
         let dt = 1.0 / 120.0;
         let a = 0.2975;
         let target = (1000.0 * dt, 0.0);
-        let (smooth, speed) = sample_pointer(Some((0.0, 0.0)), Some((0.0, 0.0)), target, a, dt);
+        let (smooth, speed) =
+            sample_pointer(Some((0.0, 0.0)), Some((0.0, 0.0)), target, a, dt, 1.0);
         assert!(
             smooth.0 < target.0 * 0.8,
             "stabilizer should lag the pointer"
@@ -13408,6 +13763,32 @@ mod tests {
             (speed - 0.5).abs() < 0.01,
             "raw 1000 px/s should map to half speed, got {speed}"
         );
+    }
+
+    #[test]
+    fn speed_is_measured_on_screen_at_any_zoom() {
+        // The same hand speed must give the same velocity dynamics whether
+        // the canvas is shown 1:1 or 4x: canvas pixels per second scale
+        // with zoom, screen pixels do not.
+        let dt = 1.0 / 120.0;
+        let (_, at_one) = sample_pointer(
+            Some((0.0, 0.0)),
+            Some((0.0, 0.0)),
+            (1000.0 * dt, 0.0),
+            0.0,
+            dt,
+            1.0,
+        );
+        let (_, at_four) = sample_pointer(
+            Some((0.0, 0.0)),
+            Some((0.0, 0.0)),
+            (250.0 * dt, 0.0),
+            0.0,
+            dt,
+            4.0,
+        );
+        assert!((at_one - 0.5).abs() < 0.01, "1:1 speed {at_one}");
+        assert!((at_one - at_four).abs() < 1e-4, "zoom changed the speed");
     }
 
     #[test]
@@ -13823,6 +14204,26 @@ mod tests {
                 "zoom {zoom} gives {screen}pt dot spacing"
             );
         }
+    }
+
+    #[test]
+    fn canvas_origin_snaps_only_at_whole_device_pixel_zoom() {
+        // 100 % on a 1x display: whole points.
+        assert_eq!(
+            snap_canvas_origin(egui::pos2(279.4, 100.6), 1.0, 1.0, 0.0),
+            egui::pos2(279.0, 101.0)
+        );
+        // 200 % on a 1.5x display: 3 device px per canvas pixel, so the
+        // origin still lands on a physical pixel (2/3 pt steps).
+        assert_eq!(
+            snap_canvas_origin(egui::pos2(100.1, 40.2), 2.0, 1.5, 0.0),
+            egui::pos2(100.0, 40.0)
+        );
+        // Fractional zoom: no grid to land on, leave the pan untouched.
+        let free = egui::pos2(10.3, 10.3);
+        assert_eq!(snap_canvas_origin(free, 2.58, 1.0, 0.0), free);
+        // Rotated views are mapped by angle, so snapping would misalign.
+        assert_eq!(snap_canvas_origin(free, 1.0, 1.0, 0.4), free);
     }
 
     #[test]
@@ -15014,11 +15415,182 @@ mod tests {
             last = l;
             leftover = lo;
         }
-        assert!(taper_replay(&mut doc, &brush, color, &record));
+        let rect = doc
+            .stroke_rect()
+            .map(|(x0, y0, x1, y1)| (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2));
+        assert!(taper_replay_all(&mut doc, &brush, color, &record, rect));
         let alpha = |x: u32| doc.layers[0].pixels.get(((6 * doc.w + x) * 4 + 3) as usize);
         assert!(alpha(6) > 200, "head alpha {}", alpha(6));
         assert!(alpha(46) < 40, "tail alpha {}", alpha(46));
         assert!(alpha(20) < alpha(6));
+    }
+
+    #[test]
+    fn taper_replay_sliced_one_segment_per_frame_matches_one_pass() {
+        let mut doc = Document::new(96, 20);
+        let brush = Brush {
+            size: 8.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                start: 0.2,
+                end: 0.4,
+                opacity: 0.8,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(20, 120, 240);
+        let dyn_ = DabDynamics::default();
+        doc.checkpoint();
+        let mut record = RecordedStroke::default();
+        let mut last = None;
+        let mut leftover = 0.0;
+        for x in [8.0, 18.0, 28.0, 38.0, 48.0, 58.0, 68.0, 78.0, 88.0] {
+            let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 10.0), dyn_, leftover);
+            record.push(last, dyn_, (x, 10.0), dyn_);
+            last = l;
+            leftover = lo;
+        }
+        let rect = doc
+            .stroke_rect()
+            .map(|(x0, y0, x1, y1)| (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2));
+        let mut whole = doc.clone();
+        assert!(taper_replay_all(&mut whole, &brush, color, &record, rect));
+        // The same replay with a zero budget stamps one segment per call,
+        // the way the frame loop slices it.
+        let mut sliced = doc.clone();
+        let mut job = taper_begin(&mut sliced, &brush, color, &record, rect).unwrap();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            match taper_step_with(std::time::Duration::ZERO, &mut sliced, &mut job, &record) {
+                TaperStep::More => {}
+                TaperStep::Done => break,
+                TaperStep::Cancelled => panic!("replay cancelled without an edit"),
+            }
+        }
+        assert!(calls > 1, "zero budget stamped the whole replay in one call");
+        assert_eq!(whole.layers[0].pixels, sliced.layers[0].pixels);
+    }
+
+    #[test]
+    fn taper_replay_stops_when_the_document_moves_on() {
+        let mut doc = Document::new(48, 12);
+        let brush = Brush {
+            size: 6.0,
+            taper: Taper {
+                end: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(1, 2, 3);
+        let dyn_ = DabDynamics::default();
+        doc.checkpoint();
+        let mut record = RecordedStroke::default();
+        let mut last = None;
+        let mut leftover = 0.0;
+        for x in [6.0, 14.0, 22.0, 30.0] {
+            let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
+            record.push(last, dyn_, (x, 6.0), dyn_);
+            last = l;
+            leftover = lo;
+        }
+        let rect = doc
+            .stroke_rect()
+            .map(|(x0, y0, x1, y1)| (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2));
+        let mut job = taper_begin(&mut doc, &brush, color, &record, rect).unwrap();
+        // Something else paints between frames (a new stroke, a restore):
+        // the replay must refuse to stamp over it.
+        doc.dab(&brush, color, 4.0, 4.0);
+        let before = doc.layers[0].pixels.clone();
+        assert!(matches!(
+            taper_step_with(std::time::Duration::ZERO, &mut doc, &mut job, &record),
+            TaperStep::Cancelled
+        ));
+        assert_eq!(doc.layers[0].pixels, before);
+    }
+
+    #[test]
+    fn live_stroke_equals_the_release_replay_outside_the_tail() {
+        // A pen lays ink only while it touches the paper: whatever the
+        // release replay paints, the live stroke must already show.
+        let mut doc = Document::new(72, 16);
+        let brush = Brush {
+            size: 6.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.25,
+            taper: Taper {
+                start: 0.25,
+                end: 0.35,
+                size: 0.7,
+                shape: 1.0,
+                ..Taper::NONE
+            },
+            ..Default::default()
+        };
+        let color = Color::rgb(30, 30, 30);
+        doc.checkpoint();
+        let mut record = RecordedStroke::default();
+        let mut last: Option<(f32, f32)> = None;
+        let mut leftover = 0.0;
+        let mut travelled = 0.0;
+        let mut last_taper = 1.0;
+        for x in [8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0] {
+            let to = (x, 8.0);
+            let leg = last.map_or(0.0, |(fx, fy)| {
+                ((to.0 - fx).powi(2) + (to.1 - fy).powi(2)).sqrt()
+            });
+            let from_dyn = DabDynamics {
+                taper: last_taper,
+                ..Default::default()
+            };
+            let to_dyn = DabDynamics {
+                taper: live_taper_at(&brush, travelled, leg),
+                ..Default::default()
+            };
+            let (l, lo) = doc.stroke_to_dyn(&brush, color, last, from_dyn, to, to_dyn, leftover);
+            record.push(last, from_dyn, to, to_dyn);
+            last = l;
+            leftover = lo;
+            travelled += leg;
+            last_taper = to_dyn.taper;
+        }
+        let live = doc.layers[0].pixels.clone();
+        let (dw, dh) = (doc.w, doc.h);
+        let alpha = |px: &Raster, x: u32, y: u32| px.get(((y * dw + x) * 4 + 3) as usize);
+        let width = |px: &Raster, x: u32| (0..dh).filter(|&y| alpha(px, x, y) > 0).count();
+        assert!(
+            width(&live, 32) >= 5,
+            "live stroke is {0} px wide at mid, not the 6 px brush",
+            width(&live, 32)
+        );
+        let rect = doc
+            .stroke_rect()
+            .map(|(x0, y0, x1, y1)| (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2));
+        assert!(taper_replay_all(&mut doc, &brush, color, &record, rect));
+        let replayed = doc.layers[0].pixels.clone();
+        // Past the start ramp and before the end ramp the two agree byte
+        // for byte: lifting adds nothing there.
+        for x in 20..=44 {
+            for y in 0..dh {
+                assert_eq!(
+                    alpha(&live, x, y),
+                    alpha(&replayed, x, y),
+                    "lift changed pixel ({x}, {y})"
+                );
+            }
+        }
+        // The tail is the one thing the lift may change: it narrows.
+        assert!(
+            width(&replayed, 63) < width(&live, 63),
+            "end taper did not narrow the tail: live {} replay {}",
+            width(&live, 63),
+            width(&replayed, 63)
+        );
     }
 
     #[test]
@@ -15040,8 +15612,9 @@ mod tests {
             ..Default::default()
         };
         let color = Color::rgb(20, 20, 20);
-        let points = brush_preview_path();
+        let points = brush_preview_path(doc.w as f32, doc.h as f32);
         let progress = preview_path_progress(&points);
+        let total = progress.last().copied().unwrap_or(0.0);
         doc.checkpoint();
         let mut record = RecordedStroke::default();
         let mut last = None;
@@ -15054,15 +15627,20 @@ mod tests {
                 let next = points[1];
                 (next.1 - to.1).atan2(next.0 - to.0)
             };
-            let from_u = if idx == 0 { 0.0 } else { progress[idx - 1] };
+            let from_dist = progress[idx.saturating_sub(1)];
             let from_dyn = DabDynamics {
                 angle,
-                taper: brush.taper.factor_at(from_u),
+                taper: brush
+                    .taper
+                    .distance_factor(from_dist, total - from_dist, brush.size),
                 ..Default::default()
             };
+            let to_dist = progress[idx];
             let to_dyn = DabDynamics {
                 angle,
-                taper: brush.taper.factor_at(progress[idx]),
+                taper: brush
+                    .taper
+                    .distance_factor(to_dist, total - to_dist, brush.size),
                 ..Default::default()
             };
             let (l, lo) = doc.stroke_to_dyn(&brush, color, last, from_dyn, to, to_dyn, leftover);
@@ -15070,7 +15648,10 @@ mod tests {
             last = l;
             leftover = lo;
         }
-        assert!(taper_replay(&mut doc, &brush, color, &record));
+        let rect = doc
+            .stroke_rect()
+            .map(|(x0, y0, x1, y1)| (x0.saturating_sub(2), y0.saturating_sub(2), x1 + 2, y1 + 2));
+        assert!(taper_replay_all(&mut doc, &brush, color, &record, rect));
         let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize);
         assert!(alpha(8, 18) > 0, "start tip alpha {}", alpha(8, 18));
         assert!(alpha(136, 18) > 0, "end tip alpha {}", alpha(136, 18));
@@ -15101,6 +15682,43 @@ mod tests {
         assert!(alpha(72) > 100, "mid alpha {}", alpha(72));
         assert!(alpha(8) < alpha(72), "head alpha {}", alpha(8));
         assert!(alpha(136) < alpha(72), "tail alpha {}", alpha(136));
+    }
+
+    #[test]
+    fn preset_previews_fit_the_strip_at_display_scale() {
+        // A preset paints at its own size (Airbrush is 64 px); on the strip
+        // that cropped into a band that showed no edge at all. Every preview
+        // must fit, and the texture is built at display scale so the panel
+        // copies it 1:1.
+        assert_eq!(preview_size(1.0), (96, 24));
+        assert_eq!(preview_size(1.5), (144, 36));
+        assert_eq!(preview_size(0.0), (96, 24));
+        for scale in [1.0f32, 1.5, 2.0] {
+            let (w, h) = preview_size(scale);
+            for (name, preset) in procraft_engine::presets() {
+                let brush = preview_brush(&preset, h as f32);
+                assert!(
+                    brush.size <= h as f32 * PREVIEW_SIZE_FRAC + 0.01,
+                    "{name} preview size {} overflows the {h} px strip",
+                    brush.size
+                );
+                let mut doc = Document::new(w, h);
+                paint_preview_stroke(&mut doc, &brush, Color::rgb(30, 30, 30));
+                let alpha = |x: u32, y: u32| {
+                    doc.layers[0]
+                        .pixels
+                        .get(((y * w + x) * 4 + 3) as usize)
+                };
+                assert!(
+                    (0..h).any(|y| (0..w).any(|x| alpha(x, y) > 0)),
+                    "{name} preview is blank"
+                );
+                for x in 0..w {
+                    assert_eq!(alpha(x, 0), 0, "{name} preview clipped at the top");
+                    assert_eq!(alpha(x, h - 1), 0, "{name} preview clipped at the bottom");
+                }
+            }
+        }
     }
 
     #[test]
@@ -15551,7 +16169,10 @@ mod tests {
         // Plain click replaces the selection.
         assert_eq!(next_layer_selection(&[1, 2], 2, 5, false, false), vec![5]);
         // Toggle adds and removes, keeping the order stable.
-        assert_eq!(next_layer_selection(&[1, 2], 2, 5, true, false), vec![1, 2, 5]);
+        assert_eq!(
+            next_layer_selection(&[1, 2], 2, 5, true, false),
+            vec![1, 2, 5]
+        );
         assert_eq!(
             next_layer_selection(&[1, 2, 5], 5, 2, true, false),
             vec![1, 5]

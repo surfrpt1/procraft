@@ -14,8 +14,11 @@ use crate::raster::{Raster, TILE};
 /// patched afterwards: that keeps the write a single streaming pass over
 /// every tile (the deflate already touches the bytes) instead of buffering
 /// a whole layer's compressed payloads in memory.
-fn write_tile_table(f: &mut std::fs::File, raster: &Raster) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
+fn write_tile_table<W: std::io::Write + std::io::Seek>(
+    f: &mut W,
+    raster: &Raster,
+) -> Result<(), String> {
+    use std::io::{SeekFrom, Write};
     let count_at = f.stream_position().map_err(|e| e.to_string())?;
     f.write_all(&0u32.to_le_bytes())
         .map_err(|e| e.to_string())?;
@@ -515,6 +518,14 @@ pub struct Document {
     /// mutations made behind their back (e.g. a transform session holding
     /// a pre-transform pixel base). Session-only, never saved.
     rev: u64,
+    /// Per-stroke peak coverage (0..=255 per canvas pixel) for the active
+    /// stroke: a pixel keeps the strongest single dab instead of summing
+    /// every dab that crosses it, so one stroke stops at the brush opacity
+    /// and keeps its soft rim. Session-only, never saved.
+    pub(crate) stroke_peak: Option<Raster>,
+    /// Canvas bbox touched by the active stroke (inclusive), for cheap
+    /// stroke-local restores. Session-only.
+    pub(crate) stroke_rect: Option<(u32, u32, u32, u32)>,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -586,6 +597,8 @@ impl Document {
             next_group_id: 1,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
         }
     }
 
@@ -614,6 +627,8 @@ impl Document {
             next_group_id: 1,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -1084,6 +1099,78 @@ impl Document {
         }
         self.active = index.min(self.layers.len().saturating_sub(1));
         self.mark_full_dirty();
+        true
+    }
+
+    /// Rewind only `rect` (inclusive canvas pixels) of the active layer to
+    /// the newest checkpoint, leaving the rest of the layer alone: the
+    /// tapered stroke replay pays for the stroke bbox instead of a full
+    /// layer copy (256 MiB at 8K). The checkpoint stays on the undo stack.
+    pub fn restore_checkpoint_region(&mut self, rect: (u32, u32, u32, u32)) -> bool {
+        let Some(entry) = self.undo.last() else {
+            return false;
+        };
+        let index = entry.layer;
+        let (x0, y0) = (
+            rect.0.min(self.w.saturating_sub(1)),
+            rect.1.min(self.h.saturating_sub(1)),
+        );
+        let (x1, y1) = (
+            rect.2.min(self.w.saturating_sub(1)),
+            rect.3.min(self.h.saturating_sub(1)),
+        );
+        if x0 > x1 || y0 > y1 {
+            return false;
+        }
+        let (w, h) = (self.w as i32, self.h as i32);
+        {
+            let Some(layer) = self.layers.get_mut(index) else {
+                return false;
+            };
+            let (lox, loy) = (entry.ox, entry.oy);
+            layer.ox = entry.ox;
+            layer.oy = entry.oy;
+            // One run per row: the rewind copies whole spans into the tiles
+            // instead of a get/set per byte (a full-8K stroke bbox would
+            // otherwise be hundreds of millions of calls).
+            for py in y0..=y1 {
+                let ly = py as i32 - loy;
+                if !(0..h).contains(&ly) {
+                    continue;
+                }
+                let start = (x0 as i32 - lox).max(0);
+                let end = (x1 as i32 - lox).min(w - 1);
+                if start > end {
+                    continue;
+                }
+                let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
+                layer
+                    .pixels
+                    .copy_run(&entry.pixels, start, ly, start, ly, run);
+            }
+            // A mask the stroke created has no checkpoint copy: it started
+            // fully revealed (255).
+            if let Some(layer_mask) = layer.mask.as_mut() {
+                for py in y0..=y1 {
+                    let ly = py as i32 - loy;
+                    if !(0..h).contains(&ly) {
+                        continue;
+                    }
+                    let start = (x0 as i32 - lox).max(0);
+                    let end = (x1 as i32 - lox).min(w - 1);
+                    if start > end {
+                        continue;
+                    }
+                    let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
+                    match entry.mask.as_ref() {
+                        Some(m) => layer_mask.copy_run(m, start, ly, start, ly, run),
+                        None => layer_mask.fill_run(ly, start, run, 255),
+                    }
+                }
+            }
+        }
+        self.active = index.min(self.layers.len().saturating_sub(1));
+        self.mark_dirty(x0, y0, x1, y1);
         true
     }
 
@@ -3316,8 +3403,24 @@ impl Document {
     /// written), so sparse 8K documents stay small; older readers cleanly
     /// refuse v12 files at the magic. Versions 1-11 stay readable.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
-        use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        self.write_project(&mut f)
+    }
+
+    /// Encode the project into memory instead of a file. Deflating an 8K
+    /// document's tiles takes ~600 ms, so autosave runs this on a worker
+    /// thread (the `Document` clone it reads shares every tile through
+    /// `Arc`) and the UI thread writes the short result.
+    pub fn save_project_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        self.write_project(&mut out)?;
+        Ok(out.into_inner())
+    }
+
+    fn write_project(
+        &self,
+        f: &mut (impl std::io::Write + std::io::Seek),
+    ) -> Result<(), String> {
         f.write_all(b"PCRAFT12").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -3422,12 +3525,12 @@ impl Document {
             if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.bpp() != 4 {
                 return Err("layer has wrong pixel size".to_string());
             }
-            write_tile_table(&mut f, &layer.pixels)?;
+            write_tile_table(&mut *f, &layer.pixels)?;
             // Optional reveal mask, one byte per pixel, same tile table.
             match layer.mask.as_ref() {
                 Some(m) if m.w() == self.w && m.h() == self.h && m.bpp() == 1 => {
                     f.write_all(&[1u8]).map_err(|e| e.to_string())?;
-                    write_tile_table(&mut f, m)?;
+                    write_tile_table(&mut *f, m)?;
                 }
                 _ => {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
@@ -3967,6 +4070,8 @@ impl Document {
             next_group_id,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
         })
     }
 }
@@ -4077,6 +4182,67 @@ mod tests {
         // A dab fully outside the canvas paints nothing: no bump.
         doc.mark_dirty(5, 5, 1, 1);
         assert_eq!(doc.revision(), r0 + 2);
+    }
+
+    #[test]
+    fn region_restore_rewinds_only_the_rect() {
+        let mut doc = Document::new(8, 8);
+        let idx = |x: u32, y: u32| ((y * 8 + x) * 4) as usize;
+        doc.layers[0].pixels.set4(idx(1, 1), [10, 0, 0, 255]);
+        doc.layers[0].pixels.set4(idx(6, 6), [20, 0, 0, 255]);
+        doc.checkpoint();
+        doc.layers[0].pixels.set4(idx(1, 1), [99, 0, 0, 255]);
+        doc.layers[0].pixels.set4(idx(6, 6), [99, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 0, 3, 3)));
+        assert_eq!(doc.layers[0].pixels.get4(idx(1, 1)), [10, 0, 0, 255]);
+        // Outside the rect the live edit stands: the replay redraws it.
+        assert_eq!(doc.layers[0].pixels.get4(idx(6, 6)), [99, 0, 0, 255]);
+    }
+
+    #[test]
+    fn region_restore_copies_wide_bands_across_tiles() {
+        // 600 px wide crosses two 256-px tile borders.
+        let mut doc = Document::new(600, 4);
+        let idx = |x: u32, y: u32| ((y * 600 + x) * 4) as usize;
+        for x in 0..600 {
+            doc.layers[0].pixels.set4(idx(x, 1), [7, 0, 0, 255]);
+        }
+        doc.checkpoint();
+        for x in 0..600 {
+            doc.layers[0].pixels.set4(idx(x, 1), [99, 0, 0, 255]);
+        }
+        doc.layers[0].pixels.set4(idx(0, 0), [5, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 1, 599, 1)));
+        for x in 0..600 {
+            assert_eq!(doc.layers[0].pixels.get4(idx(x, 1)), [7, 0, 0, 255], "x={x}");
+        }
+        assert_eq!(doc.layers[0].pixels.get4(idx(0, 0)), [5, 0, 0, 255]);
+    }
+
+    #[test]
+    fn region_restore_refills_a_mask_the_stroke_created() {
+        let mut doc = Document::new(4, 2);
+        doc.checkpoint();
+        // Mask created after the checkpoint: it has no snapshot to copy back.
+        doc.layers[0].mask = Some(Raster::from_dense(4, 2, 1, &[10, 20, 30, 40, 50, 60, 70, 80]));
+        assert!(doc.restore_checkpoint_region((0, 0, 3, 1)));
+        assert_eq!(
+            doc.layers[0].mask.as_ref().unwrap().to_dense(),
+            vec![255; 8]
+        );
+    }
+
+    #[test]
+    fn region_restore_follows_the_checkpoint_offset() {
+        let mut doc = Document::new(8, 2);
+        // Layer shifted left by one: canvas x maps to local x + 1.
+        doc.layers[0].ox = -1;
+        let at = ((8 + 2) * 4) as usize;
+        doc.layers[0].pixels.set4(at, [3, 0, 0, 255]);
+        doc.checkpoint();
+        doc.layers[0].pixels.set4(at, [99, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 1, 7, 1)));
+        assert_eq!(doc.layers[0].pixels.get4(at), [3, 0, 0, 255]);
     }
 
     #[test]
@@ -4273,7 +4439,11 @@ mod tests {
         doc.add_layer("b".to_string());
         let outer = doc.new_group("outer".to_string());
         let inner = doc.new_group("inner".to_string());
-        doc.groups.iter_mut().find(|g| g.id == inner).unwrap().parent = Some(outer);
+        doc.groups
+            .iter_mut()
+            .find(|g| g.id == inner)
+            .unwrap()
+            .parent = Some(outer);
         doc.layers[0].group = Some(outer);
         doc.layers[1].group = Some(inner);
         doc.add_layer("above".to_string());
@@ -5668,6 +5838,27 @@ mod tests {
         assert_eq!(back.symmetry, SymmetryMode::Both);
         assert_eq!(back.symmetry_center, Some((1.5, 1.0)));
         assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
+    }
+
+    #[test]
+    fn project_bytes_open_like_the_saved_file_and_a_clone_is_a_snapshot() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(300, 260);
+        doc.layers[0].pixels = px_rgba(&doc, &[9; 4 * 300 * 260]);
+        let bytes = doc.save_project_bytes().unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-bytes.pcraft");
+        std::fs::write(&path, &bytes).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.w, 300);
+        assert_eq!(back.layers[0].pixels, vec![9; 4 * 300 * 260]);
+        // Autosave encodes a clone on a worker thread: painting on the live
+        // document must leave that snapshot's bytes untouched.
+        let snapshot = doc.clone();
+        doc.dab(&Brush::default(), Color::rgb(1, 2, 3), 10.0, 10.0);
+        assert_eq!(snapshot.save_project_bytes().unwrap(), bytes);
+        assert_ne!(doc.save_project_bytes().unwrap(), bytes);
     }
 
     #[test]

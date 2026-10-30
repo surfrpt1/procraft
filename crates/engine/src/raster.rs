@@ -188,6 +188,69 @@ impl Raster {
         }
     }
 
+    /// Copy `run` pixels of source row `sy` onto row `dy` of `self`,
+    /// starting at `sx`/`dx`. Both rasters share this geometry. The run is
+    /// split at tile borders, so a 8K-wide band costs one `memcpy` per
+    /// 256-px segment instead of a `get`/`set` per byte. A zero source
+    /// segment leaves an unallocated destination tile alone.
+    pub fn copy_run(&mut self, src: &Raster, sx: u32, sy: u32, dx: u32, dy: u32, run: u32) {
+        debug_assert_eq!((self.w, self.h, self.bpp), (src.w, src.h, src.bpp));
+        let bpp = self.bpp();
+        let mut done = 0;
+        while done < run {
+            let x = dx + done;
+            let tx = x / TILE;
+            let px = x % TILE;
+            let n = (TILE - px).min(run - done);
+            let sxx = sx + done;
+            let stx = sxx / TILE;
+            let spx = sxx % TILE;
+            let len = n as usize * bpp;
+            let dst_off = ((dy % TILE) * TILE + px) as usize * bpp;
+            let src_off = ((sy % TILE) * TILE + spx) as usize * bpp;
+            let slot = ((dy / TILE) * self.tiles_x + tx) as usize;
+            match src.tile(stx, sy / TILE) {
+                Some(st) => {
+                    let chunk = &st[src_off..src_off + len];
+                    if chunk.iter().any(|&b| b != 0) || self.tiles[slot].is_some() {
+                        let t = self.tile_mut(tx, dy / TILE);
+                        t[dst_off..dst_off + len].copy_from_slice(chunk);
+                    }
+                }
+                None => {
+                    if self.tiles[slot].is_some() {
+                        let t = self.tile_mut(tx, dy / TILE);
+                        t[dst_off..dst_off + len].fill(0);
+                    }
+                }
+            }
+            done += n;
+        }
+    }
+
+    /// Paint `run` pixels of row `y` from `x` with `v`. Same tile-splitting
+    /// as [`Raster::copy_run`]; a zero fill into an unallocated tile is a
+    /// no-op so blank rows stay free.
+    pub fn fill_run(&mut self, y: u32, x: u32, run: u32, v: u8) {
+        let bpp = self.bpp();
+        let mut done = 0;
+        while done < run {
+            let cx = x + done;
+            let tx = cx / TILE;
+            let px = cx % TILE;
+            let n = (TILE - px).min(run - done);
+            let ty = y / TILE;
+            let slot = (ty * self.tiles_x + tx) as usize;
+            if v != 0 || self.tiles[slot].is_some() {
+                let off = ((y % TILE) * TILE + px) as usize * bpp;
+                let len = n as usize * bpp;
+                let t = self.tile_mut(tx, ty);
+                t[off..off + len].fill(v);
+            }
+            done += n;
+        }
+    }
+
     pub fn to_dense(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.len()];
         let step = self.bpp();
@@ -499,6 +562,42 @@ mod tests {
         assert_eq!(m.tile_len(), 65536);
         assert_eq!(m.get((299 * 300 + 299) as usize), 255);
         assert_eq!(m.to_dense().len(), 300 * 300);
+    }
+
+    #[test]
+    fn copy_run_spans_tile_borders_and_skips_blank_sources() {
+        let (w, h) = (600u32, 2u32);
+        let at = |x: u32, y: u32| ((y * w + x) * 4) as usize;
+        let mut src = Raster::rgba(w, h);
+        for x in 0..w {
+            src.set4(at(x, 0), [x as u8, 1, 2, 3]);
+        }
+        let mut dst = Raster::rgba(w, h);
+        dst.copy_run(&src, 0, 0, 0, 1, w);
+        for x in 0..w {
+            assert_eq!(dst.get4(at(x, 1)), [x as u8, 1, 2, 3], "x={x}");
+        }
+        assert_eq!(dst.get4(at(0, 0)), [0; 4], "the source row itself is untouched");
+
+        // A blank source neither writes nor allocates.
+        let empty = Raster::rgba(w, h);
+        let mut fresh = Raster::rgba(w, h);
+        fresh.copy_run(&empty, 0, 0, 0, 1, w);
+        assert_eq!(fresh.alloc_bytes(), 0);
+    }
+
+    #[test]
+    fn fill_run_spans_tile_borders_and_skips_blank_tiles() {
+        let mut m = Raster::mask(600, 1);
+        m.fill_run(0, 10, 580, 255);
+        let dense = m.to_dense();
+        assert!(dense[..10].iter().all(|&v| v == 0));
+        assert!(dense[10..590].iter().all(|&v| v == 255));
+        assert!(dense[590..].iter().all(|&v| v == 0));
+        // Clearing blank tiles with zeros allocates nothing.
+        let mut blank = Raster::mask(600, 2);
+        blank.fill_run(1, 0, 600, 0);
+        assert_eq!(blank.alloc_bytes(), 0);
     }
 
     /// Per-pixel reference for the slide rule: `dst(x, y)` takes

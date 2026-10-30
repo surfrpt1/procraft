@@ -90,6 +90,25 @@ impl Document {
     /// One tile of the composite, `TILE * TILE * 4` bytes, row-major.
     /// Pixels outside the canvas are zero.
     pub fn composite_tile(&self, plan: &StackPlan, tx: u32, ty: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (TILE * TILE * 4) as usize];
+        self.composite_tile_into(plan, tx, ty, None, &mut out);
+        out
+    }
+
+    /// Recompose `rect` (canvas pixels, inclusive) of one tile into `out`,
+    /// a full-tile buffer. `None` covers the whole canvas part of the tile.
+    ///
+    /// Pixels outside `rect` are left untouched, so a cache can patch the
+    /// tile it already holds instead of paying for the whole 256² square —
+    /// a stroke event only changes a dab-wide band.
+    pub fn composite_tile_into(
+        &self,
+        plan: &StackPlan,
+        tx: u32,
+        ty: u32,
+        rect: Option<(u32, u32, u32, u32)>,
+        out: &mut [u8],
+    ) {
         // A stale plan would read layers by index after a reorder/removal.
         debug_assert_eq!(
             plan.rev,
@@ -101,28 +120,110 @@ impl Document {
             self.layers.len(),
             "stack plan is stale: layer count changed since the snapshot"
         );
-        let mut out = vec![0u8; (TILE * TILE * 4) as usize];
+        debug_assert_eq!(
+            out.len(),
+            (TILE * TILE * 4) as usize,
+            "tile buffer must hold one full tile"
+        );
         let x0 = tx.saturating_mul(TILE);
         let y0 = ty.saturating_mul(TILE);
         let cw = self.w.saturating_sub(x0).min(TILE);
         let ch = self.h.saturating_sub(y0).min(TILE);
         if cw == 0 || ch == 0 {
-            return out;
+            return;
         }
+        // Tile-local, clamped row/column range of `rect` (or the whole tile).
+        let (col0, col1, row0, row1) = match rect {
+            Some((rx0, ry0, rx1, ry1)) => {
+                if rx1 < x0 || ry1 < y0 || rx0 >= x0 + cw || ry0 >= y0 + ch {
+                    return;
+                }
+                (
+                    rx0.saturating_sub(x0),
+                    (rx1 - x0).min(cw - 1),
+                    ry0.saturating_sub(y0),
+                    (ry1 - y0).min(ch - 1),
+                )
+            }
+            None => (0, cw - 1, 0, ch - 1),
+        };
         let (br, bg, bb) = (
             self.background[0] as f32,
             self.background[1] as f32,
             self.background[2] as f32,
         );
-        for row in 0..ch {
+        // A tiled layer with no allocated tiles cannot contribute anywhere:
+        // skip it once instead of looking up an absent tile per pixel. Most
+        // layers of a large document are empty in most tiles, and those
+        // tiles are recomposited constantly (stroke dirt, viewport passes).
+        let live: Vec<&PlannedLayer> = plan
+            .layers
+            .iter()
+            .filter(|pl| !pl.tiled || self.layers[pl.index].pixels.alloc_bytes() > 0)
+            .collect();
+        let fill_row = |out: &mut [u8], row: u32| {
+            let start = (row * TILE + col0) as usize * 4;
+            let end = (row * TILE + col1 + 1) as usize * 4;
+            let px = [
+                self.background[0],
+                self.background[1],
+                self.background[2],
+                255,
+            ];
+            for slot in out[start..end].as_chunks_mut::<4>().0 {
+                slot.copy_from_slice(&px);
+            }
+        };
+        if live.is_empty() {
+            // The page alone: every pixel is the same opaque background.
+            for row in row0..=row1 {
+                fill_row(out, row);
+            }
+            return;
+        }
+        // Per-row activity: a layer whose covered tile row holds no pixels
+        // is skipped for the whole row. Reused across rows.
+        let mut active = vec![false; live.len()];
+        let w_u32 = self.w;
+        let h_u32 = self.h;
+        let (xc0, xc1) = (x0 + col0, x0 + col1 + 1);
+        for row in row0..=row1 {
             let y = y0 + row;
-            for col in 0..cw {
+            for (slot, pl) in active.iter_mut().zip(&live) {
+                let lx0 = xc0 as i32 - pl.ox;
+                let lx1 = xc1 as i32 - pl.ox;
+                let ly = y as i32 - pl.oy;
+                *slot = if lx0 >= w_u32 as i32 || lx1 <= 0 || ly < 0 || ly >= h_u32 as i32 {
+                    false
+                } else if pl.tiled {
+                    let layer = &self.layers[pl.index];
+                    let (c0, c1) = (
+                        (lx0.max(0) as u32) / TILE,
+                        ((lx1 - 1).max(0) as u32).min(w_u32 - 1) / TILE,
+                    );
+                    let ty = ly as u32 / TILE;
+                    (c0..=c1).any(|tx| {
+                        layer.pixels.tile(tx, ty).is_some()
+                            || layer.mask.as_ref().is_some_and(|m| m.tile(tx, ty).is_some())
+                    })
+                } else {
+                    true
+                };
+            }
+            if !active.iter().any(|&a| a) {
+                fill_row(out, row);
+                continue;
+            }
+            for col in col0..=col1 {
                 let x = x0 + col;
                 let (mut r, mut g, mut b) = (br, bg, bb);
                 // Opaque content composited so far (layers only, not the
                 // page): clipping masks intersect against it.
                 let mut below_a = 0.0f32;
-                for pl in &plan.layers {
+                for (i, pl) in live.iter().enumerate() {
+                    if !active[i] {
+                        continue;
+                    }
                     let lx = x as i32 - pl.ox;
                     let ly = y as i32 - pl.oy;
                     if lx < 0 || ly < 0 || lx >= self.w as i32 || ly >= self.h as i32 {
@@ -179,7 +280,6 @@ impl Document {
                 out[o + 3] = 255;
             }
         }
-        out
     }
 }
 
@@ -490,6 +590,69 @@ mod tests {
     fn tile_composite_matches_per_pixel_reference() {
         assert_tile_parity(&doc_with_everything());
         assert_tile_parity(&doc_with_groups());
+    }
+
+    /// A cached tile patched with only the edited rect must equal a full
+    /// recomposite, and must not touch bytes outside the rect.
+    #[test]
+    fn sub_rect_patch_matches_a_full_recomposite() {
+        let mut doc = doc_with_everything();
+        let w = doc.w;
+        let plan = doc.stack_plan();
+        let mut cached: Vec<Vec<u8>> = Vec::new();
+        for ty in 0..doc.tiles_y() {
+            for tx in 0..doc.tiles_x() {
+                cached.push(doc.composite_tile(&plan, tx, ty));
+            }
+        }
+        // A stroke-sized edit: opaque green band straddling the tile-0/1 seam.
+        let rect = (230, 90, 270, 120);
+        for y in rect.1..=rect.3 {
+            for x in rect.0..=rect.2 {
+                doc.layers[0]
+                    .pixels
+                    .set4(((y * w + x) * 4) as usize, [0, 255, 0, 255]);
+            }
+        }
+        let plan = doc.stack_plan();
+        let mut i = 0;
+        for ty in 0..doc.tiles_y() {
+            for tx in 0..doc.tiles_x() {
+                let before = cached[i].clone();
+                let mut tile = cached[i].clone();
+                doc.composite_tile_into(&plan, tx, ty, Some(rect), &mut tile);
+                let full = doc.composite_tile(&plan, tx, ty);
+                let (x0, y0) = (tx * TILE, ty * TILE);
+                for row in 0..TILE {
+                    for col in 0..TILE {
+                        let o = ((row * TILE + col) * 4) as usize;
+                        let (x, y) = (x0 + col, y0 + row);
+                        let in_rect = x >= rect.0 && x <= rect.2 && y >= rect.1 && y <= rect.3;
+                        if in_rect && x < doc.w && y < doc.h {
+                            assert_eq!(&tile[o..o + 4], &full[o..o + 4], "patched {x},{y}");
+                        } else {
+                            assert_eq!(
+                                &tile[o..o + 4],
+                                &before[o..o + 4],
+                                "outside the rect at {x},{y} was rewritten"
+                            );
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// A rect that misses a tile leaves it byte-identical.
+    #[test]
+    fn patch_rect_outside_a_tile_is_a_no_op() {
+        let doc = doc_with_everything();
+        let plan = doc.stack_plan();
+        let mut tile = vec![0xABu8; (TILE * TILE * 4) as usize];
+        let before = tile.clone();
+        doc.composite_tile_into(&plan, 1, 0, Some((0, 0, 100, 100)), &mut tile);
+        assert_eq!(tile, before, "an untouched tile was rewritten");
     }
 
     #[test]
