@@ -794,19 +794,50 @@ impl Document {
         self.push_group(name, None)
     }
 
-    /// Create a group around one layer and move it in, preserving the
-    /// stacking order. The group nests inside the layer's current group
-    /// (like Photoshop's Group from Layers). Out-of-range indexes change
-    /// nothing and return `None`.
+    /// Create a group around one layer in place. Out-of-range indexes
+    /// change nothing and return `None`.
     pub fn group_layer(&mut self, index: usize, name: String) -> Option<u32> {
-        let parent = self.layers.get(index)?.group;
-        if let Some(id) = parent {
-            self.group(id)?;
+        self.group_layers(&[index], name)
+    }
+
+    /// Create a group around every listed layer, preserving the stacking
+    /// order (Photoshop's Group Layers). Out-of-range and duplicate
+    /// indexes are ignored; an empty or entirely invalid list returns
+    /// `None`. The group nests inside the selection's common group when
+    /// all of it already shares one, and lands at the top level when the
+    /// selection spans groups.
+    pub fn group_layers(&mut self, indexes: &[usize], name: String) -> Option<u32> {
+        let mut picked: Vec<usize> = indexes
+            .iter()
+            .copied()
+            .filter(|&i| i < self.layers.len())
+            .collect();
+        picked.sort_unstable();
+        picked.dedup();
+        if picked.is_empty() {
+            return None;
         }
+        let parent = self.shared_group(&picked);
         let id = self.push_group(name, parent);
-        self.layers[index].group = Some(id);
+        for &i in &picked {
+            self.layers[i].group = Some(id);
+        }
         self.mark_full_dirty();
         Some(id)
+    }
+
+    /// The group every listed layer already belongs to, if any. Invalid
+    /// indexes are ignored. `None` when the list is empty, spans groups,
+    /// sits at the top level, or names a group that no longer exists.
+    pub fn shared_group(&self, indexes: &[usize]) -> Option<u32> {
+        let mut valid = indexes.iter().copied().filter(|&i| i < self.layers.len());
+        let first = valid.next()?;
+        let parent = self.layers[first].group?;
+        if valid.all(|i| self.layers[i].group == Some(parent)) && self.group(parent).is_some() {
+            Some(parent)
+        } else {
+            None
+        }
     }
 
     fn push_group(&mut self, name: String, parent: Option<u32>) -> u32 {
@@ -4127,6 +4158,87 @@ mod tests {
     }
 
     #[test]
+    fn shared_group_requires_one_common_parent() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.new_group("g".to_string());
+        doc.layers[0].group = Some(g);
+        doc.layers[1].group = Some(g);
+        assert_eq!(doc.shared_group(&[0, 1]), Some(g));
+        // Mixed parentage and empty/unknown indexes have no common group.
+        assert_eq!(doc.shared_group(&[0, 2]), None);
+        assert_eq!(doc.shared_group(&[]), None);
+        assert_eq!(doc.shared_group(&[9]), None);
+        // A dangling group id is not a home.
+        doc.layers[0].group = Some(999);
+        assert_eq!(doc.shared_group(&[0]), None);
+    }
+
+    #[test]
+    fn group_layers_wraps_every_selected_layer() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("mid".to_string());
+        doc.add_layer("top".to_string());
+        let g = doc
+            .group_layers(&[0, 2], "Both".to_string())
+            .expect("two layers group");
+        assert_eq!(doc.groups.len(), 1);
+        assert!(doc.group(g).is_some_and(|gr| gr.parent.is_none()));
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert_eq!(doc.layers[1].group, None);
+        assert_eq!(doc.layers[2].group, Some(g));
+        // Non-contiguous members keep their stacking positions.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "mid", "top"]);
+    }
+
+    #[test]
+    fn group_layers_ignores_bad_and_duplicate_indexes() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        assert!(doc.group_layers(&[], "none".to_string()).is_none());
+        assert!(doc.group_layers(&[5, 9], "none".to_string()).is_none());
+        assert!(doc.groups.is_empty());
+        let g = doc
+            .group_layers(&[1, 1, 0], "both".to_string())
+            .expect("valid indexes group");
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert_eq!(doc.groups.len(), 1);
+    }
+
+    #[test]
+    fn group_layers_nests_only_when_the_selection_shares_a_group() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let outer = doc.new_group("outer".to_string());
+        doc.layers[0].group = Some(outer);
+        doc.layers[1].group = Some(outer);
+        let inner = doc
+            .group_layers(&[0, 1], "inner".to_string())
+            .expect("shared-parent selection groups");
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        assert_eq!(doc.layers[0].group, Some(inner));
+        assert_eq!(doc.layers[1].group, Some(inner));
+
+        // A selection spanning parents lands at the top level.
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.new_group("g".to_string());
+        doc.layers[0].group = Some(g);
+        let mixed = doc
+            .group_layers(&[0, 2], "mixed".to_string())
+            .expect("mixed selection groups");
+        assert_eq!(doc.group(mixed).unwrap().parent, None);
+        assert_eq!(doc.layers[0].group, Some(mixed));
+        assert_eq!(doc.layers[1].group, None);
+        assert_eq!(doc.layers[2].group, Some(mixed));
+    }
+
+    #[test]
     fn move_into_group_lands_adjacent() {
         let mut doc = Document::new(1, 1);
         doc.add_layer("b".to_string());
@@ -4566,6 +4678,34 @@ mod tests {
         assert_eq!(back.layers[0].mask.as_ref().unwrap().get(last), 0);
         assert_eq!(back.layers[0].group, Some(g));
         assert_eq!(back.group_opacity(0), 0.5);
+        assert_eq!(back.flatten(), doc.flatten());
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_empty_and_nested_groups() {
+        let mut doc = Document::new(16, 16);
+        let outer = doc.new_group("Outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc.group_layer(0, "Inner".to_string()).unwrap();
+        let empty = doc.new_group("Empty".to_string());
+        doc.set_group_collapsed(empty, true);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-nested-groups.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.groups.len(), 3);
+        let outer_back = back.group(outer).expect("outer group survives");
+        assert_eq!(outer_back.name, "Outer");
+        assert_eq!(outer_back.parent, None);
+        let inner_back = back.group(inner).expect("nested group survives");
+        assert_eq!(inner_back.name, "Inner");
+        assert_eq!(inner_back.parent, Some(outer));
+        assert_eq!(back.layers[0].group, Some(inner));
+        let empty_back = back.group(empty).expect("empty group survives");
+        assert_eq!(empty_back.name, "Empty");
+        assert_eq!(empty_back.parent, None);
+        assert!(empty_back.collapsed);
         assert_eq!(back.flatten(), doc.flatten());
     }
 

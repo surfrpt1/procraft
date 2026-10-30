@@ -669,6 +669,51 @@ struct GroupRowActions {
     rename: Option<(u32, String)>,
 }
 
+/// Inline member count for a group header (`(3)`). Empty groups show an
+/// "empty" marker instead, so they get no badge.
+fn group_member_badge(members: usize) -> Option<String> {
+    (members > 0).then(|| format!("({members})"))
+}
+
+/// Layers-panel selection after a row click. A plain click selects one
+/// row; `toggle` (Ctrl/Cmd-click or long-press) adds or removes the row;
+/// `extend` (Shift-click) takes the range from the active layer. The
+/// selection never goes empty, so there is always an active row to act on.
+fn next_layer_selection(
+    selection: &[usize],
+    active: usize,
+    target: usize,
+    toggle: bool,
+    extend: bool,
+) -> Vec<usize> {
+    if extend {
+        let (lo, hi) = (active.min(target), active.max(target));
+        return (lo..=hi).collect();
+    }
+    if toggle {
+        let mut next: Vec<usize> = selection.iter().copied().filter(|&i| i != target).collect();
+        if next.len() == selection.len() {
+            next.push(target);
+        }
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() {
+            next.push(target);
+        }
+        return next;
+    }
+    vec![target]
+}
+
+/// Status line after "New group": naming the parent explains why the new
+/// group landed indented inside an existing one.
+fn group_created_status(name: &str, parent: Option<&str>, targets: &str) -> String {
+    match parent {
+        Some(parent) => format!("{name} created inside {parent} with {targets}."),
+        None => format!("{name} created with {targets}."),
+    }
+}
+
 /// Layers-panel footer text: layer count, the active layer's name and the
 /// document's allocated tile memory (painted tiles plus masks). Fresh
 /// layers cost nothing until a tile is touched, so this starts at `0 B`
@@ -1148,6 +1193,13 @@ struct ProCraftApp {
     renaming: Option<usize>,
     renaming_text: String,
     group_renaming: Option<u32>,
+    /// Multi-selection for the Layers panel, as layer indexes. Always
+    /// contains the active layer, and resets when the layer count changes
+    /// (add, duplicate, merge, delete, undo) since indexes are not ids.
+    layer_selection: Vec<usize>,
+    /// `doc.layers.len()` seen on the last panel draw: detects the count
+    /// changes that invalidate `layer_selection`.
+    layer_count_marker: usize,
     group_name_edit: String,
     preset_textures: Vec<TextureHandle>,
     view_mask: bool,
@@ -1421,6 +1473,8 @@ impl ProCraftApp {
             renaming: None,
             renaming_text: String::new(),
             group_renaming: None,
+            layer_selection: Vec::new(),
+            layer_count_marker: 0,
             group_name_edit: String::new(),
             preset_textures: Vec::new(),
             view_mask: false,
@@ -3874,7 +3928,7 @@ impl ProCraftApp {
         else {
             return;
         };
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(depth as f32 * 12.0);
             if ui
                 .small_button(if collapsed { "+" } else { "−" })
@@ -3896,7 +3950,15 @@ impl ProCraftApp {
                 acts.eye = Some(id);
             }
             if self.group_renaming == Some(id) {
-                let resp = ui.text_edit_singleline(&mut self.group_name_edit);
+                // Fixed width, so the field cannot shove OK/X off a narrow
+                // drawer; the wrapped row moves the buttons to the next
+                // line if the field still does not fit.
+                let buttons_w = 2.0 * 44.0 + 2.0 * ui.spacing().item_spacing.x;
+                let field_w = (ui.available_width() - buttons_w).clamp(72.0, 260.0);
+                let resp = ui.add_sized(
+                    [field_w, 28.0],
+                    egui::TextEdit::singleline(&mut self.group_name_edit),
+                );
                 if !resp.has_focus() {
                     resp.request_focus();
                 }
@@ -3936,18 +3998,21 @@ impl ProCraftApp {
                     self.group_name_edit.clear();
                 }
             } else {
-                let hint = if members == 1 {
-                    "1 layer · tap to rename".to_string()
-                } else {
-                    format!("{members} layers · tap to rename")
-                };
-                if ui
+                // Double-tap renames, matching the layer rows.
+                let resp = ui
                     .selectable_label(false, &name)
-                    .on_hover_text(hint)
-                    .clicked()
-                {
+                    .on_hover_text("Double-tap to rename");
+                if resp.double_clicked() {
                     self.group_renaming = Some(id);
                     self.group_name_edit = name.clone();
+                }
+                if let Some(badge) = group_member_badge(members) {
+                    let hint = if members == 1 {
+                        "1 layer in this group".to_string()
+                    } else {
+                        format!("{members} layers in this group")
+                    };
+                    ui.weak(badge).on_hover_text(hint);
                 }
             }
             if members == 0 {
@@ -3983,6 +4048,18 @@ impl ProCraftApp {
 
     fn layers_panel_body(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // Indexes are the only layer identity, so a count change (add,
+            // duplicate, merge, delete, undo) invalidates the stored
+            // selection; fall back to the active layer.
+            let len = self.doc.layers.len();
+            if self.layer_count_marker != len {
+                self.layer_count_marker = len;
+                self.layer_selection = vec![self.doc.active];
+            }
+            self.layer_selection.retain(|&i| i < len);
+            if !self.layer_selection.contains(&self.doc.active) {
+                self.layer_selection = vec![self.doc.active];
+            }
             let t = self.tokens(ui);
             let mut close_layers = false;
             design::section_card_actions(
@@ -4003,20 +4080,31 @@ impl ProCraftApp {
                     } else {
                         ui.horizontal(|ui| self.layer_action_row(ui));
                     }
+                    let selected_count = self.layer_selection.len();
                     if ui
                         .button("New group")
-                        .on_hover_text("Group the active layer in a new group")
+                        .on_hover_text(if selected_count > 1 {
+                            "Group the selected layers in a new group"
+                        } else {
+                            "Group the active layer in a new group"
+                        })
                         .clicked()
                     {
+                        let selection = self.layer_selection.clone();
                         let name = self.next_group_name();
-                        let layer_name = self.doc.layers[self.doc.active].name.clone();
-                        if self
+                        let parent_name = self
                             .doc
-                            .group_layer(self.doc.active, name.clone())
-                            .is_some()
-                        {
+                            .shared_group(&selection)
+                            .and_then(|id| self.doc.group(id))
+                            .map(|g| g.name.clone());
+                        let targets = match selection.as_slice() {
+                            [only] => self.doc.layers[*only].name.clone(),
+                            many => format!("{} layers", many.len()),
+                        };
+                        if self.doc.group_layers(&selection, name.clone()).is_some() {
                             self.ghost_dirty = true;
-                            self.status = format!("{name} created with {layer_name}.");
+                            self.status =
+                                group_created_status(&name, parent_name.as_deref(), &targets);
                         }
                     }
                     let mut remove = None;
@@ -4043,7 +4131,7 @@ impl ProCraftApp {
                                 layer.visible = vis;
                                 touched = true;
                             }
-                            let selected = self.doc.active == i;
+                            let selected = self.layer_selection.contains(&i);
                             if Some(i) == self.renaming {
                                 // Double-clicked: edit the name in a staged buffer so
                                 // Cancel can discard it. Commits via Save, Enter, or
@@ -4084,9 +4172,26 @@ impl ProCraftApp {
                                     self.renaming_text.clear();
                                 }
                             } else {
-                                let resp = ui.selectable_label(selected, &layer.name);
+                                let resp = ui
+                                    .selectable_label(selected, &layer.name)
+                                    .on_hover_text(
+                                        "Ctrl/Shift-click or long-press to select several layers",
+                                    );
+                                let long = resp.long_touched();
+                                let mods = ui.ctx().input(|inp| inp.modifiers);
                                 if resp.clicked() {
+                                    self.layer_selection = next_layer_selection(
+                                        &self.layer_selection,
+                                        self.doc.active,
+                                        i,
+                                        long || mods.command || mods.ctrl,
+                                        mods.shift && !long,
+                                    );
                                     select = Some(i);
+                                    if self.layer_selection.len() > 1 {
+                                        self.status =
+                                            format!("{} layers selected.", self.layer_selection.len());
+                                    }
                                 }
                                 if resp.double_clicked() {
                                     select = Some(i);
@@ -4204,10 +4309,13 @@ impl ProCraftApp {
                         self.doc.layers[active].blend = blend;
                         dirty = true;
                     }
-                    if moved > 0 && active + 1 < self.doc.layers.len() {
-                        self.doc.move_layer(active, active + 1);
-                    } else if moved < 0 && active > 0 {
-                        self.doc.move_layer(active, active - 1);
+                    let reordered = (moved > 0 && active + 1 < self.doc.layers.len())
+                        || (moved < 0 && active > 0);
+                    if reordered {
+                        let target = if moved > 0 { active + 1 } else { active - 1 };
+                        self.doc.move_layer(active, target);
+                        // Rows shift under the indexes: keep only the active row.
+                        self.layer_selection = vec![self.doc.active];
                     }
                     if dirty {
                         self.ghost_dirty = true;
@@ -5940,7 +6048,8 @@ impl ProCraftApp {
         if !self.status.is_empty() && alpha > 0.0 {
             let offset = toast_offset(capsule_offset, island_h, t.gap, capsule_visible);
             egui::Area::new(egui::Id::new("mobile-toast"))
-                .order(egui::Order::Foreground)
+                // Above the drawers (same layer would let them cover the toast).
+                .order(egui::Order::Tooltip)
                 .interactable(false)
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, offset])
                 .show(ctx, |ui| {
@@ -15335,6 +15444,42 @@ mod tests {
                 },
                 LayerPanelRow::Layer { index: 0, depth: 1 },
             ]
+        );
+    }
+
+    #[test]
+    fn layer_selection_click_shift_and_toggle() {
+        // Plain click replaces the selection.
+        assert_eq!(next_layer_selection(&[1, 2], 2, 5, false, false), vec![5]);
+        // Toggle adds and removes, keeping the order stable.
+        assert_eq!(next_layer_selection(&[1, 2], 2, 5, true, false), vec![1, 2, 5]);
+        assert_eq!(
+            next_layer_selection(&[1, 2, 5], 5, 2, true, false),
+            vec![1, 5]
+        );
+        // Shift extends from the active layer in either direction.
+        assert_eq!(next_layer_selection(&[5], 1, 3, false, true), vec![1, 2, 3]);
+        assert_eq!(next_layer_selection(&[5], 5, 3, false, true), vec![3, 4, 5]);
+        // The selection never goes empty: toggling off the last row keeps it.
+        assert_eq!(next_layer_selection(&[4], 4, 4, true, false), vec![4]);
+    }
+
+    #[test]
+    fn group_member_badge_shows_the_count_inline() {
+        assert_eq!(group_member_badge(0), None);
+        assert_eq!(group_member_badge(1).as_deref(), Some("(1)"));
+        assert_eq!(group_member_badge(3).as_deref(), Some("(3)"));
+    }
+
+    #[test]
+    fn group_created_status_names_the_parent_when_nested() {
+        assert_eq!(
+            group_created_status("Group 2", None, "Layer 3"),
+            "Group 2 created with Layer 3."
+        );
+        assert_eq!(
+            group_created_status("Group 2", Some("Group 1"), "Layer 3"),
+            "Group 2 created inside Group 1 with Layer 3."
         );
     }
 
