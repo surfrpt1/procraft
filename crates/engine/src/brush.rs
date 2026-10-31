@@ -2710,54 +2710,65 @@ impl Document {
             y0.min(y1).floor().max(0.0) as u32,
         );
         let (ix1, iy1) = (x0.max(x1).ceil() as u32, y0.max(y1).ceil() as u32);
-        if self.symmetry == SymmetryMode::Off {
-            let x1c = ix1.min(self.w.saturating_sub(1));
-            let mut row = Vec::new();
-            for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
-                let py = y as f32 + 0.5;
-                // Even-odd ray cast from the pixel center.
-                let inside = |x: u32| {
-                    let px = x as f32 + 0.5;
-                    let mut hit = false;
-                    let mut j = pts.len() - 1;
-                    for i in 0..pts.len() {
-                        let (xi, yi) = pts[i];
-                        let (xj, yj) = pts[j];
-                        if (yi > py) != (yj > py) {
-                            let at = xi + (py - yi) / (yj - yi) * (xj - xi);
-                            if px < at {
-                                hit = !hit;
-                            }
-                        }
-                        j = i;
-                    }
-                    hit
-                };
-                self.put_row_span(brush, color, y, ix0, x1c, &mut row, inside);
+        let x1c = ix1.min(self.w.saturating_sub(1));
+        let mut crossings: Vec<f32> = Vec::with_capacity(pts.len());
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut row = Vec::new();
+        for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
+            let py = y as f32 + 0.5;
+            crossings.clear();
+            let mut j = pts.len() - 1;
+            for i in 0..pts.len() {
+                let (xi, yi) = pts[i];
+                let (xj, yj) = pts[j];
+                if (yi > py) != (yj > py) {
+                    crossings.push(xi + (py - yi) / (yj - yi) * (xj - xi));
+                }
+                j = i;
             }
+            Self::even_odd_spans(&mut crossings, ix0, x1c, &mut spans);
+            if self.symmetry == SymmetryMode::Off {
+                for &(s, e) in &spans {
+                    self.put_row_span(brush, color, y, s, e, &mut row, |_| true);
+                }
+            } else {
+                for &(s, e) in &spans {
+                    for x in s..=e {
+                        self.put(brush, color, x, y);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inclusive pixel-x spans covered by a scanline, from the sorted
+    /// crossings of its edges. Resolves the even-odd rule once per row
+    /// instead of per pixel: a crossing at `at` toggles at `px == at`, so
+    /// it covers pixels up to `ceil(at - 0.5) - 1` (the last `x` whose
+    /// center is left of it). An odd crossing count leaves the region left
+    /// of the first crossing inside.
+    fn even_odd_spans(crossings: &mut [f32], x_lo: u32, x_hi: u32, spans: &mut Vec<(u32, u32)>) {
+        spans.clear();
+        if crossings.is_empty() || x_lo > x_hi {
             return;
         }
-        for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
-            for x in ix0..=ix1.min(self.w.saturating_sub(1)) {
-                // Even-odd ray cast from the pixel center.
-                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                let mut inside = false;
-                let mut j = pts.len() - 1;
-                for i in 0..pts.len() {
-                    let (xi, yi) = pts[i];
-                    let (xj, yj) = pts[j];
-                    if (yi > py) != (yj > py) {
-                        let at = xi + (py - yi) / (yj - yi) * (xj - xi);
-                        if px < at {
-                            inside = !inside;
-                        }
-                    }
-                    j = i;
-                }
-                if inside {
-                    self.put(brush, color, x, y);
-                }
+        crossings.sort_unstable_by(f32::total_cmp);
+        let (lo, hi) = (x_lo as i64, x_hi as i64);
+        let end_of = |at: f32| ((at as f64) - 0.5).ceil() as i64 - 1;
+        let push = |a: i64, b: i64, spans: &mut Vec<(u32, u32)>| {
+            let (a, b) = (a.max(lo), b.min(hi));
+            if a <= b {
+                spans.push((a as u32, b as u32));
             }
+        };
+        let mut k = 0;
+        if crossings.len() % 2 == 1 {
+            push(lo, end_of(crossings[0]), spans);
+            k = 1;
+        }
+        while k + 1 < crossings.len() {
+            push(end_of(crossings[k]) + 1, end_of(crossings[k + 1]), spans);
+            k += 2;
         }
     }
 
@@ -5709,41 +5720,71 @@ mod tests {
         got.fill_ellipse(&brush, color, 30.0, 20.0, 270.0, 180.0);
         assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "ellipse fill");
 
-        let pts = Document::poly_vertices(ShapePoly::Triangle, 30.0, 20.0, 270.0, 180.0, 3);
-        let mut want = build();
-        for y in 0..200u32 {
-            for x in 0..300u32 {
-                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                let mut inside = false;
-                let mut j = pts.len() - 1;
-                for i in 0..pts.len() {
-                    let (xi, yi) = pts[i];
-                    let (xj, yj) = pts[j];
-                    if (yi > py) != (yj > py) {
-                        let at = xi + (py - yi) / (yj - yi) * (xj - xi);
-                        if px < at {
-                            inside = !inside;
-                        }
+        for (kind, sides) in [
+            (ShapePoly::Triangle, 3),
+            (ShapePoly::Diamond, 3),
+            (ShapePoly::Star, 3),
+            (ShapePoly::Polygon, 5),
+        ] {
+            let pts = Document::poly_vertices(kind, 30.0, 20.0, 270.0, 180.0, sides);
+            let mut want = build();
+            for y in 0..200u32 {
+                for x in 0..300u32 {
+                    if poly_inside(&pts, x, y) {
+                        want.put_one(&brush, color, x, y);
                     }
-                    j = i;
-                }
-                if inside {
-                    want.put_one(&brush, color, x, y);
                 }
             }
+            let mut got = build();
+            got.fill_poly(&brush, color, kind, 30.0, 20.0, 270.0, 180.0, sides);
+            assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "{kind:?} fill");
         }
-        let mut got = build();
-        got.fill_poly(
-            &brush,
-            color,
-            ShapePoly::Triangle,
-            30.0,
-            20.0,
-            270.0,
-            180.0,
-            3,
-        );
-        assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "poly fill");
+    }
+
+    /// Per-pixel even-odd ray cast: the reference the scanline fill replaced.
+    fn poly_inside(pts: &[(f32, f32)], x: u32, y: u32) -> bool {
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        let mut inside = false;
+        let mut j = pts.len() - 1;
+        for i in 0..pts.len() {
+            let (xi, yi) = pts[i];
+            let (xj, yj) = pts[j];
+            if (yi > py) != (yj > py) {
+                let at = xi + (py - yi) / (yj - yi) * (xj - xi);
+                if px < at {
+                    inside = !inside;
+                }
+            }
+            j = i;
+        }
+        inside
+    }
+
+    /// The scanline path must mirror exactly what the per-pixel ray cast
+    /// plus `put` laid down, for both mirror layouts.
+    #[test]
+    fn poly_fill_with_symmetry_matches_the_per_pixel_path() {
+        let brush = Brush {
+            opacity: 0.7,
+            ..Default::default()
+        };
+        let color = Color::rgb(20, 90, 160);
+        let pts = Document::poly_vertices(ShapePoly::Star, 10.0, 8.0, 70.0, 60.0, 3);
+        for mode in [SymmetryMode::Horizontal, SymmetryMode::Both] {
+            let mut want = Document::new(140, 100);
+            want.symmetry = mode;
+            for y in 0..100u32 {
+                for x in 0..140u32 {
+                    if poly_inside(&pts, x, y) {
+                        want.put(&brush, color, x, y);
+                    }
+                }
+            }
+            let mut got = Document::new(140, 100);
+            got.symmetry = mode;
+            got.fill_poly(&brush, color, ShapePoly::Star, 10.0, 8.0, 70.0, 60.0, 3);
+            assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "{mode:?}");
+        }
     }
 
     #[test]
