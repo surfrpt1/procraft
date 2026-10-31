@@ -526,6 +526,8 @@ pub struct Document {
     /// Canvas bbox touched by the active stroke (inclusive), for cheap
     /// stroke-local restores. Session-only.
     pub(crate) stroke_rect: Option<(u32, u32, u32, u32)>,
+    /// Active liquify stroke (snapshot + displacement field). Session-only.
+    liquify: Option<LiquifyStroke>,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -561,6 +563,127 @@ impl UndoEntry {
                 t.text.len() + t.style.font_bytes.as_ref().map_or(0, Vec::len)
             })
     }
+}
+
+/// Sparse per-canvas-pixel sample offsets for one liquify stroke, in
+/// lazily allocated `TILE`-side tiles of `[f32; 2]` (x, y). A pixel with no
+/// entry has never been pushed and is never resampled, so an untouched 8K
+/// layer costs nothing and untouched pixels keep their exact bytes. Tiles
+/// are copy-on-write like the layer rasters, so an autosave snapshot of the
+/// open document shares the field instead of copying it.
+#[derive(Clone, Debug)]
+struct LiquifyField {
+    tiles_x: u32,
+    tiles: std::collections::HashMap<u32, std::sync::Arc<Vec<f32>>>,
+}
+
+impl LiquifyField {
+    fn new(w: u32) -> Self {
+        Self {
+            tiles_x: w.div_ceil(TILE),
+            tiles: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get(&self, x: u32, y: u32) -> [f32; 2] {
+        let Some(t) = self.tiles.get(&((y / TILE) * self.tiles_x + x / TILE)) else {
+            return [0.0, 0.0];
+        };
+        let o = (((y % TILE) * TILE + (x % TILE)) * 2) as usize;
+        [t[o], t[o + 1]]
+    }
+
+    /// Write one pixel's offset.
+    fn set(&mut self, x: u32, y: u32, v: [f32; 2]) {
+        let key = (y / TILE) * self.tiles_x + x / TILE;
+        let tile = self.tiles.entry(key).or_insert_with(|| {
+            std::sync::Arc::new(vec![0.0f32; (TILE * TILE * 2) as usize])
+        });
+        let t = std::sync::Arc::make_mut(tile);
+        let o = (((y % TILE) * TILE + (x % TILE)) * 2) as usize;
+        t[o] = v[0];
+        t[o + 1] = v[1];
+    }
+
+    /// Dense copy of `rect` (inclusive) for pre-update reads, row-major.
+    fn snapshot(&self, rect: (u32, u32, u32, u32)) -> (Vec<[f32; 2]>, u32) {
+        let (x0, y0, x1, y1) = rect;
+        let rw = x1 - x0 + 1;
+        let mut v = Vec::with_capacity((rw * (y1 - y0 + 1)) as usize);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                v.push(self.get(x, y));
+            }
+        }
+        (v, rw)
+    }
+
+    /// Furthest reverse sample inside `rect` (inclusive): the render needs
+    /// the snapshot that far outside the rewritten pixels.
+    fn reach(&self, rect: (u32, u32, u32, u32)) -> u32 {
+        let (x0, y0, x1, y1) = rect;
+        let mut furthest = 0.0f32;
+        for ty in (y0 / TILE)..=(y1 / TILE) {
+            for tx in (x0 / TILE)..=(x1 / TILE) {
+                let Some(t) = self.tiles.get(&(ty * self.tiles_x + tx)) else {
+                    continue;
+                };
+                let rx0 = x0.saturating_sub(tx * TILE) as usize;
+                let rx1 = ((x1 - tx * TILE).min(TILE - 1)) as usize;
+                let ry0 = y0.saturating_sub(ty * TILE) as usize;
+                let ry1 = ((y1 - ty * TILE).min(TILE - 1)) as usize;
+                for ry in ry0..=ry1 {
+                    for rx in rx0..=rx1 {
+                        let o = (ry * TILE as usize + rx) * 2;
+                        furthest = furthest.max(t[o].abs()).max(t[o + 1].abs());
+                    }
+                }
+            }
+        }
+        furthest.ceil() as u32
+    }
+}
+
+/// One liquify stroke: the layer as it was when the stroke opened plus the
+/// displacement field, which is carried along with the content it moves (a
+/// push shifts the offsets of the pixels it touches, like dragging paint).
+/// Every pointer move re-renders the swept region from `src` through the
+/// field, so a pixel is resampled once per stroke instead of once per push:
+/// a drag can no longer soften what its own earlier pushes already warped.
+#[derive(Clone, Debug)]
+struct LiquifyStroke {
+    layer: usize,
+    src: Raster,
+    field: LiquifyField,
+    /// `Document::rev` after the last render. Any other write invalidates
+    /// the snapshot, so the next push starts a fresh stroke from the
+    /// current pixels instead of resurrecting stale ones.
+    rev: u64,
+}
+
+/// Split one pointer segment into liquify pushes no longer than `max_step`,
+/// so a fast drag warps the whole segment in this frame instead of trailing
+/// the pointer. The 64-push ceiling keeps a pathological one-frame jump
+/// from stalling the frame.
+fn liquify_steps(
+    from: (f32, f32),
+    to: (f32, f32),
+    max_step: f32,
+) -> Vec<((f32, f32), (f32, f32))> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len == 0.0 {
+        return Vec::new();
+    }
+    let steps = (len / max_step.max(1.0)).ceil().clamp(1.0, 64.0);
+    let mut pushes = Vec::with_capacity(steps as usize);
+    for i in 1..=steps as u32 {
+        let t = i as f32 / steps;
+        let t0 = (i - 1) as f32 / steps;
+        let (sx, sy) = (dx * (t - t0), dy * (t - t0));
+        pushes.push(((from.0 + dx * t, from.1 + dy * t), (sx, sy)));
+    }
+    pushes
 }
 
 /// One canvas pixel of the mask viewer image: grayscale of the mask byte at
@@ -599,6 +722,7 @@ impl Document {
             rev: 0,
             stroke_peak: None,
             stroke_rect: None,
+            liquify: None,
         }
     }
 
@@ -629,6 +753,7 @@ impl Document {
             rev: 0,
             stroke_peak: None,
             stroke_rect: None,
+            liquify: None,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -1036,6 +1161,9 @@ impl Document {
     /// Snapshot the active layer for one undo step (call when a stroke starts).
     /// A new checkpoint discards the redo history.
     pub fn checkpoint(&mut self) {
+        // A new undo step is a new stroke: drop any liquify field so its
+        // displacements cannot leak into the fresh step.
+        self.liquify = None;
         if let Some(entry) = self.snapshot() {
             self.push_undo(entry);
             self.redo.clear();
@@ -3157,11 +3285,13 @@ impl Document {
     }
 
     /// M40 Liquify push: displace layer pixels along the drag vector
-    /// `(dx, dy)` within `size` px of `(x, y)`, reverse-mapped with
-    /// bilinear sampling so no holes tear open. `strength` 0..=1 scales
-    /// the push; falloff is smooth to the rim. Honors the active
-    /// selection for writes (graduated-mask mixed, like blur). Caller
-    /// checkpoints once per stroke; zero push is a no-op.
+    /// `(dx, dy)` within `size` px of `(x, y)`. `strength` 0..=1 scales the
+    /// push; falloff is smooth to the rim. Honors the active selection.
+    /// Repeated calls (or one `liquify_begin`/`liquify_end` stroke) accumulate
+    /// into a displacement field carried along with the content, and re-render
+    /// the swept region from the stroke's snapshot, so a stroke resamples each
+    /// pixel at most once: in place resampling would smear the previous warp
+    /// again on every push. Zero push is a no-op.
     #[allow(clippy::too_many_arguments)]
     pub fn liquify(
         &mut self,
@@ -3182,6 +3312,17 @@ impl Document {
         if self.w == 0 || self.h == 0 {
             return;
         }
+        // Reuse the open stroke only while its snapshot still matches the
+        // layer: any other write (paint, undo, filter) starts a new one.
+        let mut stroke = match self.liquify.take() {
+            Some(stroke) if stroke.layer == index && stroke.rev == self.rev => stroke,
+            _ => LiquifyStroke {
+                layer: index,
+                src: self.layers[index].pixels.clone(),
+                field: LiquifyField::new(self.w),
+                rev: self.rev,
+            },
+        };
         // One push per symmetry mirror, deduped when a mirror lands on an
         // identical (point, vector) pair (e.g. kaleidoscope center).
         let (ccx, ccy) = self.symmetry_center_px();
@@ -3199,16 +3340,61 @@ impl Document {
                 continue;
             }
             done.push((px, py, pdx, pdy));
-            self.liquify_push(index, px, py, pdx, pdy, size, strength);
+            self.liquify_push(&mut stroke, px, py, pdx, pdy, size, strength);
+        }
+        self.liquify = Some(stroke);
+    }
+
+    /// Open a liquify stroke on `index`: the snapshot every push resamples
+    /// from. The app calls it once per drag (right after the undo
+    /// checkpoint) and [`Self::liquify_end`] on release; pushes also open a
+    /// stroke on their own when none is active.
+    pub fn liquify_begin(&mut self, index: usize) {
+        if let Some(stroke) = self.liquify.as_ref() {
+            if stroke.layer == index && stroke.rev == self.rev {
+                return;
+            }
+        }
+        self.liquify = self.layers.get(index).map(|layer| LiquifyStroke {
+            layer: index,
+            src: layer.pixels.clone(),
+            field: LiquifyField::new(self.w),
+            rev: self.rev,
+        });
+    }
+
+    /// Close the active liquify stroke and free its snapshot and field.
+    pub fn liquify_end(&mut self) {
+        self.liquify = None;
+    }
+
+    /// Warp along one pointer segment. The segment is split into pushes no
+    /// longer than an eighth of the brush size (min 2 px) so a fast drag
+    /// warps all of it this frame instead of trailing the pointer; the last
+    /// push ends exactly at the pointer.
+    pub fn liquify_segment(
+        &mut self,
+        index: usize,
+        from: (f32, f32),
+        to: (f32, f32),
+        size: f32,
+        strength: f32,
+    ) {
+        if size < 1.0 || strength <= 0.0 {
+            return;
+        }
+        let steps = liquify_steps(from, to, (size * 0.125).max(2.0));
+        for ((x, y), (dx, dy)) in steps {
+            self.liquify(index, x, y, dx, dy, size, strength);
         }
     }
 
-    /// One warp centered at (x, y) pushing pixels by (dx, dy). Reads from
-    /// a bounded region copy (disc plus sample reach), not the full layer.
+    /// Add one warp to the stroke's field and re-render the disc it covers
+    /// from the stroke snapshot.
     #[allow(clippy::too_many_arguments)]
     fn liquify_push(
         &mut self,
-        index: usize,
+        stroke: &mut LiquifyStroke,
         x: f32,
         y: f32,
         dx: f32,
@@ -3216,9 +3402,6 @@ impl Document {
         size: f32,
         strength: f32,
     ) {
-        if dx == 0.0 && dy == 0.0 {
-            return;
-        }
         let (w, h) = (self.w, self.h);
         let radius = size * 0.5;
         let bx0 = ((x - radius).floor().max(0.0)) as u32;
@@ -3228,77 +3411,160 @@ impl Document {
         if bx0 > bx1 || by0 > by1 {
             return;
         }
-        // Reverse samples reach up to |d| * strength px back along the
-        // push; copy that hull so the whole warp reads from the region.
-        let reach = (dx.hypot(dy) * strength).ceil() as u32 + 1;
-        let rx0 = bx0.saturating_sub(reach);
-        let ry0 = by0.saturating_sub(reach);
-        let rx1 = (bx1 + reach).min(w - 1);
-        let ry1 = (by1 + reach).min(h - 1);
-        let rw = rx1 - rx0 + 1;
-        let sel = self.selection;
-        let Document {
-            layers,
-            selection_mask,
-            ..
-        } = self;
-        let mask = selection_mask.as_deref();
-        // Reads come from a bounded region copy (disc plus sample reach):
-        // sampling the tiles directly keeps an 8K push O(region) instead of
-        // materialising the whole layer twice per pointer move.
-        let pixels = &layers[index].pixels;
-        let mut src = Vec::with_capacity((rw * (ry1 - ry0 + 1) * 4) as usize);
-        for ry in ry0..=ry1 {
-            for rx in rx0..=rx1 {
-                src.extend_from_slice(&pixels.get4(((ry * w + rx) * 4) as usize));
-            }
-        }
-        let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
-            let sx = sx.clamp(0.0, w as f32 - 1.0);
-            let sy = sy.clamp(0.0, h as f32 - 1.0);
-            let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
-            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let at = |x: u32, y: u32| src[(((y - ry0) * rw + (x - rx0)) * 4) as usize + ch] as f32;
-            at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-                + at(x1, y0) * fx * (1.0 - fy)
-                + at(x0, y1) * (1.0 - fx) * fy
-                + at(x1, y1) * fx * fy
+        let selection = self.selection;
+        let mask = self.selection_mask.as_deref();
+        // The displacement this push gives each pixel (reverse sample offset
+        // direction: content moves along `(dx, dy)`).
+        let disp = |px: u32, py: u32| -> [f32; 2] {
+            let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2))
+                .sqrt()
+                / radius)
+                .min(1.0);
+            // Smooth falloff: full push at the center, zero at the rim.
+            let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
+            let in_rect = !matches!(selection, Some((a, b, c, d)) if px < a || px > c || py < b || py > d);
+            let k = if in_rect {
+                Self::sel_k(mask, w, px, py)
+            } else {
+                0.0
+            };
+            // A feathered selection scales the displacement, so a pixel at
+            // k = 0 samples itself and stays put.
+            [-dx * strength * f * k, -dy * strength * f * k]
         };
-        let layer = &mut layers[index];
+        let mut step = 0.0f32;
         for py in by0..=by1 {
             for px in bx0..=bx1 {
-                let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2)).sqrt()
-                    / radius)
-                    .min(1.0);
-                // Smooth falloff: full push at the center, zero at the rim.
-                let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
-                let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
-                if (ox - px as f32).abs() < f32::EPSILON && (oy - py as f32).abs() < f32::EPSILON {
+                let d = disp(px, py);
+                step = step.max(d[0].abs()).max(d[1].abs());
+            }
+        }
+        if step == 0.0 {
+            return;
+        }
+        // The offset is carried with the content, like dragging the pixels:
+        // `F_new(p) = F_old(p + d) + d`. Summing `d` at a fixed pixel instead
+        // only moves content while the disc passes over it, so a drag
+        // transfers barely half its distance and the warp reads as a stiff
+        // block instead of a pull. Reading the pre-push field needs a dense
+        // copy of the disc plus the bilinear support.
+        let pad = step.ceil() as u32 + 1;
+        let (sx0, sy0) = (bx0.saturating_sub(pad), by0.saturating_sub(pad));
+        let (sx1, sy1) = ((bx1 + pad).min(w - 1), (by1 + pad).min(h - 1));
+        let (old, sw) = stroke.field.snapshot((sx0, sy0, sx1, sy1));
+        let old_at = |x: f32, y: f32| -> [f32; 2] {
+            let x = x.clamp(0.0, w as f32 - 1.0);
+            let y = y.clamp(0.0, h as f32 - 1.0);
+            let (cx0, cy0) = (x.floor() as u32, y.floor() as u32);
+            let (cx1, cy1) = ((cx0 + 1).min(w - 1), (cy0 + 1).min(h - 1));
+            let (fx, fy) = (x - cx0 as f32, y - cy0 as f32);
+            let at = |x: u32, y: u32| old[((y - sy0) * sw + (x - sx0)) as usize];
+            let (a, b, c, d) = (at(cx0, cy0), at(cx1, cy0), at(cx0, cy1), at(cx1, cy1));
+            [
+                a[0] * (1.0 - fx) * (1.0 - fy)
+                    + b[0] * fx * (1.0 - fy)
+                    + c[0] * (1.0 - fx) * fy
+                    + d[0] * fx * fy,
+                a[1] * (1.0 - fx) * (1.0 - fy)
+                    + b[1] * fx * (1.0 - fy)
+                    + c[1] * (1.0 - fx) * fy
+                    + d[1] * fx * fy,
+            ]
+        };
+        let mut touched = false;
+        for py in by0..=by1 {
+            for px in bx0..=bx1 {
+                let d = disp(px, py);
+                if d[0] == 0.0 && d[1] == 0.0 {
                     continue;
                 }
-                let selected = !matches!(sel, Some((a, b, c, d)) if px < a || px > c || py < b || py > d)
-                    && match mask {
-                        Some(m) => m[(py * w + px) as usize] != 0,
-                        None => true,
-                    };
-                if !selected {
-                    continue;
-                }
+                let prev = old_at(px as f32 + d[0], py as f32 + d[1]);
+                // Clamp to the canvas: a sample past the edge folds back to
+                // the same clamped read, and the clamp bounds the region copy
+                // a long drag makes.
+                let nx = (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32);
+                let ny = (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32);
+                stroke.field.set(px, py, [nx, ny]);
+                touched = true;
+            }
+        }
+        if touched {
+            self.liquify_render(stroke, (bx0, by0, bx1, by1));
+        }
+    }
+
+    /// Re-render `rect` (inclusive) from the stroke snapshot through its
+    /// displacement field. Reads come from a bounded copy of the snapshot,
+    /// expanded by the furthest reverse sample; filtering is premultiplied
+    /// and the writes unpremultiplied, so transparent black never bleeds
+    /// into a warped edge and darkens its color.
+    fn liquify_render(&mut self, stroke: &mut LiquifyStroke, rect: (u32, u32, u32, u32)) {
+        let (w, h) = (self.w, self.h);
+        let (x0, y0, x1, y1) = rect;
+        let reach = stroke.field.reach(rect);
+        let rx0 = x0.saturating_sub(reach);
+        let ry0 = y0.saturating_sub(reach);
+        let rx1 = (x1 + reach).min(w - 1);
+        let ry1 = (y1 + reach).min(h - 1);
+        let rw = rx1 - rx0 + 1;
+        let src = &stroke.src;
+        let mut region = Vec::with_capacity((rw * (ry1 - ry0 + 1) * 4) as usize);
+        for ry in ry0..=ry1 {
+            for rx in rx0..=rx1 {
+                region.extend_from_slice(&src.get4(((ry * w + rx) * 4) as usize));
+            }
+        }
+        let sample = |sx: f32, sy: f32| -> [u8; 4] {
+            let sx = sx.clamp(0.0, w as f32 - 1.0);
+            let sy = sy.clamp(0.0, h as f32 - 1.0);
+            let (cx0, cy0) = (sx.floor() as u32, sy.floor() as u32);
+            let (cx1, cy1) = ((cx0 + 1).min(w - 1), (cy0 + 1).min(h - 1));
+            let (fx, fy) = ((sx - cx0 as f32) as f64, (sy - cy0 as f32) as f64);
+            let at = |x: u32, y: u32| -> [u8; 4] {
+                let o = (((y - ry0) * rw + (x - rx0)) * 4) as usize;
+                [region[o], region[o + 1], region[o + 2], region[o + 3]]
+            };
+            let corners = [
+                (cx0, cy0, (1.0 - fx) * (1.0 - fy)),
+                (cx1, cy0, fx * (1.0 - fy)),
+                (cx0, cy1, (1.0 - fx) * fy),
+                (cx1, cy1, fx * fy),
+            ];
+            let (mut pr, mut pg, mut pb, mut pa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (x, y, weight) in corners {
+                let [r, g, b, a] = at(x, y);
+                let a = a as f64 * weight;
+                pa += a;
+                pr += r as f64 * a;
+                pg += g as f64 * a;
+                pb += b as f64 * a;
+            }
+            if pa <= 0.0 {
+                return [0, 0, 0, 0];
+            }
+            [
+                (pr / pa).round().clamp(0.0, 255.0) as u8,
+                (pg / pa).round().clamp(0.0, 255.0) as u8,
+                (pb / pa).round().clamp(0.0, 255.0) as u8,
+                pa.round().clamp(0.0, 255.0) as u8,
+            ]
+        };
+        let layer = &mut self.layers[stroke.layer];
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let off = stroke.field.get(px, py);
                 let o = ((py * w + px) * 4) as usize;
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
-                let k = Self::sel_k(mask, w, px, py);
-                let mut dst = layer.pixels.get4(o);
-                for (ch, d) in dst.iter_mut().enumerate() {
-                    let v = sample(ox, oy, ch);
-                    *d = (*d as f32 * (1.0 - k) + v * k).round() as u8;
+                let out = sample(px as f32 + off[0], py as f32 + off[1]);
+                if out != layer.pixels.get4(o) {
+                    layer.pixels.set4(o, out);
                 }
-                layer.pixels.set4(o, dst);
             }
         }
-        self.mark_dirty(bx0, by0, bx1, by1);
+        self.mark_dirty(x0, y0, x1, y1);
+        stroke.rev = self.rev;
     }
 
     /// Save the composite as PNG.
@@ -4072,6 +4338,7 @@ impl Document {
             rev: 0,
             stroke_peak: None,
             stroke_rect: None,
+            liquify: None,
         })
     }
 }
@@ -7351,102 +7618,388 @@ mod tests {
     }
 
     #[test]
-    fn liquify_honors_selection() {
-        use crate::brush::{Brush, Color};
+    fn liquify_moves_only_pixels_inside_the_selection() {
+        let (w, h) = (64u32, 32u32);
+        let mut doc = Document::new(w, h);
+        // Ramp images so a moved pixel reads back as a different value.
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                bytes[o] = (x * 4) as u8;
+                bytes[o + 1] = (y * 8) as u8;
+                bytes[o + 3] = 255;
+            }
+        }
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let before = doc.layers[0].pixels.clone();
+        let at = |r: &Raster, x: u32, y: u32| r.get4(((y * w + x) * 4) as usize);
+        // The disc straddles the selection edge at x = 31: inside pixels
+        // warp, outside pixels must stay byte-identical.
+        doc.selection = Some((0, 0, 31, 31));
+        doc.liquify(0, 28.0, 16.0, 0.0, 6.0, 40.0, 1.0);
+        let moved = at(&doc.layers[0].pixels, 20, 16);
+        assert!(
+            (94..=96).contains(&(moved[1] as i32)),
+            "selected pixel sampled the row above: {moved:?}"
+        );
+        for (x, y) in [(36, 16), (40, 20), (63, 16)] {
+            assert_eq!(
+                at(&doc.layers[0].pixels, x, y),
+                at(&before, x, y),
+                "unselected ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn liquify_scales_the_push_by_mask_coverage() {
+        let (w, h) = (64u32, 32u32);
+        let mut doc = Document::new(w, h);
+        // A horizontal ramp in red and a vertical one in green, so a sampled
+        // position reads back as the position it came from.
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                bytes[o] = (x * 4) as u8;
+                bytes[o + 1] = (y * 8) as u8;
+                bytes[o + 3] = 255;
+            }
+        }
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let mut mask = vec![255u8; (w * h) as usize];
+        mask[(16 * w + 28) as usize] = 64; // k = 64/255
+        mask[(16 * w + 30) as usize] = 0;
+        doc.selection_mask = Some(mask);
+        doc.liquify(0, 28.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+        let at = |x: u32, y: u32| doc.layers[0].pixels.get4(((y * w + x) * 4) as usize);
+        // A quarter-covered pixel moves a quarter of the way: it samples
+        // ~2 px back, where the ramp reads ~104.
+        let quarter = at(28, 16);
+        assert!(
+            (103..=105).contains(&(quarter[0] as i32)),
+            "quarter push sampled x~26: {quarter:?}"
+        );
+        assert_eq!(quarter[1], 128, "no vertical displacement");
+        assert_eq!(at(30, 16), [120, 128, 0, 255], "k = 0 keeps the pixel");
+    }
+
+    #[test]
+    fn liquify_matches_a_dense_field_reference() {
+        // Characterization: the tiled field and the region-bounded snapshot
+        // reads must reproduce a whole-canvas field warp bit-for-bit,
+        // including pushes whose reverse samples read far outside the
+        // rewritten disc (and clamp at the canvas edge).
+        fn field_warp(
+            src: &[u8],
+            w: u32,
+            h: u32,
+            pushes: &[(f32, f32, f32, f32, f32, f32)],
+        ) -> Vec<u8> {
+            let mut off = vec![[0.0f32; 2]; (w * h) as usize];
+            let mut touched = vec![false; (w * h) as usize];
+            let field_at = |off: &[[f32; 2]], x: f32, y: f32| -> [f32; 2] {
+                let x = x.clamp(0.0, w as f32 - 1.0);
+                let y = y.clamp(0.0, h as f32 - 1.0);
+                let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+                let at = |x: u32, y: u32| off[(y * w + x) as usize];
+                let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                [
+                    a[0] * (1.0 - fx) * (1.0 - fy)
+                        + b[0] * fx * (1.0 - fy)
+                        + c[0] * (1.0 - fx) * fy
+                        + d[0] * fx * fy,
+                    a[1] * (1.0 - fx) * (1.0 - fy)
+                        + b[1] * fx * (1.0 - fy)
+                        + c[1] * (1.0 - fx) * fy
+                        + d[1] * fx * fy,
+                ]
+            };
+            for &(x, y, dx, dy, size, strength) in pushes {
+                let before = off.clone();
+                let radius = size * 0.5;
+                let bx0 = ((x - radius).floor().max(0.0)) as u32;
+                let by0 = ((y - radius).floor().max(0.0)) as u32;
+                let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
+                let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
+                for py in by0..=by1 {
+                    for px in bx0..=bx1 {
+                        let dist = (((px as f32 + 0.5 - x).powi(2)
+                            + (py as f32 + 0.5 - y).powi(2))
+                        .sqrt()
+                            / radius)
+                            .min(1.0);
+                        let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
+                        let d = [-dx * strength * f, -dy * strength * f];
+                        let prev = field_at(&before, px as f32 + d[0], py as f32 + d[1]);
+                        let o = (py * w + px) as usize;
+                        off[o][0] =
+                            (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32);
+                        off[o][1] =
+                            (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32);
+                        touched[o] = true;
+                    }
+                }
+            }
+            // Premultiplied bilinear, unpremultiplied on write (the
+            // documented sampling rule; no selection, so k = 1).
+            let sample = |sx: f32, sy: f32| -> [u8; 4] {
+                let sx = sx.clamp(0.0, w as f32 - 1.0);
+                let sy = sy.clamp(0.0, h as f32 - 1.0);
+                let (cx0, cy0) = (sx.floor() as u32, sy.floor() as u32);
+                let (cx1, cy1) = ((cx0 + 1).min(w - 1), (cy0 + 1).min(h - 1));
+                let (fx, fy) = ((sx - cx0 as f32) as f64, (sy - cy0 as f32) as f64);
+                let at = |x: u32, y: u32| -> [u8; 4] {
+                    let o = ((y * w + x) * 4) as usize;
+                    [src[o], src[o + 1], src[o + 2], src[o + 3]]
+                };
+                let (mut pr, mut pg, mut pb, mut pa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for (x, y, weight) in [
+                    (cx0, cy0, (1.0 - fx) * (1.0 - fy)),
+                    (cx1, cy0, fx * (1.0 - fy)),
+                    (cx0, cy1, (1.0 - fx) * fy),
+                    (cx1, cy1, fx * fy),
+                ] {
+                    let [r, g, b, a] = at(x, y);
+                    let a = a as f64 * weight;
+                    pa += a;
+                    pr += r as f64 * a;
+                    pg += g as f64 * a;
+                    pb += b as f64 * a;
+                }
+                if pa <= 0.0 {
+                    return [0, 0, 0, 0];
+                }
+                [
+                    (pr / pa).round().clamp(0.0, 255.0) as u8,
+                    (pg / pa).round().clamp(0.0, 255.0) as u8,
+                    (pb / pa).round().clamp(0.0, 255.0) as u8,
+                    pa.round().clamp(0.0, 255.0) as u8,
+                ]
+            };
+            let mut out = src.to_vec();
+            for py in 0..h {
+                for px in 0..w {
+                    if !touched[(py * w + px) as usize] {
+                        continue;
+                    }
+                    let [ox, oy] = off[(py * w + px) as usize];
+                    let o = ((py * w + px) * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&sample(px as f32 + ox, py as f32 + oy));
+                }
+            }
+            out
+        }
+        // Deterministic pseudo-random paint so any region-copy slip shows.
+        let bytes: Vec<u8> = (0..32 * 32 * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        // Reach (|d| = 11.4) far beyond the disc: samples come from the
+        // ring outside the rewritten pixels, then a second push folds in.
         let mut doc = Document::new(32, 32);
+        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
+        doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
+        doc.liquify(0, 10.0, 20.0, -8.0, 5.0, 18.0, 0.6);
+        assert_eq!(
+            doc.layers[0].pixels,
+            field_warp(
+                &bytes,
+                32,
+                32,
+                &[(20.0, 12.0, 9.0, -7.0, 14.0, 1.0), (10.0, 20.0, -8.0, 5.0, 18.0, 0.6)]
+            )
+        );
+        // Corner warp: reads clamp against the canvas edge.
+        let mut doc = Document::new(32, 32);
+        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
+        doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
+        assert_eq!(
+            doc.layers[0].pixels,
+            field_warp(&bytes, 32, 32, &[(2.0, 2.0, 5.0, 4.0, 14.0, 0.7)])
+        );
+    }
+
+    #[test]
+    fn repeated_pushes_carry_the_rim_without_smearing_it() {
+        use crate::brush::{Brush, Color};
         let brush = Brush {
             size: 30.0,
             softness: 0.0,
             opacity: 1.0,
             ..Default::default()
         };
-        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 27, 27);
-        // Selection far from the push keeps its pixels (warp still runs).
-        doc.selection = Some((24, 24, 31, 31));
-        let before = doc.layers[0].pixels.clone();
-        doc.liquify(0, 8.5, 8.5, 6.0, 0.0, 12.0, 1.0);
-        let o = ((25 * 32 + 25) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels.get(o), before.get(o));
+        let mut doc = Document::new(64, 32);
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 0, 0, 31, 31);
+        // Content is carried with the pointer: ten pushes from one spot keep
+        // pulling the rim outward instead of summing a force at fixed pixels.
+        for _ in 0..10 {
+            doc.liquify(0, 32.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+        }
+        let px = |x: u32| doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
+        let rim = (0..64u32).rev().find(|&x| px(x)[3] > 0).unwrap();
+        assert!(rim > 31, "the rim did not advance: {rim}");
+        // The moved rim stays one filter wide: it steps straight from opaque
+        // to clear between neighboring pixels instead of spreading over a
+        // ramp, and every inked pixel is still pure red.
+        let mut biggest = 0u8;
+        for x in 0..63u32 {
+            let [r, g, bl, a] = px(x);
+            biggest = biggest.max(a.abs_diff(px(x + 1)[3]));
+            if a > 0 {
+                assert_eq!([r, g, bl], [255, 0, 0], "x={x} alpha={a}");
+            }
+        }
+        assert_eq!(biggest, 255, "the rim smeared instead of stepping");
     }
 
     #[test]
-    fn liquify_matches_naive_reference_with_long_reach() {
-        // Characterization: the region-bounded copy must reproduce the
-        // original whole-buffer warp bit-for-bit, including long pushes
-        // whose reverse samples read far outside the disc (and off-canvas).
-        #[allow(clippy::too_many_arguments)]
-        fn naive_liquify(
-            src: &[u8],
-            w: u32,
-            h: u32,
-            x: f32,
-            y: f32,
-            dx: f32,
-            dy: f32,
-            size: f32,
-            strength: f32,
-        ) -> Vec<u8> {
-            let radius = size * 0.5;
-            let bx0 = ((x - radius).floor().max(0.0)) as u32;
-            let by0 = ((y - radius).floor().max(0.0)) as u32;
-            let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
-            let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
-            let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
-                let sx = sx.clamp(0.0, w as f32 - 1.0);
-                let sy = sy.clamp(0.0, h as f32 - 1.0);
-                let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
-                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-                let at = |x: u32, y: u32| src[((y * w + x) as usize * 4) + ch] as f32;
-                at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-                    + at(x1, y0) * fx * (1.0 - fy)
-                    + at(x0, y1) * (1.0 - fx) * fy
-                    + at(x1, y1) * fx * fy
-            };
-            let mut pixels = src.to_vec();
-            for py in by0..=by1 {
-                for px in bx0..=bx1 {
-                    let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2))
-                        .sqrt()
-                        / radius)
-                        .min(1.0);
-                    let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
-                    let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
-                    if (ox - px as f32).abs() < f32::EPSILON
-                        && (oy - py as f32).abs() < f32::EPSILON
-                    {
-                        continue;
-                    }
-                    let o = ((py * w + px) * 4) as usize;
-                    for ch in 0..4 {
-                        // No selection: k = 1, write the sampled value.
-                        pixels[o + ch] = sample(ox, oy, ch).round() as u8;
-                    }
-                }
+    fn liquify_drag_carries_content_with_the_pointer() {
+        let (w, h) = (640u32, 360u32);
+        let mut doc = Document::new(w, h);
+        // A 6 px bar across the drag line at y = 180.
+        for y in 60..=300u32 {
+            for x in 312..=317u32 {
+                doc.layers[0].pixels.set4(((y * w + x) * 4) as usize, [30, 144, 255, 255]);
             }
-            pixels
         }
-        let mut doc = Document::new(32, 32);
-        // Deterministic pseudo-random paint so any region-copy slip shows.
-        let bytes: Vec<u8> = (0..32 * 32 * 4)
-            .map(|i| ((i * 37 + 11) % 256) as u8)
-            .collect();
-        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
-        // Reach (|d| = 11.4) far beyond the disc: samples come from the
-        // ring outside the write bbox.
-        let src = doc.layers[0].pixels.clone();
-        doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
-        assert_eq!(
-            doc.layers[0].pixels,
-            naive_liquify(&src.to_dense(), 32, 32, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0)
+        // A 160 px drag at strength 0.5, fed as ~4 px pointer segments and
+        // starting 70 px short of the bar (it enters the disc's rim).
+        doc.liquify_begin(0);
+        let (x0, x1, y) = (242.0f32, 402.0f32, 180.0f32);
+        let n = 40u32;
+        let mut at = x0;
+        for i in 1..=n {
+            let to = x0 + (x1 - x0) * i as f32 / n as f32;
+            doc.liquify_segment(0, (at, y), (to, y), 128.0, 0.5);
+            at = to;
+        }
+        doc.liquify_end();
+        // The bar's centre (315.5) travels about half the drag: the offsets
+        // are carried with the paint instead of being summed at fixed pixels,
+        // which would stop pulling as soon as the disc's rim passed over.
+        let (mut mass, mut sum, mut max_a, mut inked) = (0.0f32, 0.0f32, 0u8, 0u32);
+        for x in 200..520u32 {
+            let p = doc.layers[0].pixels.get4(((180 * w + x) * 4) as usize);
+            if p[3] > 0 {
+                inked += 1;
+                mass += p[3] as f32;
+                sum += x as f32 * p[3] as f32;
+                max_a = max_a.max(p[3]);
+            }
+        }
+        let advance = sum / mass.max(1.0) - 315.5;
+        assert!(
+            (40.0..=60.0).contains(&advance),
+            "bar advanced {advance:.1} px (want ~50)"
         );
-        // Corner warp: reads clamp against the canvas edge.
-        let src = doc.layers[0].pixels.clone();
-        doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
-        assert_eq!(
-            doc.layers[0].pixels,
-            naive_liquify(&src.to_dense(), 32, 32, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7)
-        );
+        // One resample of the snapshot: the bar keeps its width, its solid
+        // interior, and a rim no wider than the filter.
+        assert_eq!(max_a, 255, "the bar was softened");
+        assert!(inked <= 8, "the bar smeared over {inked} px");
+    }
+
+    #[test]
+    fn liquify_keeps_edge_color_at_partial_alpha() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(64, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 10, 4, 30, 27);
+        // A half-strength push stretches the bar's rim into fractional
+        // alpha. Straight-alpha filtering would drag transparent black into
+        // it (and the rim turns [227, 0, 0]); premultiplied keeps [255, 0, 0].
+        doc.liquify(0, 30.5, 16.0, 6.0, 0.0, 40.0, 0.5);
+        let mut partial = 0;
+        for x in 0..64u32 {
+            let [r, g, b, a] = doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
+            if a > 0 && a < 255 {
+                partial += 1;
+                assert_eq!([r, g, b], [255, 0, 0], "x={x} alpha={a}");
+            }
+        }
+        assert!(partial > 0, "the push must leave a soft rim");
+    }
+
+    #[test]
+    fn liquify_starts_a_new_snapshot_after_a_paint() {
+        use crate::brush::{Brush, Color};
+        let (w, h) = (32u32, 32u32);
+        let mut doc = Document::new(w, h);
+        let bytes: Vec<u8> = (0..w * h * 4).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+        // Paint over everything: the open stroke's snapshot is now stale,
+        // and the next push must warp the new pixels, not resurrect the old.
+        let brush = Brush {
+            size: 40.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, w - 1, h - 1);
+        for _ in 0..4 {
+            doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+        }
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    doc.layers[0].pixels.get4(((y * w + x) * 4) as usize),
+                    [255, 255, 255, 255],
+                    "({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn liquify_steps_cover_the_whole_pointer_segment() {
+        // Within the cap: one push, ending exactly at the pointer.
+        let steps = liquify_steps((0.0, 0.0), (3.0, 4.0), 10.0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0], ((3.0, 4.0), (3.0, 4.0)));
+        // A fast move is split so every push stays under the cap, the
+        // pushes chain end-to-end, and the last anchor is the pointer —
+        // nothing is left over for the release to drop.
+        let steps = liquify_steps((0.0, 0.0), (120.0, 160.0), 10.0);
+        assert_eq!(steps.len(), 20);
+        let (mut at, mut sum) = ((0.0, 0.0), (0.0, 0.0));
+        for ((x, y), (dx, dy)) in &steps {
+            assert!(dx.hypot(*dy) <= 10.0 + 1e-4, "step {dx},{dy}");
+            assert!(
+                (at.0 + dx - x).abs() < 1e-4 && (at.1 + dy - y).abs() < 1e-4,
+                "gap before {x},{y}"
+            );
+            at = (*x, *y);
+            sum = (sum.0 + dx, sum.1 + dy);
+        }
+        assert_eq!(at, (120.0, 160.0));
+        assert!((sum.0 - 120.0).abs() < 1e-3 && (sum.1 - 160.0).abs() < 1e-3);
+        // A pathological one-frame jump stays bounded, and an idle hand has
+        // nothing to push.
+        assert_eq!(liquify_steps((0.0, 0.0), (10_000.0, 0.0), 10.0).len(), 64);
+        assert!(liquify_steps((7.0, 8.0), (7.0, 8.0), 5.0).is_empty());
+    }
+
+    #[test]
+    fn liquify_segment_matches_manual_stepping() {
+        let (w, h) = (96u32, 32u32);
+        let mut doc = Document::new(w, h);
+        let bytes: Vec<u8> = (0..w * h * 4).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let mut manual = doc.clone();
+        let (from, to, size, strength) = ((6.0, 10.0), (84.0, 24.0), 24.0, 0.8);
+        doc.liquify_segment(0, from, to, size, strength);
+        for ((x, y), (dx, dy)) in liquify_steps(from, to, (size * 0.125).max(2.0)) {
+            manual.liquify(0, x, y, dx, dy, size, strength);
+        }
+        assert_eq!(doc.layers[0].pixels, manual.layers[0].pixels);
     }
 
     #[test]

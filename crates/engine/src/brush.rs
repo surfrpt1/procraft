@@ -201,11 +201,14 @@ fn def_pressure_size() -> f32 {
 fn def_pressure_opacity() -> f32 {
     0.6
 }
+// Speed dynamics are off by default, like Procreate: with a mouse speed is
+// the only input, and reacting to it turns every stroke into a thread with
+// blobs wherever the hand paused. Brushes that want speed opt in.
 fn def_velocity_size() -> f32 {
-    0.6
+    0.0
 }
 fn def_velocity_opacity() -> f32 {
-    0.6
+    0.0
 }
 fn def_grain() -> f32 {
     0.0
@@ -254,10 +257,19 @@ fn hash01(x: i32, y: i32) -> f32 {
     (h >> 8) as f32 / 16_777_215.0
 }
 
+/// Grain cell in canvas pixels: `3 * scale`, back off to a third of the
+/// dab. A cell wider than that gives every pixel of a small brush the same
+/// value, so a 2–6 px Chalk mark paints as flat blotches (dashes) instead
+/// of grain; large brushes keep the preset's coarse texture.
+fn grain_cell(size: f32, scale: f32) -> u32 {
+    let base = (3.0 * scale.clamp(0.25, 4.0)).round().max(1.0);
+    let per_dab = (size.max(1.0) / 3.0).floor().max(1.0);
+    base.min(per_dab) as u32
+}
+
 /// Procedural grain sample 0.0..=1.0: one value-noise texel per `cell`
-/// pixel block (`cell` grows with `scale`). No assets, clean-room.
-fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
-    let cell = ((3.0 * scale.clamp(0.25, 4.0)).round() as u32).max(1);
+/// pixel block. No assets, clean-room.
+fn grain_at(px: u32, py: u32, cell: u32) -> f32 {
     hash01((px / cell) as i32, (py / cell) as i32)
 }
 
@@ -286,8 +298,11 @@ fn sample_tip(tip: &BrushTip, tx: f32, ty: f32) -> f32 {
 /// canvas when present, otherwise the procedural noise above. The texture is
 /// magnified by `grain_scale` (larger = coarser), so imported Procreate grain
 /// stays deterministic and canvas-anchored instead of following each dab.
-fn grain_sample(brush: &Brush, px: u32, py: u32) -> f32 {
-    let scale = brush.grain_scale.clamp(0.25, 4.0);
+/// `dab` is the resolved dab size; it narrows the grain cell so small
+/// brushes still get several cells across the mark.
+fn grain_sample(brush: &Brush, px: u32, py: u32, dab: f32) -> f32 {
+    let cell = grain_cell(dab, brush.grain_scale);
+    let scale = brush.grain_scale.clamp(0.25, 4.0).min(cell as f32);
     if let Some(tip) = brush.grain_tip.as_ref() {
         if tip.w > 0 && tip.h > 0 && tip.mask.len() == (tip.w * tip.h) as usize {
             let (sx, sy) = if brush.grain_angle == 0.0 {
@@ -308,7 +323,7 @@ fn grain_sample(brush: &Brush, px: u32, py: u32) -> f32 {
             return tip.mask[ty * tw + tx] as f32 / 255.0;
         }
     }
-    grain_at(px, py, scale)
+    grain_at(px, py, cell)
 }
 
 /// M39 dual-tip multiplier 0.0..=1.0 at canvas offset (`ox`, `oy`) from
@@ -623,6 +638,7 @@ impl Document {
     pub fn end_stroke(&mut self) {
         self.stroke_peak = None;
         self.stroke_rect = None;
+        self.liquify_end();
     }
 
     /// Canvas bbox (inclusive) painted by the active stroke, if any.
@@ -825,7 +841,7 @@ impl Document {
                 let mut a = (falloff * coverage * strength * Document::sel_k(sel_mask, w, px, py))
                     .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 if a <= 0.0 {
                     continue;
@@ -969,7 +985,7 @@ impl Document {
                 let mut a =
                     (texel * strength * Document::sel_k(sel_mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 if a <= 0.0 {
                     continue;
@@ -1096,7 +1112,7 @@ impl Document {
                 let mut fa = (falloff * coverage * strength * Document::sel_k(mask, w, px, py))
                     .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -1245,7 +1261,7 @@ impl Document {
                 }
                 let mut fa = (texel * strength * Document::sel_k(mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -2003,14 +2019,14 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             Brush {
                 size: 24.0,
                 opacity: 1.0,
-                softness: 0.2,
-                spacing: 0.15,
+                softness: 0.12,
+                spacing: 0.12,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.7,
                 pressure_opacity: 0.6,
-                velocity_size: 0.6,
-                velocity_opacity: 0.6,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
                 grain: 0.0,
@@ -2042,22 +2058,22 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             "Marker",
             Brush {
                 size: 28.0,
-                opacity: 0.85,
-                softness: 0.5,
-                spacing: 0.12,
+                opacity: 0.7,
+                softness: 0.05,
+                spacing: 0.06,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.4,
                 pressure_opacity: 0.5,
-                velocity_size: 0.3,
-                velocity_opacity: 0.3,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
                 grain: 0.0,
                 grain_scale: 1.0,
                 grain_tip: None,
                 grain_angle: 0.0,
-                roundness: 0.55,
+                roundness: 0.7,
                 roundness_jitter: 0.0,
                 size_jitter: 0.0,
                 opacity_jitter: 0.0,
@@ -2082,18 +2098,18 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             "Airbrush",
             Brush {
                 size: 64.0,
-                opacity: 0.25,
+                opacity: 0.3,
                 softness: 1.0,
-                spacing: 0.08,
+                spacing: 0.04,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.3,
-                pressure_opacity: 0.9,
-                velocity_size: 0.2,
-                velocity_opacity: 0.3,
+                pressure_size: 0.2,
+                pressure_opacity: 1.0,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.15,
+                grain: 0.0,
                 grain_scale: 1.5,
                 grain_tip: None,
                 grain_angle: 0.0,
@@ -2121,20 +2137,20 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
         (
             "Chalk",
             Brush {
-                size: 18.0,
-                opacity: 0.8,
-                softness: 0.9,
-                spacing: 0.25,
+                size: 22.0,
+                opacity: 1.0,
+                softness: 0.4,
+                spacing: 0.1,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.6,
                 pressure_opacity: 0.6,
-                velocity_size: 0.5,
-                velocity_opacity: 0.5,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.55,
-                grain_scale: 0.7,
+                grain: 0.45,
+                grain_scale: 1.3,
                 grain_tip: None,
                 grain_angle: 0.0,
                 roundness: 1.0,
@@ -2143,7 +2159,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 opacity_jitter: 0.0,
                 angle: 0.0,
                 angle_follow: false,
-                scatter: 0.12,
+                scatter: 0.06,
                 stabilizer: 0.2,
                 blend: super::document::BlendMode::Normal,
                 wet_edge: 0.0,
@@ -3909,8 +3925,14 @@ mod tests {
     }
 
     #[test]
-    fn velocity_thins_and_fades() {
-        let brush = Brush::default(); // velocity 0.6 / 0.6
+    fn velocity_thins_and_fades_when_a_brush_opts_in() {
+        // Speed dynamics moved to opt-in (the default is flat), so the M7
+        // weights are pinned through an explicit brush.
+        let brush = Brush {
+            velocity_size: 0.6,
+            velocity_opacity: 0.6,
+            ..Default::default()
+        };
         let size_full = brush.resolve_size(1.0, 1.0);
         let op_full = brush.resolve_opacity(1.0, 1.0);
         assert!(size_full < brush.size);
@@ -4091,7 +4113,7 @@ mod tests {
         };
         for py in 0..512 {
             for px in 0..512 {
-                let _ = grain_sample(&brush, px, py);
+                let _ = grain_sample(&brush, px, py, 22.0);
             }
         }
     }
@@ -4108,7 +4130,7 @@ mod tests {
         };
         for y in 0..512 {
             for x in 0..512 {
-                let sample = grain_sample(&brush, x, y);
+                let sample = grain_sample(&brush, x, y, 22.0);
                 assert!((0.0..=1.0).contains(&sample));
             }
         }
@@ -4982,8 +5004,186 @@ mod tests {
         // Pre-M39 library JSON has no blend/wet/dual keys: same defaults.
         // Every present key mirrors Brush::default(), so the assertion stays
         // about the absent ones.
-        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.6,"velocity_opacity":0.6,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
+        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.0,"velocity_opacity":0.0,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
         let brush: Brush = serde_json::from_str(old).unwrap();
         assert_eq!(brush, Brush::default());
+    }
+
+    // --- Built-in preset character ---
+    //
+    // A mouse has no pressure sensor, so speed was the only dynamics signal
+    // and every preset thinned into a thread between full-size blobs. These
+    // tests pin the preset character at full pressure and zero speed, which
+    // is exactly what a mouse stroke looks like apart from the speed term.
+
+    fn preset_brush(name: &str) -> Brush {
+        presets()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, b)| b)
+            .unwrap_or_else(|| panic!("no preset named {name}"))
+    }
+
+    /// One straight full-pressure, zero-speed stroke across a fresh document.
+    fn paint_straight(name: &str, w: u32, h: u32) -> Document {
+        paint_straight_brush(&preset_brush(name), w, h)
+    }
+
+    fn paint_straight_brush(brush: &Brush, w: u32, h: u32) -> Document {
+        let mut doc = Document::new(w, h);
+        let d = DabDynamics::default();
+        let y = h as f32 / 2.0;
+        let (x0, x1) = (8.0, w as f32 - 8.0);
+        doc.stroke_to_dyn(brush, Color::rgb(0, 0, 0), None, d, (x0, y), d, 0.0);
+        doc.stroke_to_dyn(
+            brush,
+            Color::rgb(0, 0, 0),
+            Some((x0, y)),
+            d,
+            (x1, y),
+            d,
+            0.0,
+        );
+        doc.end_stroke();
+        doc
+    }
+
+    fn alpha_at(doc: &Document, x: u32, y: u32) -> u8 {
+        doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize)
+    }
+
+    fn partial_rows(doc: &Document, x: u32) -> usize {
+        (0..doc.h)
+            .filter(|&y| {
+                let a = alpha_at(doc, x, y);
+                a > 0 && a < 200
+            })
+            .count()
+    }
+
+    #[test]
+    fn presets_that_used_speed_no_longer_thin_or_fade_with_it() {
+        for name in ["Round", "Marker", "Airbrush", "Chalk"] {
+            let b = preset_brush(name);
+            assert!(
+                (b.resolve_size(1.0, 1.0) - b.resolve_size(1.0, 0.0)).abs() < 1e-4,
+                "{name} still thins with speed"
+            );
+            assert!(
+                (b.resolve_opacity(1.0, 1.0) - b.resolve_opacity(1.0, 0.0)).abs() < 1e-4,
+                "{name} still fades with speed"
+            );
+        }
+    }
+
+    #[test]
+    fn default_brush_paints_the_same_width_at_any_speed() {
+        let b = Brush::default();
+        assert_eq!(b.resolve_size(1.0, 1.0), b.size);
+        assert_eq!(b.resolve_opacity(1.0, 1.0), b.opacity);
+    }
+
+    #[test]
+    fn pencil_and_ink_keep_their_speed_response() {
+        assert!(preset_brush("Pencil").velocity_size > 0.0);
+        assert!(preset_brush("Ink Pen").velocity_size > 0.0);
+    }
+
+    #[test]
+    fn round_preset_draws_one_even_width() {
+        let doc = paint_straight("Round", 200, 60);
+        let col = |x: u32| (0..60).filter(|&y| alpha_at(&doc, x, y) > 0).count();
+        let (a, b, c) = (col(40), col(100), col(160));
+        assert!(b >= 20, "round stroke too thin: {b} px");
+        assert!(
+            (a as i32 - b as i32).abs() <= 2 && (c as i32 - b as i32).abs() <= 2,
+            "round width wanders: {a}/{b}/{c}"
+        );
+    }
+
+    #[test]
+    fn round_preset_keeps_a_crisp_edge() {
+        let doc = paint_straight("Round", 200, 60);
+        let partial = partial_rows(&doc, 100);
+        assert!(partial <= 4, "round rim is soft: {partial} px");
+    }
+
+    #[test]
+    fn marker_preset_lays_a_hard_chisel_band() {
+        let doc = paint_straight("Marker", 240, 80);
+        let width = (0..80).filter(|&y| alpha_at(&doc, 120, y) > 0).count();
+        assert!((14..=24).contains(&width), "marker width {width} px");
+        let core = alpha_at(&doc, 120, 40);
+        assert!(
+            (150..=200).contains(&core),
+            "marker ink should stay translucent, core alpha {core}"
+        );
+        // A hard nib keeps full ink at 80% of its half-width; a soft one has
+        // already faded there. The chisel's top/bottom are a long ellipse
+        // tangent, so the nib is judged across its short axis, not by a
+        // count of rim pixels.
+        let near_rim = alpha_at(&doc, 120, 48);
+        assert!(
+            near_rim as u32 * 10 >= core as u32 * 9,
+            "marker nib is soft: {near_rim} at 80% radius, core {core}"
+        );
+    }
+
+    #[test]
+    fn chalk_preset_keeps_a_continuous_dry_core() {
+        let doc = paint_straight("Chalk", 260, 80);
+        let holes: Vec<u32> = (30..230).filter(|&x| alpha_at(&doc, x, 40) < 110).collect();
+        assert!(holes.is_empty(), "chalk core breaks at {holes:?}");
+        let row: Vec<u8> = (30..230).map(|x| alpha_at(&doc, x, 40)).collect();
+        let (min, max) = (*row.iter().min().unwrap(), *row.iter().max().unwrap());
+        assert!(max - min >= 20, "chalk lost its grain: {min}..{max}");
+    }
+
+    #[test]
+    fn grain_cell_shrinks_with_the_dab() {
+        assert_eq!(grain_cell(22.0, 1.3), 4);
+        assert_eq!(grain_cell(12.0, 1.3), 4);
+        assert_eq!(grain_cell(6.0, 1.3), 2);
+        assert_eq!(grain_cell(3.0, 1.3), 1);
+        for size in 1..=64u32 {
+            for cell in 1..=12u32 {
+                let got = grain_cell(size as f32, cell as f32 / 3.0);
+                assert!(got <= cell, "size {size} cell {cell}: grew to {got}");
+                assert!(
+                    got * 3 <= size.max(3),
+                    "size {size} cell {cell}: {got} is wider than a third of the dab"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chalk_small_size_grain_is_finer_than_the_dab() {
+        let mut brush = preset_brush("Chalk");
+        brush.size = 6.0;
+        let doc = paint_straight_brush(&brush, 200, 40);
+        let sum = |y: u32| -> u32 { (20..180).map(|x| alpha_at(&doc, x, y) as u32).sum() };
+        let core_y = (0..doc.h).max_by_key(|&y| sum(y)).unwrap();
+        let row: Vec<u8> = (20..180).map(|x| alpha_at(&doc, x, core_y)).collect();
+        assert!(row.iter().all(|&a| a >= 100), "chalk 6 px core breaks: {row:?}");
+        let steps = row.windows(2).filter(|p| p[0].abs_diff(p[1]) >= 40).count();
+        assert!(
+            steps >= 25,
+            "chalk 6 px grain too coarse: {steps} steps in {row:?}"
+        );
+    }
+
+    #[test]
+    fn airbrush_preset_is_a_smooth_even_haze() {
+        let doc = paint_straight("Airbrush", 260, 120);
+        let row = |y: u32| -> Vec<i32> {
+            (40..220).map(|x| alpha_at(&doc, x, y) as i32).collect()
+        };
+        let center = row(60);
+        let (min, max) = (*center.iter().min().unwrap(), *center.iter().max().unwrap());
+        assert!(max - min <= 6, "airbrush speckles {min}..{max}");
+        assert!((60..=100).contains(&max), "airbrush core alpha {max}");
+        let off = *row(75).iter().max().unwrap();
+        assert!(off < max, "airbrush has no falloff: {max} on axis, {off} off");
     }
 }

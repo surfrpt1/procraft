@@ -7045,6 +7045,7 @@ impl ProCraftApp {
         self.crop_current = None;
         self.move_from = None;
         self.liquify_from = None;
+        self.doc.liquify_end();
         // M48 pins are canvas-sized state: a new/resized canvas
         // invalidates them (they were seeded at the old dimensions).
         self.xform = XformState::off();
@@ -7612,32 +7613,6 @@ fn tool_ring_size(tool: Tool, brush_size: f32, liquify_size: f32) -> Option<f32>
         Tool::Liquify => Some(liquify_size),
         _ => None,
     }
-}
-
-/// Split one pointer segment into warp pushes no longer than `max_step`,
-/// so a fast drag warps the whole segment in this frame. One capped step
-/// per frame could never catch up with the cursor: the warp trailed the
-/// pointer and the unwarped tail was dropped on release. The 64-push
-/// ceiling keeps a pathological one-frame jump from stalling the frame.
-fn liquify_pushes(
-    from: (f32, f32),
-    to: (f32, f32),
-    max_step: f32,
-) -> Vec<((f32, f32), (f32, f32))> {
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let len = (dx * dx + dy * dy).sqrt();
-    if len == 0.0 {
-        return Vec::new();
-    }
-    let steps = (len / max_step.max(1.0)).ceil().clamp(1.0, 64.0);
-    let mut pushes = Vec::with_capacity(steps as usize);
-    for i in 1..=steps as u32 {
-        let t = i as f32 / steps;
-        let t0 = (i - 1) as f32 / steps;
-        let (sx, sy) = (dx * (t - t0), dy * (t - t0));
-        pushes.push(((from.0 + dx * t, from.1 + dy * t), (sx, sy)));
-    }
-    pushes
 }
 
 /// Top-bar width era. Below [`WIDE_BAR_W`] the zoom/rotate/theme/About
@@ -11405,6 +11380,7 @@ impl eframe::App for ProCraftApp {
                 self.shape_current = None;
                 self.move_from = None;
                 self.liquify_from = None;
+                self.doc.liquify_end();
                 self.fill_preview = None;
                 self.vp_grab = None;
                 self.sym_grab = false;
@@ -12649,28 +12625,32 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = pos {
                             self.doc.checkpoint();
+                            self.doc.liquify_begin(self.doc.active);
                             self.liquify_from = Some(to_canvas(pos));
                         }
                     }
                     if resp.dragged() {
                         if let (Some(from), Some(pos)) = (self.liquify_from, pos) {
                             let to = to_canvas(pos);
-                            // Warp the whole pointer segment every frame.
-                            // Sub-steps cap each push at a quarter of the
-                            // brush radius so fast strokes stay smooth
-                            // instead of tearing holes into the layer.
-                            let max_step = (self.liquify_size * 0.125).max(2.0);
-                            let active = self.doc.active;
-                            let (size, strength) = (self.liquify_size, self.liquify_strength);
-                            for ((x, y), (dx, dy)) in liquify_pushes(from, to, max_step) {
-                                self.doc.liquify(active, x, y, dx, dy, size, strength);
-                                self.ghost_dirty = true;
-                            }
+                            // The engine splits the segment into sub-steps
+                            // (an eighth of the brush size) and warps it
+                            // from the stroke's snapshot, so a fast drag
+                            // neither trails the pointer nor blurs what
+                            // earlier pushes already warped.
+                            self.doc.liquify_segment(
+                                self.doc.active,
+                                from,
+                                to,
+                                self.liquify_size,
+                                self.liquify_strength,
+                            );
+                            self.ghost_dirty = true;
                             self.liquify_from = Some(to);
                         }
                     }
                     if resp.drag_stopped() {
                         self.liquify_from = None;
+                        self.doc.liquify_end();
                         if !self.text_paint_blocked() {
                             self.capture_timelapse();
                             self.status = "Liquified.".to_string();
@@ -13828,39 +13808,6 @@ mod tests {
         assert_eq!(brush_ring_radius(20.0, 2.0), 20.0);
         // Tiny brushes stay visible (2px floor).
         assert_eq!(brush_ring_radius(1.0, 0.5), 2.0);
-    }
-
-    #[test]
-    fn liquify_pushes_cover_the_whole_pointer_segment() {
-        // Within the cap: one push, ending exactly at the pointer.
-        let pushes = liquify_pushes((0.0, 0.0), (3.0, 4.0), 10.0);
-        assert_eq!(pushes.len(), 1);
-        assert_eq!(pushes[0], ((3.0, 4.0), (3.0, 4.0)));
-
-        // A fast move is split so every push stays under the cap, the
-        // pushes chain end-to-end, and the last anchor is the pointer —
-        // nothing is left over for the release to drop.
-        let pushes = liquify_pushes((0.0, 0.0), (120.0, 160.0), 10.0);
-        assert_eq!(pushes.len(), 20);
-        let mut at = (0.0, 0.0);
-        let mut sum = (0.0, 0.0);
-        for ((x, y), (dx, dy)) in &pushes {
-            assert!(dx.hypot(*dy) <= 10.0 + 1e-4, "step {dx},{dy}");
-            assert!(
-                (at.0 + dx - x).abs() < 1e-4 && (at.1 + dy - y).abs() < 1e-4,
-                "gap before {x},{y}"
-            );
-            at = (*x, *y);
-            sum = (sum.0 + dx, sum.1 + dy);
-        }
-        assert_eq!(at, (120.0, 160.0));
-        assert!((sum.0 - 120.0).abs() < 1e-3 && (sum.1 - 160.0).abs() < 1e-3);
-
-        // A pathological one-frame jump stays bounded.
-        assert_eq!(liquify_pushes((0.0, 0.0), (10_000.0, 0.0), 10.0).len(), 64);
-
-        // Idle hand: nothing to push.
-        assert!(liquify_pushes((7.0, 8.0), (7.0, 8.0), 5.0).is_empty());
     }
 
     #[test]
