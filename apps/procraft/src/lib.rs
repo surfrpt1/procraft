@@ -7504,6 +7504,15 @@ fn center_offset(content: egui::Vec2, avail: egui::Vec2) -> egui::Vec2 {
     )
 }
 
+/// The page rect that is drawn and sensed. The layout allocates a
+/// page-sized slot, then the board centring and the touch pan move it;
+/// using the slot as the hit target instead leaves the page's right and
+/// bottom strips (and anything panned) unable to start a stroke.
+fn canvas_page_rect(slot: egui::Rect, avail: egui::Vec2, pan: egui::Vec2) -> egui::Rect {
+    slot.translate(center_offset(slot.size(), avail))
+        .translate(pan)
+}
+
 /// Land the canvas origin on a physical pixel when the view sits on a whole
 /// device-pixel zoom (100 %, 200 % ...). A fractional origin makes the GPU
 /// bilinearly resample every edge on the page — the raster is sharp, the
@@ -11410,16 +11419,19 @@ impl eframe::App for ProCraftApp {
                 });
             }
             canvas_scroll.show(ui, |ui| {
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::click_and_drag());
+                // The slot only sizes the scroll content; `resp` is built
+                // below on the drawn page. Allocating it here with input
+                // sense left the sensor on the un-centred slot, so the
+                // page's right/bottom strips could not start a stroke.
+                let (slot, _) =
+                    ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::hover());
                 // A page that fits floats centred on the board; a zoomed-in
                 // page keeps the viewport origin so panning still works.
-                let rect = rect.translate(center_offset(rect.size(), avail));
                 // Pan applies to the drawn canvas and every overlay/mapping
                 // below (sizes are translation-invariant). At a whole-pixel
                 // zoom the origin lands on a physical pixel: a fractional
                 // one makes the GPU resample every edge on the page.
-                let rect = rect.translate(self.view_offset);
+                let rect = canvas_page_rect(slot, avail, self.view_offset);
                 let rect = egui::Rect::from_min_size(
                     snap_canvas_origin(
                         rect.min,
@@ -11429,6 +11441,11 @@ impl eframe::App for ProCraftApp {
                     ),
                     rect.size(),
                 );
+                // Presses and drags must start on the drawn page: centring
+                // and pan move the artwork after layout, and the scroll
+                // area clips the sensor to the visible part.
+                let resp =
+                    ui.interact(rect, ui.id().with("canvas-page"), Sense::click_and_drag());
                 // Rotation about the view center: canvas (x, y) maps through
                 // the unrotated rect, then spins into place.
                 let ang = self.view_angle;
@@ -14234,6 +14251,29 @@ mod tests {
         assert_eq!(
             center_offset(egui::vec2(1600.0, 1200.0), avail),
             egui::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn page_sensor_covers_the_centred_and_panned_page() {
+        let slot = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
+        let avail = egui::vec2(1000.0, 700.0);
+        let page = canvas_page_rect(slot, avail, egui::Vec2::ZERO);
+        assert_eq!(page.min, egui::pos2(100.0, 100.0));
+        // The far corner of the visible page must accept a stroke start;
+        // the old sensor stayed on the slot and ended at (800, 500).
+        assert!(page.contains(egui::pos2(899.0, 599.0)));
+
+        // Touch pan moves the sensor with the artwork, not the slot.
+        let panned = canvas_page_rect(slot, avail, egui::vec2(30.0, -20.0));
+        assert_eq!(panned.min, egui::pos2(130.0, 80.0));
+        assert_eq!(panned.size(), page.size());
+
+        // A page bigger than the board is not centred: only the pan moves it.
+        let big = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        assert_eq!(
+            canvas_page_rect(big, avail, egui::vec2(-50.0, 0.0)).min,
+            egui::pos2(-50.0, 0.0)
         );
     }
 
