@@ -261,6 +261,80 @@ pub(crate) fn tool_ring_size(tool: Tool, brush_size: f32, liquify_size: f32) -> 
     }
 }
 
+/// Brush settings a paint tool remembers across tool switches. Spacing and
+/// stabilizer stay shared; Liquify carries its own size and strength.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ToolBrush {
+    pub(crate) size: f32,
+    pub(crate) opacity: f32,
+    pub(crate) softness: f32,
+}
+
+/// Per-tool slots behind the live brush. `save` remembers the active tool's
+/// settings, `load` restores a returning tool's own — tools without a slot
+/// (Liquify, Fill, selection, ...) leave the live brush untouched.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ToolBrushes {
+    brush: ToolBrush,
+    eraser: ToolBrush,
+    smudge: ToolBrush,
+}
+
+impl ToolBrushes {
+    /// Seed every slot from the starting brush so the first switch to a
+    /// paint tool lands on the values the user began with.
+    pub(crate) fn new(default: &Brush) -> Self {
+        let slot = ToolBrush {
+            size: default.size,
+            opacity: default.opacity,
+            softness: default.softness,
+        };
+        Self {
+            brush: slot,
+            eraser: slot,
+            smudge: slot,
+        }
+    }
+
+    fn slot_mut(&mut self, tool: Tool) -> Option<&mut ToolBrush> {
+        match tool {
+            Tool::Brush => Some(&mut self.brush),
+            Tool::Eraser => Some(&mut self.eraser),
+            Tool::Smudge => Some(&mut self.smudge),
+            _ => None,
+        }
+    }
+
+    fn slot(&self, tool: Tool) -> Option<&ToolBrush> {
+        match tool {
+            Tool::Brush => Some(&self.brush),
+            Tool::Eraser => Some(&self.eraser),
+            Tool::Smudge => Some(&self.smudge),
+            _ => None,
+        }
+    }
+
+    /// Remember the live brush under `tool`.
+    pub(crate) fn save(&mut self, tool: Tool, live: &Brush) {
+        if let Some(slot) = self.slot_mut(tool) {
+            *slot = ToolBrush {
+                size: live.size,
+                opacity: live.opacity,
+                softness: live.softness,
+            };
+        }
+    }
+
+    /// Adopt `tool`'s stored settings into the live brush.
+    pub(crate) fn load(&self, tool: Tool, live: &mut Brush) {
+        if let Some(slot) = self.slot(tool) {
+            live.size = slot.size;
+            live.opacity = slot.opacity;
+            live.softness = slot.softness;
+        }
+    }
+}
+
 /// Columns for the tools panel: the mobile drawer packs two, and three when
 /// the drawer is shot (landscape) so every tool fits without scrolling; the
 /// desktop dock is always a list.
@@ -271,5 +345,97 @@ pub(crate) fn tool_grid_columns(width: f32, compact: bool, mobile: bool) -> usiz
         3
     } else {
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live(size: f32, opacity: f32, softness: f32) -> Brush {
+        Brush {
+            size,
+            opacity,
+            softness,
+            ..Brush::default()
+        }
+    }
+
+    #[test]
+    fn every_paint_tool_starts_from_the_brush_defaults() {
+        let defaults = Brush::default();
+        let slots = ToolBrushes::new(&defaults);
+        for tool in [Tool::Brush, Tool::Eraser, Tool::Smudge] {
+            let mut b = live(7.0, 0.3, 0.9);
+            slots.load(tool, &mut b);
+            assert_eq!(
+                (b.size, b.opacity, b.softness),
+                (defaults.size, defaults.opacity, defaults.softness),
+                "{tool:?} does not start from the brush defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_tools_restores_each_paint_tools_own_parameters() {
+        let mut slots = ToolBrushes::new(&Brush::default());
+        let mut b = Brush::default();
+
+        slots.save(Tool::Brush, &live(10.0, 0.9, 0.1));
+
+        slots.load(Tool::Eraser, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (24.0, 1.0, 0.2));
+        slots.save(Tool::Eraser, &live(40.0, 0.5, 0.7));
+
+        slots.load(Tool::Smudge, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (24.0, 1.0, 0.2));
+        slots.save(Tool::Smudge, &live(70.0, 0.8, 0.3));
+
+        slots.load(Tool::Brush, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (10.0, 0.9, 0.1));
+        slots.load(Tool::Eraser, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (40.0, 0.5, 0.7));
+        slots.load(Tool::Smudge, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (70.0, 0.8, 0.3));
+    }
+
+    #[test]
+    fn tools_without_a_slot_leave_the_live_brush_alone() {
+        let mut slots = ToolBrushes::new(&Brush::default());
+        let mut b = live(33.0, 0.4, 0.6);
+        for tool in [
+            Tool::Liquify,
+            Tool::Fill,
+            Tool::Select,
+            Tool::Lasso,
+            Tool::Picker,
+            Tool::Move,
+            Tool::Hand,
+            Tool::Crop,
+            Tool::Shapes,
+            Tool::Text,
+        ] {
+            slots.save(tool, &b);
+            slots.load(tool, &mut b);
+            assert_eq!(
+                (b.size, b.opacity, b.softness),
+                (33.0, 0.4, 0.6),
+                "{tool:?} changed the live brush"
+            );
+        }
+    }
+
+    #[test]
+    fn adopting_a_preset_updates_only_the_brush_slot() {
+        let mut slots = ToolBrushes::new(&Brush::default());
+        let eraser = live(40.0, 0.5, 0.7);
+        slots.save(Tool::Eraser, &eraser);
+        slots.save(Tool::Brush, &live(6.0, 0.7, 0.05));
+
+        let mut b = Brush::default();
+        slots.load(Tool::Brush, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (6.0, 0.7, 0.05));
+        slots.load(Tool::Eraser, &mut b);
+        assert_eq!((b.size, b.opacity, b.softness), (40.0, 0.5, 0.7));
     }
 }

@@ -66,13 +66,7 @@ impl ProCraftApp {
     /// strings the toolbar buttons and the old hardwired keys used.
     pub(crate) fn apply_action(&mut self, action: ActionId) {
         match action {
-            ActionId::Tool(t) => {
-                let tool = tool_from_id(t);
-                if tool != Tool::Fill {
-                    self.fill_preview = None;
-                }
-                self.tool = tool;
-            }
+            ActionId::Tool(t) => self.choose_tool(tool_from_id(t)),
             ActionId::Undo => {
                 if self.doc.undo() {
                     self.ghost_dirty = true;
@@ -227,7 +221,7 @@ impl ProCraftApp {
             ui.horizontal(|ui| {
                 ui.add_sized(
                     [150.0, 18.0],
-                    egui::Label::new("Drag on canvas — Brush size"),
+                    egui::Label::new("Drag on canvas — Tool size"),
                 );
                 let cur = self.shortcuts.drag_get(DragActionId::BrushSize);
                 let mut ctrl = cur.ctrl;

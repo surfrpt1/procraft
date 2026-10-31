@@ -109,10 +109,11 @@ pub(crate) fn stroke_steps(len: f32) -> usize {
     (len / 4.0).ceil().clamp(1.0, 64.0) as usize
 }
 
-/// How long one frame may spend stamping a live stroke. A dab is ~35 us on
-/// an 8K canvas, so a full-canvas flick (thousands of dabs) would block for
-/// most of a second if stamped in one frame; past this the batch tail waits
-/// for the next frame (see `pending_pts`).
+/// How long one frame may spend stamping a live stroke. A dab costs time in
+/// proportion to its area (tens of milliseconds for a very large brush), so
+/// a full-canvas flick (thousands of dabs) would block for seconds if
+/// stamped in one frame; past this the batch tail waits for the next frame
+/// (see `pending_pts`).
 pub(crate) const STAMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Seconds between autosave recovery snapshots.
@@ -266,7 +267,7 @@ pub(crate) fn taper_step_with(
             job.brush
                 .taper
                 .distance_factor(to_dist, stroke.total_len - to_dist, job.brush.size);
-        let (_, lo) = doc.stroke_to_dyn(
+        let (_, lo) = doc.stroke_to_dyn_spaced(
             &job.brush,
             job.color,
             segment.from,
@@ -312,7 +313,8 @@ pub(crate) fn flush_stroke_tail(
     for k in 1..=steps {
         let t = k as f32 / steps as f32;
         let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
-        let (l, lo) = doc.stroke_to_dyn(brush, color, *last, dyn_state, p, dyn_state, *leftover);
+        let (l, lo) =
+            doc.stroke_to_dyn_spaced(brush, color, *last, dyn_state, p, dyn_state, *leftover);
         stroke.push(*last, dyn_state, p, dyn_state);
         *last = l;
         *leftover = lo;

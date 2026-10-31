@@ -6,6 +6,9 @@ pub(crate) type SavedSelection = ((u32, u32), Option<(u32, u32, u32, u32)>, Opti
 pub(crate) struct ProCraftApp {
     pub(crate) doc: Document,
     pub(crate) brush: Brush,
+    /// Per-tool copies of size/opacity/softness: switching tools saves the
+    /// live brush and restores the entering tool's own.
+    pub(crate) tool_brushes: ToolBrushes,
     pub(crate) color: [u8; 3],
     pub(crate) tool: Tool,
     pub(crate) theme: Theme,
@@ -332,6 +335,7 @@ impl ProCraftApp {
         let mut app = Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
+            tool_brushes: ToolBrushes::new(&Brush::default()),
             color: [30, 144, 255],
             tool: Tool::Brush,
             theme: Theme::Dark,

@@ -2,8 +2,11 @@ use crate::*;
 
 impl ProCraftApp {
     pub(crate) fn choose_brush(&mut self, slot: BrushSlot, brush: &Brush) {
+        // A preset carries its own settings: adopt them as the Brush
+        // tool's slot, leaving the eraser and smudge slots alone.
+        self.choose_tool(Tool::Brush);
         self.brush = brush.clone();
-        self.tool = Tool::Brush;
+        self.tool_brushes.save(Tool::Brush, &self.brush);
         self.brush_slot = Some(slot);
     }
 

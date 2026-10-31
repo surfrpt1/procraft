@@ -127,6 +127,30 @@ impl Raster {
         Arc::make_mut(arc).as_mut_slice()
     }
 
+    /// Overwrite a whole tile from `bytes` (which must be `tile_len()`
+    /// long). Writing an all-zero tile into an unallocated slot leaves it
+    /// unallocated, matching what a `set` of zeros would do.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tile index is out of range or `bytes` has the wrong
+    /// length; callers always write back a tile they read from this raster.
+    pub(crate) fn write_tile(&mut self, tx: u32, ty: u32, bytes: &[u8]) {
+        assert!(
+            tx < self.tiles_x && ty < self.tiles_y,
+            "tile ({tx},{ty}) outside {}x{}",
+            self.tiles_x,
+            self.tiles_y
+        );
+        assert_eq!(bytes.len(), self.tile_len(), "tile write of wrong length");
+        let idx = (ty * self.tiles_x + tx) as usize;
+        if let Some(arc) = self.tiles[idx].as_mut() {
+            Arc::make_mut(arc).copy_from_slice(bytes);
+        } else if bytes.iter().any(|&b| b != 0) {
+            self.tiles[idx] = Some(Arc::new(bytes.to_vec()));
+        }
+    }
+
     /// Allocated tiles in row-major order: `(tx, ty, bytes)`.
     pub fn allocated_tiles(&self) -> impl Iterator<Item = (u32, u32, &[u8])> {
         self.tiles.iter().enumerate().filter_map(|(i, t)| {
@@ -294,6 +318,89 @@ impl Raster {
                 out[dst..dst + n].copy_from_slice(&tile[src..src + n]);
             }
         }
+    }
+
+    /// Copy `rect` (inclusive, clipped to the canvas) into `out` as dense
+    /// row-major bytes with stride = rect width. Copies whole tile rows, so
+    /// a region read costs one `memcpy` per 256-px segment instead of a
+    /// `get` per byte.
+    pub(crate) fn region_into(&self, rect: (u32, u32, u32, u32), out: &mut Vec<u8>) {
+        out.clear();
+        let (x0, y0, x1, y1) = rect;
+        if x0 > x1 || y0 > y1 || self.is_empty() {
+            return;
+        }
+        let x1 = x1.min(self.w - 1);
+        let y1 = y1.min(self.h - 1);
+        let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let bpp = self.bpp();
+        let rw = (x1 - x0 + 1) as usize;
+        out.resize(rw * (y1 - y0 + 1) as usize * bpp, 0);
+        for ty in y0 / TILE..=y1 / TILE {
+            for tx in x0 / TILE..=x1 / TILE {
+                let Some(tile) = self.tiles[(ty * self.tiles_x + tx) as usize].as_deref() else {
+                    continue;
+                };
+                let gx0 = x0.max(tx * TILE);
+                let gx1 = x1.min(tx * TILE + TILE - 1);
+                let gy0 = y0.max(ty * TILE);
+                let gy1 = y1.min(ty * TILE + TILE - 1);
+                let n = (gx1 - gx0 + 1) as usize * bpp;
+                for gy in gy0..=gy1 {
+                    let src = (((gy % TILE) * TILE + gx0 % TILE) as usize) * bpp;
+                    let dst = ((gy - y0) as usize * rw + (gx0 - x0) as usize) * bpp;
+                    out[dst..dst + n].copy_from_slice(&tile[src..src + n]);
+                }
+            }
+        }
+    }
+
+    /// Write `row` (dense bytes for one row, `bpp` bytes per pixel) starting
+    /// at `x0` on row `y`, skipping bytes that are already identical. Runs
+    /// are split at tile borders and a changed run copies the tile once via
+    /// `Arc::make_mut`. A zero run into an unallocated tile allocates
+    /// nothing. Returns whether any byte changed.
+    pub(crate) fn write_row_changed(&mut self, x0: u32, y: u32, row: &[u8]) -> bool {
+        let bpp = self.bpp();
+        let pixels = row.len() / bpp;
+        if pixels == 0 || y >= self.h {
+            return false;
+        }
+        let ty = y / TILE;
+        let mut changed = false;
+        let mut done = 0usize;
+        while done < pixels {
+            let x = x0 + done as u32;
+            if x >= self.w {
+                break;
+            }
+            let tx = x / TILE;
+            let n = ((TILE - x % TILE) as usize).min(pixels - done) * bpp;
+            let src = &row[done * bpp..done * bpp + n];
+            let off = ((y % TILE) * TILE + x % TILE) as usize * bpp;
+            let slot = (ty * self.tiles_x + tx) as usize;
+            match &mut self.tiles[slot] {
+                Some(arc) => {
+                    // Compare before `make_mut`: an unchanged run must not
+                    // clone a tile that undo or a stroke snapshot shares.
+                    if arc[off..off + n] != *src {
+                        let t = Arc::make_mut(arc);
+                        t[off..off + n].copy_from_slice(src);
+                        changed = true;
+                    }
+                }
+                None => {
+                    if src.iter().any(|&b| b != 0) {
+                        let mut tile = vec![0u8; self.tile_len()];
+                        tile[off..off + n].copy_from_slice(src);
+                        self.tiles[slot] = Some(Arc::new(tile));
+                        changed = true;
+                    }
+                }
+            }
+            done += n / bpp;
+        }
+        changed
     }
 
     /// Replace every tile from a dense buffer sized for this geometry.
@@ -633,6 +740,61 @@ mod tests {
         let mut blank = Raster::mask(600, 2);
         blank.fill_run(1, 0, 600, 0);
         assert_eq!(blank.alloc_bytes(), 0);
+    }
+
+    #[test]
+    fn region_reads_straddle_tiles_and_clip_to_the_canvas() {
+        let (w, h) = (600u32, 300u32); // 3x2 tiles
+        let bytes: Vec<u8> = (0..w * h * 4).map(|i| (i % 253) as u8).collect();
+        let r = Raster::from_dense(w, h, 4, &bytes);
+        let mut out = Vec::new();
+        r.region_into((200, 230, 300, 290), &mut out);
+        let mut want = Vec::new();
+        for y in 230..=290 {
+            for x in 200..=300 {
+                let o = ((y * w + x) * 4) as usize;
+                want.extend_from_slice(&bytes[o..o + 4]);
+            }
+        }
+        assert_eq!(out, want);
+        // Past the right edge the rect stops at 599.
+        r.region_into((590, 0, 700, 0), &mut out);
+        assert_eq!(&out[..], &bytes[(590 * 4) as usize..(600 * 4) as usize]);
+        // An inverted rect copies nothing.
+        r.region_into((5, 5, 4, 4), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn write_row_changed_skips_equal_bytes_and_blank_tiles() {
+        let w = 600u32;
+        let mut r = Raster::rgba(w, 4);
+        let mut row = vec![0u8; (w * 4) as usize];
+        assert!(
+            !r.write_row_changed(0, 1, &row),
+            "an all-zero row allocates nothing"
+        );
+        assert_eq!(r.alloc_bytes(), 0);
+        let at = |x: u32| ((w + x) * 4) as usize;
+        row[..4].copy_from_slice(&[1, 2, 3, 4]);
+        row[(590 * 4) as usize..(590 * 4 + 4) as usize].copy_from_slice(&[5, 6, 7, 8]);
+        assert!(r.write_row_changed(0, 1, &row));
+        assert_eq!(r.get4(at(0)), [1, 2, 3, 4]);
+        assert_eq!(r.get4(at(590)), [5, 6, 7, 8]);
+
+        // The same bytes again change nothing, so shared tiles stay shared.
+        let mut copy = r.clone();
+        assert!(!copy.write_row_changed(0, 1, &row));
+        assert!(r.shares_tile(&copy, 0, 0));
+        assert!(r.shares_tile(&copy, 2, 0));
+
+        // One changed byte copies only the tile it lands in.
+        row[(300 * 4) as usize] = 9;
+        assert!(copy.write_row_changed(0, 1, &row));
+        assert!(r.shares_tile(&copy, 0, 0), "untouched tile stays shared");
+        assert!(!r.shares_tile(&copy, 1, 0), "the written tile was copied");
+        assert_eq!(copy.get4(at(300)), [9, 0, 0, 0]);
+        assert_eq!(r.get4(at(300)), [0; 4], "the snapshot keeps its bytes");
     }
 
     /// Per-pixel reference for the slide rule: `dst(x, y)` takes

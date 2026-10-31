@@ -100,12 +100,17 @@ impl ProCraftApp {
     }
 
     /// Tool switch that also retires a live fill preview, mirroring the
-    /// tool radio list in the Tools panel.
+    /// tool radio list in the Tools panel. The outgoing paint tool keeps
+    /// its own size/opacity/softness and the entering one gets its own back.
     pub(crate) fn choose_tool(&mut self, tool: Tool) {
         if self.tool == Tool::Fill && tool != Tool::Fill {
             self.fill_preview = None;
         }
-        self.tool = tool;
+        if tool != self.tool {
+            self.tool_brushes.save(self.tool, &self.brush);
+            self.tool = tool;
+            self.tool_brushes.load(tool, &mut self.brush);
+        }
     }
 
     /// Clear the active layer as one undoable step. Shared by the desktop

@@ -109,7 +109,7 @@ impl eframe::App for ProCraftApp {
                 self.brush.size = sd.base;
                 self.painting = false;
                 self.last = None;
-                self.status = "Brush size reverted.".to_string();
+                self.status = "Size reverted.".to_string();
             } else {
                 self.doc.clear_selection();
                 self.sel_anchor = None;
@@ -2069,7 +2069,7 @@ impl eframe::App for ProCraftApp {
                         }
                     }
                     if resp.drag_stopped() {
-                        self.status = format!("Brush size {:.0}", self.brush.size);
+                        self.status = format!("Size {:.0}", self.brush.size);
                         self.size_drag = None;
                     }
                     self.painting = false;
@@ -2511,7 +2511,8 @@ impl eframe::App for ProCraftApp {
                                 self.liquify_size,
                                 self.liquify_strength,
                             );
-                            self.ghost_dirty = true;
+                            // Ghosts show the neighbor frames only; warping
+                            // the active frame leaves them untouched.
                             self.liquify_from = Some(to);
                         }
                     }
@@ -3150,7 +3151,7 @@ impl eframe::App for ProCraftApp {
                                         taper: taper_of(from, (sx, sy)),
                                         ..base_dyn
                                     };
-                                    let (last, leftover) = self.doc.stroke_to_dyn(
+                                    let (last, leftover) = self.doc.stroke_to_dyn_spaced(
                                         &brush,
                                         color,
                                         from,
@@ -3178,7 +3179,7 @@ impl eframe::App for ProCraftApp {
                                             taper: taper_of(from, (px, py)),
                                             ..base_dyn
                                         };
-                                        let (last, leftover) = self.doc.stroke_to_dyn(
+                                        let (last, leftover) = self.doc.stroke_to_dyn_spaced(
                                             &brush,
                                             color,
                                             from,

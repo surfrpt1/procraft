@@ -1916,7 +1916,7 @@ fn taper_replay_rewinds_the_live_stroke_and_fades_the_tail() {
     let mut last = None;
     let mut leftover = 0.0;
     for x in [6.0, 14.0, 22.0, 30.0, 38.0, 46.0] {
-        let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
+        let (l, lo) = doc.stroke_to_dyn_spaced(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
         record.push(last, dyn_, (x, 6.0), dyn_);
         last = l;
         leftover = lo;
@@ -1954,7 +1954,8 @@ fn taper_replay_sliced_one_segment_per_frame_matches_one_pass() {
     let mut last = None;
     let mut leftover = 0.0;
     for x in [8.0, 18.0, 28.0, 38.0, 48.0, 58.0, 68.0, 78.0, 88.0] {
-        let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 10.0), dyn_, leftover);
+        let (l, lo) =
+            doc.stroke_to_dyn_spaced(&brush, color, last, dyn_, (x, 10.0), dyn_, leftover);
         record.push(last, dyn_, (x, 10.0), dyn_);
         last = l;
         leftover = lo;
@@ -2002,7 +2003,7 @@ fn taper_replay_stops_when_the_document_moves_on() {
     let mut last = None;
     let mut leftover = 0.0;
     for x in [6.0, 14.0, 22.0, 30.0] {
-        let (l, lo) = doc.stroke_to_dyn(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
+        let (l, lo) = doc.stroke_to_dyn_spaced(&brush, color, last, dyn_, (x, 6.0), dyn_, leftover);
         record.push(last, dyn_, (x, 6.0), dyn_);
         last = l;
         leftover = lo;
@@ -2061,7 +2062,7 @@ fn live_stroke_equals_the_release_replay_outside_the_tail() {
             taper: live_taper_at(&brush, travelled, leg),
             ..Default::default()
         };
-        let (l, lo) = doc.stroke_to_dyn(&brush, color, last, from_dyn, to, to_dyn, leftover);
+        let (l, lo) = doc.stroke_to_dyn_spaced(&brush, color, last, from_dyn, to, to_dyn, leftover);
         record.push(last, from_dyn, to, to_dyn);
         last = l;
         leftover = lo;
@@ -2152,7 +2153,7 @@ fn screenshot_taper_replay_closes_both_tips() {
                 .distance_factor(to_dist, total - to_dist, brush.size),
             ..Default::default()
         };
-        let (l, lo) = doc.stroke_to_dyn(&brush, color, last, from_dyn, to, to_dyn, leftover);
+        let (l, lo) = doc.stroke_to_dyn_spaced(&brush, color, last, from_dyn, to, to_dyn, leftover);
         record.push(last, from_dyn, to, to_dyn);
         last = l;
         leftover = lo;

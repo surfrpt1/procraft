@@ -195,19 +195,69 @@ fn frame_pixel(doc: &Document, src: Option<(&Layer, f32)>, x: u32, y: u32) -> [u
     out
 }
 
+/// The layer and effective base opacity one frame composites.
+fn frame_source(doc: &Document, index: usize) -> Option<(&Layer, f32)> {
+    doc.layers
+        .get(index)
+        .map(|l| (l, l.opacity.clamp(0.0, 1.0) * doc.group_opacity(index)))
+}
+
+/// Whether `layer`'s rasters share the document's geometry, which the dense
+/// band readers assume. Ragged rasters (test data only) take the per-pixel
+/// path, which reads them by their own geometry as it always has.
+fn row_geometry_ok(doc: &Document, layer: &Layer) -> bool {
+    layer.pixels.w() == doc.w
+        && layer.pixels.h() == doc.h
+        && layer
+            .mask
+            .as_ref()
+            .is_none_or(|m| m.w() == doc.w && m.h() == doc.h)
+}
+
+/// Canvas x span of `x0..=x1` that lands inside a layer buffer offset by
+/// `ox`: `(first canvas x, last canvas x, first local x, last local x)`.
+fn visible_span(x0: u32, x1: u32, ox: i32, w: u32) -> Option<(u32, u32, u32, u32)> {
+    if w == 0 {
+        return None;
+    }
+    let lx0 = (x0 as i64 - ox as i64).max(0);
+    let lx1 = (x1 as i64 - ox as i64).min(w as i64 - 1);
+    if lx0 > lx1 {
+        return None;
+    }
+    Some((
+        (lx0 + ox as i64) as u32,
+        (lx1 + ox as i64) as u32,
+        lx0 as u32,
+        lx1 as u32,
+    ))
+}
+
 /// Render one frame: the layer (Normal blend, opacity + group opacity +
 /// reveal mask applied, clipping intentionally ignored — a cel stands
 /// alone) over the page background. Opaque RGBA out. `index` out of range renders the bare
 /// background instead of failing, so playback never panics on a racing
 /// layer delete.
 pub fn rasterize_frame(doc: &Document, index: usize) -> Vec<u8> {
-    let layer = doc.layers.get(index);
-    let src = layer.map(|l| (l, l.opacity.clamp(0.0, 1.0) * doc.group_opacity(index)));
-    let mut out = vec![0u8; (doc.w * doc.h) as usize * 4];
-    for y in 0..doc.h {
-        for x in 0..doc.w {
-            let d = ((y * doc.w + x) * 4) as usize;
-            out[d..d + 4].copy_from_slice(&frame_pixel(doc, src, x, y));
+    if doc.w == 0 || doc.h == 0 {
+        return Vec::new();
+    }
+    rasterize_frame_region(doc, index, 0, 0, doc.w - 1, doc.h - 1)
+}
+
+/// Per-pixel reference for ragged rasters; row reads assume shared geometry.
+fn rasterize_frame_region_per_pixel(
+    doc: &Document,
+    src: Option<(&Layer, f32)>,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            out.extend_from_slice(&frame_pixel(doc, src, x, y));
         }
     }
     out
@@ -228,31 +278,72 @@ pub fn rasterize_frame_region(
     let x1 = x1.min(doc.w.saturating_sub(1));
     let y1 = y1.min(doc.h.saturating_sub(1));
     let (x0, y0) = (x0.min(x1), y0.min(y1));
-    let layer = doc.layers.get(index);
-    let src = layer.map(|l| (l, l.opacity.clamp(0.0, 1.0) * doc.group_opacity(index)));
-    let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            out.extend_from_slice(&frame_pixel(doc, src, x, y));
+    let src = frame_source(doc, index);
+    if src.is_some_and(|(layer, _)| !row_geometry_ok(doc, layer)) {
+        return rasterize_frame_region_per_pixel(doc, src, x0, y0, x1, y1);
+    }
+    let rw = (x1 - x0 + 1) as usize;
+    let mut out = Vec::with_capacity(rw * (y1 - y0 + 1) as usize * 4);
+    let bg_row = doc.background.repeat(rw);
+    for _ in y0..=y1 {
+        out.extend_from_slice(&bg_row);
+    }
+    let Some((layer, op)) = src else {
+        return out;
+    };
+    // The layer's visible band: rows shifted by `oy`, columns by `ox`. Read
+    // it once per tile run instead of a tile lookup per pixel.
+    let ly0 = (y0 as i64 - layer.oy as i64).max(0);
+    let ly1 = (y1 as i64 - layer.oy as i64).min(doc.h as i64 - 1);
+    if ly0 > ly1 {
+        return out;
+    }
+    let Some((cx0, cx1, lx0, lx1)) = visible_span(x0, x1, layer.ox, doc.w) else {
+        return out;
+    };
+    let (cy0, cy1) = (
+        (ly0 + layer.oy as i64) as u32,
+        (ly1 + layer.oy as i64) as u32,
+    );
+    let band_w = (lx1 - lx0 + 1) as usize;
+    let mut px = Vec::new();
+    let mut mask = Vec::new();
+    layer
+        .pixels
+        .region_into((lx0, ly0 as u32, lx1, ly1 as u32), &mut px);
+    let mask_band = match layer.mask.as_ref() {
+        Some(m) => {
+            m.region_into((lx0, ly0 as u32, lx1, ly1 as u32), &mut mask);
+            Some(&mask[..])
+        }
+        None => None,
+    };
+    for (row, y) in (cy0..=cy1).enumerate() {
+        let dst_row = (y - y0) as usize * rw;
+        for x in cx0..=cx1 {
+            let i = row * band_w + (x - cx0) as usize;
+            let p = &px[i * 4..i * 4 + 4];
+            let mut a = p[3] as f32 / 255.0 * op;
+            if let Some(m) = mask_band {
+                a *= m[i] as f32 / 255.0;
+            }
+            if a <= 0.0 {
+                continue;
+            }
+            let d = (dst_row + (x - x0) as usize) * 4;
+            for ch in 0..3 {
+                out[d + ch] =
+                    (p[ch] as f32 * a + doc.background[ch] as f32 * (1.0 - a)).round() as u8;
+            }
+            out[d + 3] = 255;
         }
     }
     out
 }
 
-/// Onion ghost of one frame: layer RGB with alpha scaled by `strength`
-/// (0.0 = invisible), no background — the app tints prev/next and draws
-/// these over the current frame. Out-of-range renders transparent.
-pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
-    let n = (doc.w * doc.h) as usize;
-    let mut out = vec![0u8; n * 4];
-    let strength = strength.clamp(0.0, 1.0);
-    if strength <= 0.0 {
-        return out;
-    }
-    let Some(layer) = doc.layers.get(index) else {
-        return out;
-    };
-    let op = layer.opacity.clamp(0.0, 1.0) * doc.group_opacity(index);
+/// Per-pixel reference for ragged rasters; band reads assume shared geometry.
+fn onion_ghost_per_pixel(doc: &Document, layer: &Layer, op: f32, strength: f32) -> Vec<u8> {
+    let mut out = vec![0u8; (doc.w * doc.h) as usize * 4];
     let (ox, oy) = (layer.ox, layer.oy);
     for y in 0..doc.h {
         for x in 0..doc.w {
@@ -277,6 +368,73 @@ pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
             out[d] = px[0];
             out[d + 1] = px[1];
             out[d + 2] = px[2];
+            out[d + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Onion ghost of one frame: layer RGB with alpha scaled by `strength`
+/// (0.0 = invisible), no background — the app tints prev/next and draws
+/// these over the current frame. Out-of-range renders transparent.
+pub fn onion_ghost(doc: &Document, index: usize, strength: f32) -> Vec<u8> {
+    let n = (doc.w * doc.h) as usize;
+    let mut out = vec![0u8; n * 4];
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return out;
+    }
+    let Some(layer) = doc.layers.get(index) else {
+        return out;
+    };
+    let op = layer.opacity.clamp(0.0, 1.0) * doc.group_opacity(index);
+    if doc.w == 0 || doc.h == 0 {
+        return out;
+    }
+    if !row_geometry_ok(doc, layer) {
+        return onion_ghost_per_pixel(doc, layer, op, strength);
+    }
+    let ly0 = (0i64 - layer.oy as i64).max(0);
+    let ly1 = (doc.h as i64 - 1 - layer.oy as i64).min(doc.h as i64 - 1);
+    if ly0 > ly1 {
+        return out;
+    }
+    let Some((cx0, cx1, lx0, lx1)) = visible_span(0, doc.w - 1, layer.ox, doc.w) else {
+        return out;
+    };
+    let (cy0, cy1) = (
+        (ly0 + layer.oy as i64) as u32,
+        (ly1 + layer.oy as i64) as u32,
+    );
+    let band_w = (lx1 - lx0 + 1) as usize;
+    let mut px = Vec::new();
+    let mut mask = Vec::new();
+    layer
+        .pixels
+        .region_into((lx0, ly0 as u32, lx1, ly1 as u32), &mut px);
+    let mask_band = match layer.mask.as_ref() {
+        Some(m) => {
+            m.region_into((lx0, ly0 as u32, lx1, ly1 as u32), &mut mask);
+            Some(&mask[..])
+        }
+        None => None,
+    };
+    for (row, y) in (cy0..=cy1).enumerate() {
+        let dst_row = y as usize * doc.w as usize;
+        for x in cx0..=cx1 {
+            let i = row * band_w + (x - cx0) as usize;
+            let p = &px[i * 4..i * 4 + 4];
+            let mut a = p[3] as f32 / 255.0 * op * strength;
+            if let Some(m) = mask_band {
+                a *= m[i] as f32 / 255.0;
+            }
+            if a <= 0.0 {
+                continue;
+            }
+            let d = (dst_row + x as usize) * 4;
+            out[d] = p[0];
+            out[d + 1] = p[1];
+            out[d + 2] = p[2];
             out[d + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
@@ -540,6 +698,82 @@ mod tests {
         assert!((half[3] as i32 - 128).abs() <= 1, "{}", half[3]);
         assert!(onion_ghost(&doc, 0, 0.0).iter().all(|&b| b == 0));
         assert!(onion_ghost(&doc, 7, 1.0).iter().all(|&b| b == 0));
+    }
+
+    /// The dense band readers replaced a per-pixel tile lookup; they must
+    /// stay byte-identical to that rule, offset and reveal mask included.
+    fn per_pixel_frame(doc: &Document, index: usize) -> Vec<u8> {
+        let src = frame_source(doc, index);
+        let mut out = vec![0u8; (doc.w * doc.h) as usize * 4];
+        for y in 0..doc.h {
+            for x in 0..doc.w {
+                let d = ((y * doc.w + x) * 4) as usize;
+                out[d..d + 4].copy_from_slice(&frame_pixel(doc, src, x, y));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dense_frame_paths_match_the_per_pixel_reference() {
+        // Straddles tile seams in both axes (600x300 = 3x2 tiles).
+        let mut doc = Document::new(600, 300);
+        doc.background = [17, 34, 51, 255];
+        doc.active = 0;
+        let brush = Brush {
+            size: 64.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(200, 30, 40), 10, 10, 590, 290);
+        let mut mask = crate::Raster::mask(600, 300);
+        for y in 0..300u32 {
+            for x in 0..600u32 {
+                let v = if (x / 7 + y / 5) % 3 == 0 { 40 } else { 230 };
+                mask.set((y * 600 + x) as usize, v);
+            }
+        }
+        doc.layers[0].mask = Some(mask);
+        doc.layers[0].opacity = 0.8;
+        doc.translate_layer(0, 31, -7);
+
+        let want = per_pixel_frame(&doc, 0);
+        assert_eq!(rasterize_frame(&doc, 0), want, "full frame");
+        assert_eq!(
+            rasterize_frame_region(&doc, 0, 0, 0, 599, 299),
+            want,
+            "full region"
+        );
+        let reg = rasterize_frame_region(&doc, 0, 250, 100, 400, 130);
+        assert_eq!(reg.len(), 151 * 31 * 4);
+        for (ry, y) in (100..=130u32).enumerate() {
+            for (rx, x) in (250..=400u32).enumerate() {
+                let ro = (ry * 151 + rx) * 4;
+                let fo = ((y * 600 + x) * 4) as usize;
+                assert_eq!(&reg[ro..ro + 4], &want[fo..fo + 4], "({x},{y})");
+            }
+        }
+
+        let op = doc.layers[0].opacity.clamp(0.0, 1.0) * doc.group_opacity(0);
+        assert_eq!(
+            onion_ghost(&doc, 0, 0.35),
+            onion_ghost_per_pixel(&doc, &doc.layers[0], op, 0.35),
+            "onion ghost"
+        );
+    }
+
+    #[test]
+    fn ragged_layer_geometry_keeps_the_per_pixel_rules() {
+        // A raster narrower than the document reads by its own geometry;
+        // the dense band reader cannot, so it must fall back, not panic.
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels = crate::Raster::from_dense(4, 1, 4, &[9, 8, 7, 200].repeat(4));
+        assert_eq!(rasterize_frame(&doc, 0), per_pixel_frame(&doc, 0));
+        let op = doc.layers[0].opacity.clamp(0.0, 1.0) * doc.group_opacity(0);
+        assert_eq!(
+            onion_ghost(&doc, 0, 1.0),
+            onion_ghost_per_pixel(&doc, &doc.layers[0], op, 1.0)
+        );
     }
 
     #[test]

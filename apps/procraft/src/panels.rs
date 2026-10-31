@@ -103,7 +103,6 @@ impl ProCraftApp {
                     }
                 },
                 |ui| {
-                let was_fill = self.tool == Tool::Fill;
                 // A one-column list on the dock; the mobile drawer packs two
                 // columns, or three when it is shot (landscape) so every tool
                 // fits without scrolling through a half-empty sheet.
@@ -132,8 +131,16 @@ impl ProCraftApp {
                                     egui::vec2(cell_w, row_h),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        ui.radio_value(&mut self.tool, *tool, *label)
-                                            .on_hover_text(hint);
+                                        // Through `choose_tool` so the
+                                        // outgoing tool keeps its settings.
+                                        let mut picked = self.tool;
+                                        if ui
+                                            .radio_value(&mut picked, *tool, *label)
+                                            .on_hover_text(hint)
+                                            .changed()
+                                        {
+                                            self.choose_tool(*tool);
+                                        }
                                     },
                                 );
                             }
@@ -141,12 +148,15 @@ impl ProCraftApp {
                     }
                 } else {
                     for (tool, label, hint) in entries {
-                        ui.radio_value(&mut self.tool, tool, label)
-                            .on_hover_text(hint);
+                        let mut picked = self.tool;
+                        if ui
+                            .radio_value(&mut picked, tool, label)
+                            .on_hover_text(hint)
+                            .changed()
+                        {
+                            self.choose_tool(tool);
+                        }
                     }
-                }
-                if was_fill && self.tool != Tool::Fill {
-                    self.fill_preview = None;
                 }
                 if self.tool == Tool::Fill {
                     let tol_before = self.fill_tolerance;
