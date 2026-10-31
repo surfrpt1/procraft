@@ -401,22 +401,17 @@ impl Document {
                 if o + 3 >= layer.pixels.len() {
                     continue;
                 }
-                let dst_a = layer.pixels[o + 3] as f32 / 255.0;
+                let mut dst = layer.pixels.get4(o);
+                let dst_a = dst[3] as f32 / 255.0;
                 let out_a = cov + dst_a * (1.0 - cov);
                 if out_a > 0.0 {
-                    layer.pixels[o] = ((c[0] as f32 * cov
-                        + layer.pixels[o] as f32 * dst_a * (1.0 - cov))
-                        / out_a)
-                        .round() as u8;
-                    layer.pixels[o + 1] = ((c[1] as f32 * cov
-                        + layer.pixels[o + 1] as f32 * dst_a * (1.0 - cov))
-                        / out_a)
-                        .round() as u8;
-                    layer.pixels[o + 2] = ((c[2] as f32 * cov
-                        + layer.pixels[o + 2] as f32 * dst_a * (1.0 - cov))
-                        / out_a)
-                        .round() as u8;
-                    layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
+                    for ch in 0..3 {
+                        dst[ch] = ((c[ch] as f32 * cov + dst[ch] as f32 * dst_a * (1.0 - cov))
+                            / out_a)
+                            .round() as u8;
+                    }
+                    dst[3] = (out_a * 255.0).round() as u8;
+                    layer.pixels.set4(o, dst);
                 }
             }
         }
@@ -530,7 +525,7 @@ mod tests {
             .draw_text(Color::rgb(255, 0, 0), 4.0, 4.0, 24.0, "Hi")
             .unwrap();
         assert!(w > 0 && h > 0);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         // Half off-canvas: clips, never panics.
         let mut doc2 = Document::new(64, 64);
         doc2.checkpoint();
@@ -541,7 +536,7 @@ mod tests {
         doc3.checkpoint();
         doc3.draw_text(Color::rgb(0, 0, 255), 500.0, 500.0, 24.0, "Far")
             .unwrap();
-        assert!(doc3.layers[0].pixels.iter().all(|&b| b == 0));
+        assert!(doc3.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
         let _ = Brush::default();
     }
 
@@ -553,15 +548,15 @@ mod tests {
         doc.checkpoint();
         doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Nope")
             .unwrap();
-        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
         // Undo restores a painted stroke.
         doc.selection = None;
         doc.checkpoint();
         doc.draw_text(Color::rgb(255, 0, 0), 2.0, 2.0, 20.0, "Yep")
             .unwrap();
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         assert!(doc.undo());
-        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -693,7 +688,14 @@ mod tests {
             &style,
         )
         .unwrap();
-        let count = |d: &Document| d.layers[0].pixels.chunks(4).filter(|p| p[3] != 0).count();
+        let count = |d: &Document| {
+            d.layers[0]
+                .pixels
+                .to_dense()
+                .chunks(4)
+                .filter(|p| p[3] != 0)
+                .count()
+        };
         assert!(count(&b) > count(&a));
     }
 
@@ -715,7 +717,7 @@ mod tests {
         assert_eq!(idx, before);
         assert!(w > 0 && h > 0);
         // Pixels were rendered from the block.
-        let px = |x: u32, y: u32| doc.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        let px = |x: u32, y: u32| doc.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3);
         assert!((0..64).any(|x| (0..64).any(|y| px(x, y) > 0)));
         // Layer is active and stores the block (with block size filled in).
         assert_eq!(doc.active, idx);
@@ -763,9 +765,8 @@ mod tests {
         assert!(!doc.undo());
         // And crucially the fresh text layer is untouched.
         assert_eq!(doc.layers[idx].pixels, snap);
-        assert!((0..64)
-            .any(|x| (0..64)
-                .any(|y| { doc.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3] > 0 })));
+        assert!((0..64).any(|x| (0..64)
+            .any(|y| { doc.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3) > 0 })));
         assert!(w > 0 && h > 0);
     }
 
@@ -795,8 +796,9 @@ mod tests {
         let t = doc.layers[idx].text.as_ref().unwrap();
         assert_eq!((w, h), (t.w, t.h));
         // The old location is cleared (whole layer repaints from scratch).
-        let px =
-            |d: &Document, x: u32, y: u32| d.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        let px = |d: &Document, x: u32, y: u32| {
+            d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3)
+        };
         assert!((0..50).all(|x| (0..50).all(|y| px(&doc, x, y) == 0)));
         // The new location paints.
         assert!((88..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
@@ -813,8 +815,9 @@ mod tests {
             t.x = 90.0;
         }
         doc.rerender_text_layer(idx).unwrap();
-        let px =
-            |d: &Document, x: u32, y: u32| d.layers[idx].pixels[((y * 200 + x) * 4) as usize + 3];
+        let px = |d: &Document, x: u32, y: u32| {
+            d.layers[idx].pixels.get(((y * 200 + x) * 4) as usize + 3)
+        };
         assert!((90..140).any(|x| (8..70).any(|y| px(&doc, x, y) > 0)));
         assert!(doc.undo());
         // Pixels AND the block revert together.

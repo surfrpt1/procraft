@@ -42,7 +42,10 @@ pub fn should_flush_zoom(dirty: bool, last_change: f64, now: f64) -> bool {
     dirty && now - last_change >= ZOOM_FLUSH_SECS
 }
 
-/// Platform settings directory (created lazily on save).
+/// Platform settings directory (created lazily on save). Never `None`:
+/// a device without the usual env vars or an Activity data dir (cold
+/// boot before JNI hands it over, stripped Android images) falls back to
+/// the temp dir so preferences degrade instead of silently vanishing.
 pub fn settings_dir() -> Option<std::path::PathBuf> {
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
@@ -53,10 +56,14 @@ pub fn settings_dir() -> Option<std::path::PathBuf> {
                 dir.push("procraft");
                 dir
             })
+            .or_else(|| Some(temp_fallback()))
     }
     #[cfg(target_os = "android")]
     {
-        ANDROID_DATA_DIR.get().cloned()
+        ANDROID_DATA_DIR
+            .get()
+            .cloned()
+            .or_else(|| Some(temp_fallback()))
     }
     #[cfg(target_os = "ios")]
     {
@@ -66,7 +73,19 @@ pub fn settings_dir() -> Option<std::path::PathBuf> {
                 dir.push("Documents");
                 dir
             })
+            .or_else(|| Some(temp_fallback()))
     }
+}
+
+/// Last-resort settings root, with the reason logged so a lost path is
+/// visible in `logcat`/`stderr` rather than silent.
+fn temp_fallback() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("procraft");
+    eprintln!(
+        "ProCraft: no platform settings directory; using {}",
+        dir.display()
+    );
+    dir
 }
 
 #[cfg(target_os = "android")]
@@ -95,7 +114,7 @@ pub fn read(dir: &std::path::Path) -> Result<Settings, String> {
 pub fn save_now(dir: &std::path::Path, s: &Settings) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let path = settings_path(dir);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_file_name(format!("{SETTINGS_FILE}.tmp"));
     std::fs::write(&tmp, s.to_json_pretty()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
@@ -105,7 +124,7 @@ pub fn save_now(dir: &std::path::Path, s: &Settings) -> Result<(), String> {
 /// quarantine path, or None when the file could not be moved.
 pub fn quarantine(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let path = settings_path(dir);
-    let bad = path.with_extension("json.bad");
+    let bad = path.with_file_name(format!("{SETTINGS_FILE}.bad"));
     let _ = std::fs::remove_file(&bad);
     std::fs::rename(&path, &bad).ok().map(|_| bad)
 }
@@ -136,5 +155,35 @@ mod tests {
         assert_eq!(settings_path(d), d.join("settings.json"));
         assert_eq!(SETTINGS_FILE, "settings.json");
         assert_eq!(MARKER_KEY, "m49_seeded");
+    }
+
+    #[test]
+    fn settings_dir_never_returns_none() {
+        // A device with no APPDATA/HOME and no Activity data dir still
+        // gets a usable root so preferences degrade instead of vanishing.
+        assert!(settings_dir().is_some());
+    }
+
+    #[test]
+    fn save_now_round_trips_through_a_sibling_temp_file() {
+        let dir = std::env::temp_dir().join(format!("procraft-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Settings {
+            zoom: 2.5,
+            ..Settings::default()
+        };
+        save_now(&dir, &s).unwrap();
+        assert!(dir.join(SETTINGS_FILE).is_file());
+        // The temp file is renamed over the real one, not left behind.
+        assert!(!dir.join(format!("{SETTINGS_FILE}.tmp")).exists());
+        assert_eq!(read(&dir).unwrap().zoom, 2.5);
+        // Quarantine moves the file aside to a sibling `.bad`.
+        let bad = quarantine(&dir).unwrap();
+        assert_eq!(
+            bad.file_name().unwrap().to_string_lossy(),
+            format!("{SETTINGS_FILE}.bad")
+        );
+        assert!(!dir.join(SETTINGS_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

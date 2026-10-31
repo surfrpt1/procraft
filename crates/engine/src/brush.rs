@@ -1,6 +1,7 @@
 //! Soft-round brush engine: colors, dab stamping and stroke interpolation.
 
-use super::document::Document;
+use super::document::{Document, SymmetryMode};
+use crate::raster::TILE;
 
 /// RGBA color, 0..=255 per channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +31,9 @@ impl BrushTip {
         if w == 0 || h == 0 || w > MAX_TIP_SIDE || h > MAX_TIP_SIDE {
             return Err("brush tip has bad dimensions".to_string());
         }
-        if mask.len() != (w * h) as usize {
+        // `MAX_TIP_SIDE` already bounds the product; the checked form
+        // keeps a malformed tip an error rather than a wrapped length.
+        if (w as usize).checked_mul(h as usize) != Some(mask.len()) {
             return Err("brush tip has corrupt pixels".to_string());
         }
         if mask.iter().all(|&b| b == 0) {
@@ -94,6 +97,9 @@ pub struct Taper {
     pub pressure: f32,
 }
 
+/// Taper span in brush diameters: at 1.0, an end fades over six widths.
+pub const TAPER_DIAMETERS: f32 = 6.0;
+
 impl Default for Taper {
     fn default() -> Self {
         Self::NONE
@@ -134,6 +140,33 @@ impl Taper {
             1.0
         };
         let f = rise.min(fall);
+        self.shape_of(f)
+    }
+
+    /// Taper factor from canvas distances: `from_start` travelled so far
+    /// and `to_end` still to go, for a brush `size` px wide. Each end fades
+    /// over `start`/`end` × [`TAPER_DIAMETERS`] brush diameters, so live
+    /// dabs need no final stroke length and the release replay reproduces
+    /// them exactly.
+    pub fn distance_factor(&self, from_start: f32, to_end: f32, size: f32) -> f32 {
+        let span = size.max(1.0) * TAPER_DIAMETERS;
+        let rise = ramp(from_start, self.start, span);
+        let fall = ramp(to_end, self.end, span);
+        self.shape_of(rise.min(fall))
+    }
+
+    /// Live taper for a dab at `from_start` px into the stroke. Only the
+    /// start ramp is known while the pen is down; the end ramp needs the
+    /// final length and is applied once on release ([`distance_factor`]).
+    /// Passing 0 for the end here would apply the *full* end ramp to every
+    /// live dab, so the stroke would be painted thin while drawing and
+    /// repainted at full width on lift.
+    pub fn live_factor(&self, from_start: f32, size: f32) -> f32 {
+        let span = size.max(1.0) * TAPER_DIAMETERS;
+        self.shape_of(ramp(from_start, self.start, span))
+    }
+
+    fn shape_of(&self, f: f32) -> f32 {
         let smooth = f * f * (3.0 - 2.0 * f);
         f + (smooth - f) * clamp01(self.shape)
     }
@@ -153,6 +186,16 @@ fn clamp01(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
 }
 
+/// One taper ramp: 0 at the tip, 1 once `dist` reaches `amount` × `span`.
+/// `amount` 0 means that end of the stroke has no taper.
+fn ramp(dist: f32, amount: f32, span: f32) -> f32 {
+    if amount <= 0.0 {
+        1.0
+    } else {
+        (dist / (clamp01(amount) * span)).clamp(0.0, 1.0)
+    }
+}
+
 // serde defaults for the fields added in M14: old `.pcbrush` files without
 // these keys load with the same values as `Brush::default()`.
 fn def_pressure_size() -> f32 {
@@ -161,11 +204,14 @@ fn def_pressure_size() -> f32 {
 fn def_pressure_opacity() -> f32 {
     0.6
 }
+// Speed dynamics are off by default, like Procreate: with a mouse speed is
+// the only input, and reacting to it turns every stroke into a thread with
+// blobs wherever the hand paused. Brushes that want speed opt in.
 fn def_velocity_size() -> f32 {
-    0.6
+    0.0
 }
 fn def_velocity_opacity() -> f32 {
-    0.6
+    0.0
 }
 fn def_grain() -> f32 {
     0.0
@@ -214,19 +260,52 @@ fn hash01(x: i32, y: i32) -> f32 {
     (h >> 8) as f32 / 16_777_215.0
 }
 
+/// Grain cell in canvas pixels: `3 * scale`, back off to a third of the
+/// dab. A cell wider than that gives every pixel of a small brush the same
+/// value, so a 2–6 px Chalk mark paints as flat blotches (dashes) instead
+/// of grain; large brushes keep the preset's coarse texture.
+fn grain_cell(size: f32, scale: f32) -> u32 {
+    let base = (3.0 * scale.clamp(0.25, 4.0)).round().max(1.0);
+    let per_dab = (size.max(1.0) / 3.0).floor().max(1.0);
+    base.min(per_dab) as u32
+}
+
 /// Procedural grain sample 0.0..=1.0: one value-noise texel per `cell`
-/// pixel block (`cell` grows with `scale`). No assets, clean-room.
-fn grain_at(px: u32, py: u32, scale: f32) -> f32 {
-    let cell = ((3.0 * scale.clamp(0.25, 4.0)).round() as u32).max(1);
+/// pixel block. No assets, clean-room.
+fn grain_at(px: u32, py: u32, cell: u32) -> f32 {
     hash01((px / cell) as i32, (py / cell) as i32)
+}
+
+/// Bilinear tap of an imported stamp tip at texel-space `(tx, ty)`.
+/// Texels outside the tip read as transparent, so scaled tips keep a
+/// soft edge instead of blocky nearest-neighbour steps.
+fn sample_tip(tip: &BrushTip, tx: f32, ty: f32) -> f32 {
+    let x = tx - 0.5;
+    let y = ty - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let mut acc = 0.0;
+    for (dy, wy) in [(0.0, 1.0 - fy), (1.0, fy)] {
+        for (dx, wx) in [(0.0, 1.0 - fx), (1.0, fx)] {
+            let (ix, iy) = (x0 + dx, y0 + dy);
+            if ix < 0.0 || iy < 0.0 || ix >= tip.w as f32 || iy >= tip.h as f32 {
+                continue;
+            }
+            acc += tip.mask[(iy as u32 * tip.w + ix as u32) as usize] as f32 / 255.0 * wx * wy;
+        }
+    }
+    acc
 }
 
 /// Grain sample 0.0..=1.0: an imported grayscale texture tiled across the
 /// canvas when present, otherwise the procedural noise above. The texture is
 /// magnified by `grain_scale` (larger = coarser), so imported Procreate grain
 /// stays deterministic and canvas-anchored instead of following each dab.
-fn grain_sample(brush: &Brush, px: u32, py: u32) -> f32 {
-    let scale = brush.grain_scale.clamp(0.25, 4.0);
+/// `dab` is the resolved dab size; it narrows the grain cell so small
+/// brushes still get several cells across the mark.
+fn grain_sample(brush: &Brush, px: u32, py: u32, dab: f32) -> f32 {
+    let cell = grain_cell(dab, brush.grain_scale);
+    let scale = brush.grain_scale.clamp(0.25, 4.0).min(cell as f32);
     if let Some(tip) = brush.grain_tip.as_ref() {
         if tip.w > 0 && tip.h > 0 && tip.mask.len() == (tip.w * tip.h) as usize {
             let (sx, sy) = if brush.grain_angle == 0.0 {
@@ -247,7 +326,7 @@ fn grain_sample(brush: &Brush, px: u32, py: u32) -> f32 {
             return tip.mask[ty * tw + tx] as f32 / 255.0;
         }
     }
-    grain_at(px, py, scale)
+    grain_at(px, py, cell)
 }
 
 /// M39 dual-tip multiplier 0.0..=1.0 at canvas offset (`ox`, `oy`) from
@@ -282,24 +361,43 @@ fn wet_boost(fa: f32, wet: f32) -> f32 {
 /// M39 dab composite: the blend mode mixes brush color with the
 /// backdrop, then alpha composites source-over. Normal reproduces the
 /// classic path bit-for-bit; the eraser keeps destination-out upstream.
-fn composite_dab(
-    pixels: &mut [u8],
-    o: usize,
+fn composite_dab_px(
+    dst: [u8; 4],
     color: [u8; 4],
     src_a: f32,
     mode: super::document::BlendMode,
-) {
-    let dst_a = pixels[o + 3] as f32 / 255.0;
+) -> Option<[u8; 4]> {
+    let dst_a = dst[3] as f32 / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
     if out_a <= 0.0 {
-        return;
+        return None;
     }
+    let mut out = dst;
     for ch in 0..3 {
-        let b = mode.apply(color[ch] as f32, pixels[o + ch] as f32);
-        pixels[o + ch] =
-            ((b * src_a + pixels[o + ch] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
+        let b = mode.apply(color[ch] as f32, dst[ch] as f32);
+        out[ch] = ((b * src_a + dst[ch] as f32 * dst_a * (1.0 - src_a)) / out_a).round() as u8;
     }
-    pixels[o + 3] = (out_a * 255.0).round() as u8;
+    out[3] = (out_a * 255.0).round() as u8;
+    Some(out)
+}
+
+/// Canvas columns of `x0..=x1` whose layer slot column (`px - off`) is in
+/// `0..w`, inclusive. `None` when the layer does not reach the dab.
+pub(crate) fn slot_span(x0: u32, x1: u32, off: i32, w: u32) -> Option<(u32, u32)> {
+    let lo = (off.max(0) as u32).max(x0);
+    let hi = ((off as i64 + w as i64 - 1).max(0) as u32).min(x1);
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// The layer slot row for canvas row `py`, if the layer covers it.
+pub(crate) fn slot_row(py: u32, off: i32, h: u32) -> Option<u32> {
+    let ly = py as i64 - off as i64;
+    (0..h as i64).contains(&ly).then_some(ly as u32)
+}
+
+/// Buffer column of a canvas column inside a [`slot_span`] range.
+pub(crate) fn slot_x(px: u32, off: i32) -> u32 {
+    (px as i64 - off as i64) as u32
 }
 
 /// Brush shape settings. All original math: a radial falloff stamp laid down
@@ -432,7 +530,10 @@ impl Default for Brush {
         Self {
             size: 24.0,
             opacity: 1.0,
-            softness: 0.6,
+            // Hard-ish by convention: a brush you cannot see the edge of
+            // reads as out of focus, and every paint app ships its default
+            // round around 80% hardness. Softness is one slider away.
+            softness: 0.2,
             spacing: 0.15,
             eraser: false,
             tip: None,
@@ -544,6 +645,57 @@ fn sample_curve(curve: &[[f32; 2]], pressure: f32) -> f32 {
 }
 
 impl Document {
+    /// Open a stroke scope: the per-pixel coverage peak resets, so the next
+    /// dabs measure against a clean slate. Stroke walkers call this at the
+    /// first segment; call it directly after an explicit lift.
+    pub fn begin_stroke(&mut self) {
+        self.stroke_peak = Some(crate::raster::Raster::mask(self.w, self.h));
+        self.stroke_rect = None;
+    }
+
+    /// Close the active stroke: the next dab opens a fresh one (and the
+    /// peak raster is freed).
+    pub fn end_stroke(&mut self) {
+        self.stroke_peak = None;
+        self.stroke_rect = None;
+        self.liquify_end();
+    }
+
+    /// Canvas bbox (inclusive) painted by the active stroke, if any.
+    pub fn stroke_rect(&self) -> Option<(u32, u32, u32, u32)> {
+        self.stroke_rect
+    }
+
+    /// Increment that lifts a pixel's stroke coverage from `seen` to
+    /// `target` (both 0..=255). Source-over is sequential, so the second
+    /// pass has to close the *remaining* gap: `(target - seen) / (1 - seen)`.
+    /// Straight subtraction leaves the stroke short of its target (a soft
+    /// brush plateaus around two thirds of its opacity).
+    fn stroke_delta(target: u8, seen: u8) -> u8 {
+        if target <= seen {
+            return 0;
+        }
+        let gap = (target - seen) as u32;
+        let left = (255 - seen) as u32;
+        ((gap * 255 + left / 2) / left) as u8
+    }
+
+    /// Grow a stroke bbox (inclusive) from a dab's canvas bounds. A free
+    /// function so dab loops can pass the field alone, keeping the layers
+    /// borrow disjoint.
+    fn grow_stroke_rect(
+        rect: &mut Option<(u32, u32, u32, u32)>,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) {
+        *rect = Some(match *rect {
+            Some((ax, ay, bx, by)) => (ax.min(x0), ay.min(y0), bx.max(x1), by.max(y1)),
+            None => (x0, y0, x1, y1),
+        });
+    }
+
     /// Stamp one dab centered at canvas pixel `(x, y)` on the active layer,
     /// mirrored per [`Document::symmetry`].
     /// Pixels outside [`Document::selection`] (when set) are skipped.
@@ -552,6 +704,9 @@ impl Document {
     /// mask value, the eraser reveals). Shapes, fills and flood fill always
     /// paint color.
     pub fn dab(&mut self, brush: &Brush, color: Color, x: f32, y: f32) {
+        // A lone dab is its own stroke: without a fresh peak, repeated taps
+        // would keep folding into the previous gesture's coverage map.
+        self.begin_stroke();
         // Single dabs (stroke starts, shape taps) paint at full pressure:
         // resolve(1, 0) returns exactly size/opacity, angle 0 keeps the
         // dab round unless the preset squeezes it.
@@ -641,10 +796,11 @@ impl Document {
         if self.layers[self.active].mask.is_none() {
             self.add_mask(self.active);
         }
-        let x0 = (x - radius).floor().max(0.0) as u32;
-        let y0 = (y - radius).floor().max(0.0) as u32;
-        let x1 = (x + radius).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
-        let y1 = (y + radius).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
+        // One extra pixel each way for the anti-aliasing rim.
+        let x0 = (x - radius - 1.0).floor().max(0.0) as u32;
+        let y0 = (y - radius - 1.0).floor().max(0.0) as u32;
+        let x1 = (x + radius + 1.0).ceil().min(w_u32 as f32 - 1.0).max(0.0) as u32;
+        let y1 = (y + radius + 1.0).ceil().min(h_u32 as f32 - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -664,18 +820,32 @@ impl Document {
             let c = color.0;
             (299.0 * c[0] as f32 + 587.0 * c[1] as f32 + 114.0 * c[2] as f32) / 1000.0
         };
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let mut peak = self.stroke_peak.as_mut();
         let edge = brush.softness.clamp(0.0, 1.0);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
-        let bh = h_u32 as i32;
         let round = dab_roundness(brush, x, y);
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
         let Some(layer_mask) = self.layers[active].mask.as_mut() else {
             return;
         };
+        // Rows load and store as dense runs: one copy per tile segment
+        // instead of a tile lookup per byte.
+        let mut row = Vec::new();
+        let mut prow = Vec::new();
         for py in y0..=y1 {
-            for px in x0..=x1 {
+            let (Some((lo, hi)), Some(ly)) = (slot_span(x0, x1, lox, w), slot_row(py, loy, h_u32))
+            else {
+                continue;
+            };
+            layer_mask.region_into((slot_x(lo, lox), ly, slot_x(hi, lox), ly), &mut row);
+            if let Some(p) = peak.as_deref_mut() {
+                p.region_into((lo, py, hi, py), &mut prow);
+            }
+            for px in lo..=hi {
+                let gx = (px - lo) as usize;
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
                         continue;
@@ -691,40 +861,48 @@ impl Document {
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                 let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
                 let d = (u * u + v * v).sqrt() / radius;
-                if d > 1.0 {
+                if d > 1.0 + 0.5 / radius {
                     continue;
                 }
-                let falloff = if d <= 1.0 - edge {
+                let falloff = if edge <= 0.0 || d <= 1.0 - edge {
                     1.0
                 } else {
-                    1.0 - (d - (1.0 - edge)) / edge.max(0.001)
+                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
-                let mut a =
-                    (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(sel_mask, w, px, py))
-                        .clamp(0.0, 1.0);
+                let coverage = ((1.0 - d) * radius + 0.5).clamp(0.0, 1.0);
+                let mut a = (falloff * coverage * strength * Document::sel_k(sel_mask, w, px, py))
+                    .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 if a <= 0.0 {
                     continue;
                 }
-                // Store at the layer-offset slot (paint lands shifted on
-                // moved layers, exactly where the composite reads it).
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = (ly as u32 * w + lx as u32) as usize;
-                if o >= layer_mask.len() {
-                    continue;
-                }
-                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+                // Mask coverage telescopes like Normal paint: the strongest
+                // dab this stroke sets the pixel, later dabs add nothing.
+                let a = match peak.as_deref_mut() {
+                    Some(_) => {
+                        let seen = prow[gx];
+                        let da = (a * 255.0).round() as u8;
+                        if da <= seen {
+                            continue;
+                        }
+                        prow[gx] = da;
+                        Document::stroke_delta(da, seen) as f32 / 255.0
+                    }
+                    None => a,
+                };
+                row[gx] = (value * a + row[gx] as f32 * (1.0 - a)).round() as u8;
+            }
+            let _ = layer_mask.write_row_changed(slot_x(lo, lox), ly, &row);
+            if let Some(p) = peak.as_deref_mut() {
+                let _ = p.write_row_changed(lo, py, &prow);
             }
         }
     }
 
-    /// Mask dab through an imported stamp tip (nearest-neighbor at brush
-    /// size, like [`Document::dab_stamp`] but writing luminance).
+    /// Mask dab through an imported stamp tip (bilinear at brush size, like
+    /// [`Document::dab_stamp`] but writing luminance).
     #[allow(clippy::too_many_arguments)]
     fn dab_mask_stamp_resolved(
         &mut self,
@@ -791,7 +969,8 @@ impl Document {
         let round = dab_roundness(brush, x, y);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
-        let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let mut peak = self.stroke_peak.as_mut();
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
         let half_w = size * 0.5;
@@ -799,8 +978,19 @@ impl Document {
         let Some(layer_mask) = self.layers[active].mask.as_mut() else {
             return;
         };
+        let mut row = Vec::new();
+        let mut prow = Vec::new();
         for py in y0..=y1 {
-            for px in x0..=x1 {
+            let (Some((lo, hi)), Some(ly)) = (slot_span(x0, x1, lox, w), slot_row(py, loy, h_u32))
+            else {
+                continue;
+            };
+            layer_mask.region_into((slot_x(lo, lox), ly, slot_x(hi, lox), ly), &mut row);
+            if let Some(p) = peak.as_deref_mut() {
+                p.region_into((lo, py, hi, py), &mut prow);
+            }
+            for px in lo..=hi {
+                let gx = (px - lo) as usize;
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
                         continue;
@@ -820,31 +1010,37 @@ impl Document {
                 } else {
                     (ox, oy / round)
                 };
-                let tx = ((rx + half_w) / scale) as i32;
-                let ty = ((ry + half_h) / scale) as i32;
-                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                let texel = sample_tip(tip, (rx + half_w) / scale, (ry + half_h) / scale);
+                if texel <= 0.0 {
                     continue;
                 }
-                let mut a = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength
-                    * Document::sel_k(sel_mask, w, px, py))
-                .clamp(0.0, 1.0);
+                let mut a =
+                    (texel * strength * Document::sel_k(sel_mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    a *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 if a <= 0.0 {
                     continue;
                 }
-                // Store at the layer-offset slot (see parametric mask dab).
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = (ly as u32 * w + lx as u32) as usize;
-                if o >= layer_mask.len() {
-                    continue;
-                }
-                layer_mask[o] = (value * a + layer_mask[o] as f32 * (1.0 - a)).round() as u8;
+                // Mask coverage telescopes like Normal paint (see the round
+                // mask dab).
+                let a = match peak.as_deref_mut() {
+                    Some(_) => {
+                        let seen = prow[gx];
+                        let da = (a * 255.0).round() as u8;
+                        if da <= seen {
+                            continue;
+                        }
+                        prow[gx] = da;
+                        Document::stroke_delta(da, seen) as f32 / 255.0
+                    }
+                    None => a,
+                };
+                row[gx] = (value * a + row[gx] as f32 * (1.0 - a)).round() as u8;
+            }
+            let _ = layer_mask.write_row_changed(slot_x(lo, lox), ly, &row);
+            if let Some(p) = peak.as_deref_mut() {
+                let _ = p.write_row_changed(lo, py, &prow);
             }
         }
     }
@@ -870,10 +1066,12 @@ impl Document {
         if strength <= 0.0 || size <= 0.0 || self.layers.get(self.active).is_none() {
             return;
         }
-        let x0 = (x - radius).floor().max(0.0) as u32;
-        let y0 = (y - radius).floor().max(0.0) as u32;
-        let x1 = (x + radius).ceil().min(w - 1.0).max(0.0) as u32;
-        let y1 = (y + radius).ceil().min(h - 1.0).max(0.0) as u32;
+        // One extra pixel each way: the anti-aliasing rim reaches half a
+        // pixel past the geometric disc.
+        let x0 = (x - radius - 1.0).floor().max(0.0) as u32;
+        let y0 = (y - radius - 1.0).floor().max(0.0) as u32;
+        let x1 = (x + radius + 1.0).ceil().min(w - 1.0).max(0.0) as u32;
+        let y1 = (y + radius + 1.0).ceil().min(h - 1.0).max(0.0) as u32;
         self.mark_dirty(x0, y0, x1, y1);
         let selection = self.selection;
         let active = self.active;
@@ -889,10 +1087,32 @@ impl Document {
         let w = w_u32;
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
-        let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        // Normal-blend paint and the eraser telescope: a pixel keeps its
+        // strongest dab this stroke, so overlapping dabs stop summing past
+        // the brush opacity. Other blends fold per dab, as defined.
+        let track = brush.eraser || brush.blend == super::document::BlendMode::Normal;
+        let mut peak = self.stroke_peak.as_mut().filter(|_| track);
         let layer = &mut self.layers[active];
+        let edge = brush.softness.clamp(0.0, 1.0);
+        let round = dab_roundness(brush, x, y);
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+        let grain = clamp01(brush.grain);
+        let mut row = Vec::new();
+        let mut prow = Vec::new();
         for py in y0..=y1 {
-            for px in x0..=x1 {
+            let (Some((lo, hi)), Some(ly)) = (slot_span(x0, x1, lox, w), slot_row(py, loy, h_u32))
+            else {
+                continue;
+            };
+            layer
+                .pixels
+                .region_into((slot_x(lo, lox), ly, slot_x(hi, lox), ly), &mut row);
+            if let Some(p) = peak.as_deref_mut() {
+                p.region_into((lo, py, hi, py), &mut prow);
+            }
+            for px in lo..=hi {
+                let gx = (px - lo) as usize;
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
                         continue;
@@ -904,28 +1124,30 @@ impl Document {
                     }
                 }
                 // 1.0 inside the hard core, linear fade across the soft edge.
-                let edge = brush.softness.clamp(0.0, 1.0);
-                let round = dab_roundness(brush, x, y);
-                let (cos_a, sin_a) = (angle.cos(), angle.sin());
-                let grain = clamp01(brush.grain);
                 // Dab-frame coords (see mask dab): roundness 1.0 keeps the
                 // old circular falloff bit-for-bit.
                 let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
                 let (u, v) = (dx * cos_a + dy * sin_a, (-dx * sin_a + dy * cos_a) / round);
                 let d = (u * u + v * v).sqrt() / radius;
-                if d > 1.0 {
+                if d > 1.0 + 0.5 / radius {
                     continue;
                 }
-                let falloff = if d <= 1.0 - edge {
+                let falloff = if edge <= 0.0 {
+                    // A hard disc is all core; the coverage term below is
+                    // what gives it an edge.
+                    1.0
+                } else if d <= 1.0 - edge {
                     1.0
                 } else {
-                    1.0 - (d - (1.0 - edge)) / edge.max(0.001)
+                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
-                let mut fa =
-                    (falloff.clamp(0.0, 1.0) * strength * Document::sel_k(mask, w, px, py))
-                        .clamp(0.0, 1.0);
+                // Analytic coverage across the last pixel of the rim: a hard
+                // disc keeps its edge but stops stair-stepping.
+                let coverage = ((1.0 - d) * radius + 0.5).clamp(0.0, 1.0);
+                let mut fa = (falloff * coverage * strength * Document::sel_k(mask, w, px, py))
+                    .clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -936,29 +1158,53 @@ impl Document {
                 if a == 0 {
                     continue;
                 }
-                // Store at the layer-offset slot (see mask dabs).
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                if o + 3 >= layer.pixels.len() {
-                    continue;
-                }
+                // Composite only what this dab adds over the stroke peak;
+                // repeated dabs over one pixel add nothing further.
+                let a = match peak.as_deref_mut() {
+                    Some(_) => {
+                        let seen = prow[gx];
+                        if a <= seen {
+                            continue;
+                        }
+                        prow[gx] = a;
+                        Document::stroke_delta(a, seen)
+                    }
+                    None => a,
+                };
+                let o = gx * 4;
                 if brush.eraser {
-                    // Destination-out: scale existing alpha down.
+                    // Destination-out: scale existing alpha down. A pixel the
+                    // erase takes to alpha 0 is canonicalised to [0, 0, 0, 0]
+                    // so invisible pixels carry no colour: all-zero tiles are
+                    // then exactly the invisible ones the v12 writer omits.
+                    // Alpha > 0 keeps its RGB untouched.
                     let keep = 255u16.saturating_sub(a as u16);
-                    layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
-                } else {
-                    composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
+                    let alpha = ((row[o + 3] as u16 * keep) / 255) as u8;
+                    if alpha == 0 {
+                        row[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+                    } else {
+                        row[o + 3] = alpha;
+                    }
+                } else if let Some(out) = composite_dab_px(
+                    [row[o], row[o + 1], row[o + 2], row[o + 3]],
+                    color.0,
+                    a as f32 / 255.0,
+                    brush.blend,
+                ) {
+                    row[o..o + 4].copy_from_slice(&out);
                 }
+            }
+            let _ = layer.pixels.write_row_changed(slot_x(lo, lox), ly, &row);
+            if let Some(p) = peak.as_deref_mut() {
+                let _ = p.write_row_changed(lo, py, &prow);
             }
         }
     }
 
     /// Stamp a grayscale-tip dab centered at `(x, y)`: the tip is scaled so
-    /// its width spans `brush.size` canvas pixels (nearest-neighbor), and
-    /// each texel contributes `mask * opacity` exactly like falloff alpha.
+    /// its width spans `brush.size` canvas pixels (bilinear, so a magnified
+    /// tip keeps a soft edge), and each texel contributes `mask * opacity`
+    /// exactly like falloff alpha.
     /// Selection, symmetry and eraser handling match [`Document::dab`].
     #[allow(clippy::too_many_arguments)]
     fn dab_stamp_resolved(
@@ -1014,14 +1260,29 @@ impl Document {
         let round = dab_roundness(brush, x, y);
         // Layer offset (Move tool): canvas pixel -> buffer slot.
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
-        let bh = h_u32 as i32;
+        Document::grow_stroke_rect(&mut self.stroke_rect, x0, y0, x1, y1);
+        let track = brush.eraser || brush.blend == super::document::BlendMode::Normal;
+        let mut peak = self.stroke_peak.as_mut().filter(|_| track);
         let layer = &mut self.layers[active];
         let (cos_a, sin_a) = (angle.cos(), angle.sin());
         let grain = clamp01(brush.grain);
         let half_w = size * 0.5;
         let half_h = th * 0.5;
+        let mut row = Vec::new();
+        let mut prow = Vec::new();
         for py in y0..=y1 {
-            for px in x0..=x1 {
+            let (Some((lo, hi)), Some(ly)) = (slot_span(x0, x1, lox, w), slot_row(py, loy, h_u32))
+            else {
+                continue;
+            };
+            layer
+                .pixels
+                .region_into((slot_x(lo, lox), ly, slot_x(hi, lox), ly), &mut row);
+            if let Some(p) = peak.as_deref_mut() {
+                p.region_into((lo, py, hi, py), &mut prow);
+            }
+            for px in lo..=hi {
+                let gx = (px - lo) as usize;
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
                         continue;
@@ -1041,17 +1302,13 @@ impl Document {
                 } else {
                     (ox, oy / round)
                 };
-                let tx = ((rx + half_w) / scale) as i32;
-                let ty = ((ry + half_h) / scale) as i32;
-                if tx < 0 || ty < 0 || tx >= tip.w as i32 || ty >= tip.h as i32 {
+                let texel = sample_tip(tip, (rx + half_w) / scale, (ry + half_h) / scale);
+                if texel <= 0.0 {
                     continue;
                 }
-                let mut fa = (tip.mask[(ty as u32 * tip.w + tx as u32) as usize] as f32 / 255.0
-                    * strength
-                    * Document::sel_k(mask, w, px, py))
-                .clamp(0.0, 1.0);
+                let mut fa = (texel * strength * Document::sel_k(mask, w, px, py)).clamp(0.0, 1.0);
                 if grain > 0.0 {
-                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py));
+                    fa *= 1.0 - grain * (1.0 - grain_sample(brush, px, py, size));
                 }
                 // M39 depth: dual-tip texture, then wet-edge fringe boost.
                 if brush.dual_tip.is_some() {
@@ -1062,21 +1319,40 @@ impl Document {
                 if a == 0 {
                     continue;
                 }
-                // Store at the layer-offset slot (see mask dabs).
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                if o + 3 >= layer.pixels.len() {
-                    continue;
-                }
+                let a = match peak.as_deref_mut() {
+                    Some(_) => {
+                        let seen = prow[gx];
+                        if a <= seen {
+                            continue;
+                        }
+                        prow[gx] = a;
+                        Document::stroke_delta(a, seen)
+                    }
+                    None => a,
+                };
+                let o = gx * 4;
                 if brush.eraser {
+                    // Destination-out, canonicalised like the round dab: an
+                    // alpha-0 pixel becomes [0, 0, 0, 0] (see `dab`).
                     let keep = 255u16.saturating_sub(a as u16);
-                    layer.pixels[o + 3] = ((layer.pixels[o + 3] as u16 * keep) / 255) as u8;
-                } else {
-                    composite_dab(&mut layer.pixels, o, color.0, a as f32 / 255.0, brush.blend);
+                    let alpha = ((row[o + 3] as u16 * keep) / 255) as u8;
+                    if alpha == 0 {
+                        row[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+                    } else {
+                        row[o + 3] = alpha;
+                    }
+                } else if let Some(out) = composite_dab_px(
+                    [row[o], row[o + 1], row[o + 2], row[o + 3]],
+                    color.0,
+                    a as f32 / 255.0,
+                    brush.blend,
+                ) {
+                    row[o..o + 4].copy_from_slice(&out);
                 }
+            }
+            let _ = layer.pixels.write_row_changed(slot_x(lo, lox), ly, &row);
+            if let Some(p) = peak.as_deref_mut() {
+                let _ = p.write_row_changed(lo, py, &prow);
             }
         }
     }
@@ -1124,7 +1400,47 @@ impl Document {
         to_dyn: DabDynamics,
         leftover: f32,
     ) -> (Option<(f32, f32)>, f32) {
+        self.stroke_to_dyn_impl(brush, color, from, from_dyn, to, to_dyn, leftover, true)
+    }
+
+    /// [`Document::stroke_to_dyn`] without the "ink the endpoint" rule: a
+    /// segment shorter than the remaining spacing is left unpainted instead
+    /// of stamping its endpoint. Live painting walks a smoothed curve in
+    /// 4 px substeps and chains the leftover; with the endpoint rule every
+    /// substep stamped a dab, so a 512 px brush painted a dab every 4 px
+    /// instead of every `spacing * size` (77 px) — 15x the work per drag and
+    /// the stutter that caused. The dab footprint already overlaps the
+    /// cursor within one spacing step, so the stroke still reaches it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_to_dyn_spaced(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        from: Option<(f32, f32)>,
+        from_dyn: DabDynamics,
+        to: (f32, f32),
+        to_dyn: DabDynamics,
+        leftover: f32,
+    ) -> (Option<(f32, f32)>, f32) {
+        self.stroke_to_dyn_impl(brush, color, from, from_dyn, to, to_dyn, leftover, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stroke_to_dyn_impl(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        from: Option<(f32, f32)>,
+        from_dyn: DabDynamics,
+        to: (f32, f32),
+        to_dyn: DabDynamics,
+        leftover: f32,
+        stamp_endpoint: bool,
+    ) -> (Option<(f32, f32)>, f32) {
         let Some((sx, sy)) = from else {
+            // Stroke start: a fresh coverage peak keeps this gesture's dabs
+            // from piling onto each other.
+            self.begin_stroke();
             let taper = clamp01(to_dyn.taper);
             let size = brush.resolve_size(to_dyn.pressure, to_dyn.speed_norm)
                 * brush.taper.size_factor(taper, to_dyn.pressure);
@@ -1164,6 +1480,9 @@ impl Document {
             let (x, y) = (sx + dx * t, sy + dy * t);
             let (ox, oy) = scatter_offset(brush, x, y, size);
             self.dab_dyn(brush, color, x + ox, y + oy, size, opacity, angle);
+            // Step by the dab size actually drawn: spacing is relative to
+            // the dab, so a tapering tip keeps overlap (and a dotted brush
+            // keeps its relative gaps) all the way to the point.
             size
         };
         let mut travelled = leftover;
@@ -1174,7 +1493,7 @@ impl Document {
             travelled += (size * brush.spacing).max(1.0);
         }
         let endpoint_painted = last_dab.map(|last| dist - last <= 0.5).unwrap_or(false);
-        if !endpoint_painted {
+        if stamp_endpoint && !endpoint_painted {
             let _ = stamp_at(1.0);
         }
         (Some(to), travelled - dist)
@@ -1280,25 +1599,36 @@ impl Document {
         let mask = self.selection_mask.as_deref();
         let w = w_u32;
         let (lox, loy) = (self.layers[active].ox, self.layers[active].oy);
-        let bh = h_u32 as i32;
+        // The disc lives in layer slots, so clip the dab rect to the placed
+        // layer once and work on dense rows: one copy per tile segment
+        // instead of a tile lookup per byte, for the pickup read and the
+        // deposit write alike.
+        let (Some((lo, hi)), Some((cy0, cy1))) =
+            (slot_span(x0, x1, lox, w), slot_span(y0, y1, loy, h_u32))
+        else {
+            return;
+        };
+        let (ly0, ly1) = (
+            (cy0 as i64 - loy as i64) as u32,
+            (cy1 as i64 - loy as i64) as u32,
+        );
+        let rw = (hi - lo + 1) as usize;
+        let mut buf = Vec::new();
+        self.layers[active]
+            .pixels
+            .region_into((slot_x(lo, lox), ly0, slot_x(hi, lox), ly1), &mut buf);
         // Pickup: the core pixel biased with a little disc average. Pure
         // core is noisy on texture, pure average dilutes a hard dot to
         // nothing on the first dab; the blend smears strongly and still
         // depletes as fresh ground dilutes the disc share.
         let mut sum = [0f32; 4];
         let mut count = 0f32;
-        for py in y0..=y1 {
-            for px in x0..=x1 {
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                let Some(pxs) = self.layers[active].pixels.get(o..o + 4) else {
-                    continue;
-                };
+        for py in cy0..=cy1 {
+            let row = (py - cy0) as usize * rw;
+            for px in lo..=hi {
+                let o = (row + (px - lo) as usize) * 4;
                 for c in 0..4 {
-                    sum[c] += pxs[c] as f32;
+                    sum[c] += buf[o + c] as f32;
                 }
                 count += 1.0;
             }
@@ -1313,12 +1643,12 @@ impl Document {
             sum[3] / count,
         ];
         let (clx, cly) = (x.round() as i32 - lox, y.round() as i32 - loy);
-        let core = if clx >= 0 && cly >= 0 && clx < w as i32 && cly < bh {
+        let core = if clx >= 0 && cly >= 0 && clx < w as i32 && cly < h_u32 as i32 {
+            // Read through the raster: the core may sit in the off-page
+            // buffer tail when the layer is pushed right, outside `buf`.
             let o = ((cly as u32 * w + clx as u32) * 4) as usize;
-            self.layers[active]
-                .pixels
-                .get(o..o + 4)
-                .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32])
+            let p = self.layers[active].pixels.get4(o);
+            Some([p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32])
         } else {
             None
         };
@@ -1344,9 +1674,9 @@ impl Document {
         // Deposit: lerp destination toward the finger under the falloff.
         let edge = brush.softness.clamp(0.0, 1.0);
         let round = dab_roundness(brush, x, y);
-        let layer = &mut self.layers[active];
-        for py in y0..=y1 {
-            for px in x0..=x1 {
+        for py in cy0..=cy1 {
+            let row = (py - cy0) as usize * rw;
+            for px in lo..=hi {
                 if let Some((sx0, sy0, sx1, sy1)) = selection {
                     if px < sx0 || px > sx1 || py < sy0 || py > sy1 {
                         continue;
@@ -1373,19 +1703,19 @@ impl Document {
                 if k <= 0.0 {
                     continue;
                 }
-                let (lx, ly) = (px as i32 - lox, py as i32 - loy);
-                if lx < 0 || ly < 0 || lx >= w as i32 || ly >= bh {
-                    continue;
-                }
-                let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                if o + 3 >= layer.pixels.len() {
-                    continue;
-                }
-                for (d, f) in layer.pixels[o..o + 4].iter_mut().zip(finger.iter()) {
-                    let v = *d as f32;
-                    *d = (v + (*f - v) * k).round().clamp(0.0, 255.0) as u8;
+                let o = (row + (px - lo) as usize) * 4;
+                for (c, f) in buf[o..o + 4].iter_mut().zip(finger.iter()) {
+                    let v = *c as f32;
+                    *c = (v + (*f - v) * k).round().clamp(0.0, 255.0) as u8;
                 }
             }
+        }
+        let layer = &mut self.layers[active];
+        for (i, ly) in (ly0..=ly1).enumerate() {
+            let s = i * rw * 4;
+            let _ = layer
+                .pixels
+                .write_row_changed(slot_x(lo, lox), ly, &buf[s..s + rw * 4]);
         }
     }
 }
@@ -1726,7 +2056,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 shape_count_jitter: 0.0,
                 pressure_curve: None,
                 pressure_opacity_curve: None,
-                taper: Taper::NONE,
+                taper: Taper {
+                    start: 0.25,
+                    end: 0.35,
+                    size: 0.7,
+                    shape: 1.0,
+                    ..Taper::NONE
+                },
             },
         ),
         (
@@ -1766,7 +2102,13 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 shape_count_jitter: 0.0,
                 pressure_curve: None,
                 pressure_opacity_curve: None,
-                taper: Taper::NONE,
+                taper: Taper {
+                    start: 0.2,
+                    end: 0.4,
+                    size: 0.8,
+                    shape: 1.0,
+                    ..Taper::NONE
+                },
             },
         ),
         (
@@ -1774,14 +2116,14 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             Brush {
                 size: 24.0,
                 opacity: 1.0,
-                softness: 0.6,
-                spacing: 0.15,
+                softness: 0.12,
+                spacing: 0.12,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.7,
                 pressure_opacity: 0.6,
-                velocity_size: 0.6,
-                velocity_opacity: 0.6,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
                 grain: 0.0,
@@ -1813,22 +2155,22 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             "Marker",
             Brush {
                 size: 28.0,
-                opacity: 0.85,
-                softness: 0.5,
-                spacing: 0.12,
+                opacity: 0.7,
+                softness: 0.05,
+                spacing: 0.06,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.4,
                 pressure_opacity: 0.5,
-                velocity_size: 0.3,
-                velocity_opacity: 0.3,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
                 grain: 0.0,
                 grain_scale: 1.0,
                 grain_tip: None,
                 grain_angle: 0.0,
-                roundness: 0.55,
+                roundness: 0.7,
                 roundness_jitter: 0.0,
                 size_jitter: 0.0,
                 opacity_jitter: 0.0,
@@ -1853,18 +2195,18 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             "Airbrush",
             Brush {
                 size: 64.0,
-                opacity: 0.25,
+                opacity: 0.3,
                 softness: 1.0,
-                spacing: 0.08,
+                spacing: 0.04,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.3,
-                pressure_opacity: 0.9,
-                velocity_size: 0.2,
-                velocity_opacity: 0.3,
+                pressure_size: 0.2,
+                pressure_opacity: 1.0,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.15,
+                grain: 0.0,
                 grain_scale: 1.5,
                 grain_tip: None,
                 grain_angle: 0.0,
@@ -1892,20 +2234,20 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
         (
             "Chalk",
             Brush {
-                size: 18.0,
-                opacity: 0.8,
-                softness: 0.9,
-                spacing: 0.25,
+                size: 22.0,
+                opacity: 1.0,
+                softness: 0.4,
+                spacing: 0.1,
                 eraser: false,
                 tip: None,
                 pressure_size: 0.6,
                 pressure_opacity: 0.6,
-                velocity_size: 0.5,
-                velocity_opacity: 0.5,
+                velocity_size: 0.0,
+                velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.55,
-                grain_scale: 0.7,
+                grain: 0.45,
+                grain_scale: 1.3,
                 grain_tip: None,
                 grain_angle: 0.0,
                 roundness: 1.0,
@@ -1914,7 +2256,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 opacity_jitter: 0.0,
                 angle: 0.0,
                 angle_follow: false,
-                scatter: 0.12,
+                scatter: 0.06,
                 stabilizer: 0.2,
                 blend: super::document::BlendMode::Normal,
                 wet_edge: 0.0,
@@ -1935,6 +2277,12 @@ impl Document {
     /// Paint one pixel with source-over at brush opacity, honoring selection
     /// and mirroring per [`Document::symmetry`].
     pub(crate) fn put(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
+        // No mirror: skip the per-pixel point list (filled shapes call this
+        // for every covered pixel).
+        if self.symmetry == SymmetryMode::Off {
+            self.put_one(brush, color, px, py);
+            return;
+        }
         let (ccx, ccy) = self.symmetry_center_px();
         let pts =
             self.symmetry
@@ -1947,6 +2295,105 @@ impl Document {
             done.push((mx, my));
             self.put_one(brush, color, mx, my);
         }
+    }
+
+    /// Source-over span of one canvas row for the filled-shape tools: reads
+    /// and writes the layer row in dense runs (one tile-row read and one
+    /// write), instead of four tile lookups per pixel. `inside` selects the
+    /// pixels the shape covers. Only valid with symmetry Off — mirrors need
+    /// per-pixel routing, so callers fall back to [`Self::put`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn put_row_span(
+        &mut self,
+        brush: &Brush,
+        color: Color,
+        y: u32,
+        x0: u32,
+        x1: u32,
+        row: &mut Vec<u8>,
+        inside: impl Fn(u32) -> bool,
+    ) {
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 || y >= h || x0 > x1 {
+            return;
+        }
+        let mut lo = x0;
+        let mut hi = x1.min(w - 1);
+        if let Some((sx0, sy0, sx1, sy1)) = self.selection {
+            if y < sy0 || y > sy1 {
+                return;
+            }
+            lo = lo.max(sx0);
+            hi = hi.min(sx1);
+        }
+        if lo > hi {
+            return;
+        }
+        // A ragged layer raster keeps the per-pixel rules.
+        let dense = self
+            .layers
+            .get(self.active)
+            .is_some_and(|l| l.pixels.w() == w && l.pixels.h() == h);
+        if !dense {
+            for x in lo..=hi {
+                if inside(x) {
+                    self.put_one(brush, color, x, y);
+                }
+            }
+            return;
+        }
+        let op = brush.opacity.clamp(0.0, 1.0);
+        let Self {
+            layers,
+            active,
+            selection_mask,
+            ..
+        } = self;
+        let Some(layer) = layers.get_mut(*active) else {
+            return;
+        };
+        let lox = layer.ox;
+        let ly = y as i64 - layer.oy as i64;
+        if ly < 0 || ly >= h as i64 {
+            return;
+        }
+        let Some((lo, hi)) = slot_span(lo, hi, lox, w) else {
+            return;
+        };
+        let ly = ly as u32;
+        let slx = slot_x(lo, lox);
+        layer
+            .pixels
+            .region_into((slx, ly, slx + (hi - lo), ly), row);
+        let mask = selection_mask.as_deref();
+        let c = color.0;
+        for x in lo..=hi {
+            if !inside(x) {
+                continue;
+            }
+            let sel_k = match mask {
+                Some(m) => m[(y as usize) * w as usize + x as usize] as f32 / 255.0,
+                None => 1.0,
+            };
+            if sel_k <= 0.0 {
+                continue;
+            }
+            let src_a = op * sel_k;
+            let o = (x - lo) as usize * 4;
+            let dst_a = row[o + 3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a <= 0.0 {
+                continue;
+            }
+            for ch in 0..3 {
+                row[o + ch] = ((c[ch] as f32 * src_a + row[o + ch] as f32 * dst_a * (1.0 - src_a))
+                    / out_a)
+                    .round() as u8;
+            }
+            row[o + 3] = (out_a * 255.0).round() as u8;
+        }
+        layer.pixels.write_row_changed(slx, ly, row);
+        self.mark_dirty(lo, y, hi, y);
     }
 
     fn put_one(&mut self, brush: &Brush, color: Color, px: u32, py: u32) {
@@ -1980,22 +2427,17 @@ impl Document {
             return;
         }
         let src_a = brush.opacity.clamp(0.0, 1.0) * sel_k;
-        let dst_a = layer.pixels[o + 3] as f32 / 255.0;
+        let mut dst = layer.pixels.get4(o);
+        let dst_a = dst[3] as f32 / 255.0;
         let out_a = src_a + dst_a * (1.0 - src_a);
         if out_a > 0.0 {
             let c = color.0;
-            layer.pixels[o] =
-                ((c[0] as f32 * src_a + layer.pixels[o] as f32 * dst_a * (1.0 - src_a)) / out_a)
+            for ch in 0..3 {
+                dst[ch] = ((c[ch] as f32 * src_a + dst[ch] as f32 * dst_a * (1.0 - src_a)) / out_a)
                     .round() as u8;
-            layer.pixels[o + 1] = ((c[1] as f32 * src_a
-                + layer.pixels[o + 1] as f32 * dst_a * (1.0 - src_a))
-                / out_a)
-                .round() as u8;
-            layer.pixels[o + 2] = ((c[2] as f32 * src_a
-                + layer.pixels[o + 2] as f32 * dst_a * (1.0 - src_a))
-                / out_a)
-                .round() as u8;
-            layer.pixels[o + 3] = (out_a * 255.0).round() as u8;
+            }
+            dst[3] = (out_a * 255.0).round() as u8;
+            layer.pixels.set4(o, dst);
         }
         let w = self.w;
         let h = self.h;
@@ -2081,6 +2523,13 @@ impl Document {
             y0.min(y1).min(self.h.saturating_sub(1)),
             y0.max(y1).min(self.h.saturating_sub(1)),
         );
+        if self.symmetry == SymmetryMode::Off {
+            let mut row = Vec::new();
+            for y in y0..=y1 {
+                self.put_row_span(brush, color, y, x0, x1, &mut row, |_| true);
+            }
+            return;
+        }
         for y in y0..=y1 {
             for x in x0..=x1 {
                 self.put(brush, color, x, y);
@@ -2108,6 +2557,18 @@ impl Document {
             y0.min(y1).floor().max(0.0) as u32,
         );
         let (ix1, iy1) = (x0.max(x1).ceil() as u32, y0.max(y1).ceil() as u32);
+        if self.symmetry == SymmetryMode::Off {
+            let x1c = ix1.min(self.w.saturating_sub(1));
+            let mut row = Vec::new();
+            for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
+                self.put_row_span(brush, color, y, ix0, x1c, &mut row, |x| {
+                    let dx = (x as f32 + 0.5 - cx) / rx;
+                    let dy = (y as f32 + 0.5 - cy) / ry;
+                    dx * dx + dy * dy <= 1.0
+                });
+            }
+            return;
+        }
         for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
             for x in ix0..=ix1.min(self.w.saturating_sub(1)) {
                 let dx = (x as f32 + 0.5 - cx) / rx;
@@ -2249,6 +2710,33 @@ impl Document {
             y0.min(y1).floor().max(0.0) as u32,
         );
         let (ix1, iy1) = (x0.max(x1).ceil() as u32, y0.max(y1).ceil() as u32);
+        if self.symmetry == SymmetryMode::Off {
+            let x1c = ix1.min(self.w.saturating_sub(1));
+            let mut row = Vec::new();
+            for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
+                let py = y as f32 + 0.5;
+                // Even-odd ray cast from the pixel center.
+                let inside = |x: u32| {
+                    let px = x as f32 + 0.5;
+                    let mut hit = false;
+                    let mut j = pts.len() - 1;
+                    for i in 0..pts.len() {
+                        let (xi, yi) = pts[i];
+                        let (xj, yj) = pts[j];
+                        if (yi > py) != (yj > py) {
+                            let at = xi + (py - yi) / (yj - yi) * (xj - xi);
+                            if px < at {
+                                hit = !hit;
+                            }
+                        }
+                        j = i;
+                    }
+                    hit
+                };
+                self.put_row_span(brush, color, y, ix0, x1c, &mut row, inside);
+            }
+            return;
+        }
         for y in iy0..=iy1.min(self.h.saturating_sub(1)) {
             for x in ix0..=ix1.min(self.w.saturating_sub(1)) {
                 // Even-odd ray cast from the pixel center.
@@ -2296,30 +2784,33 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let snap = self.layers[self.active].pixels.clone();
         let (lox, loy) = (self.layers[self.active].ox, self.layers[self.active].oy);
-        // Canvas cell -> buffer offset, if the layer covers it. Uncovered
+        // Canvas cell -> layer-buffer cell, if the layer covers it. Uncovered
         // canvas reads as transparent content (fill can flow through it
         // when it matches, but there is no slot to store into).
-        let slot = |cx: u32, cy: u32| -> Option<usize> {
+        let covered = |cx: u32, cy: u32| -> Option<(u32, u32)> {
             let lx = cx as i32 - lox;
             let ly = cy as i32 - loy;
             if lx < 0 || ly < 0 || lx >= w as i32 || ly >= h as i32 {
                 return None;
             }
-            Some(((ly as u32 * w + lx as u32) * 4) as usize)
+            Some((lx as u32, ly as u32))
+        };
+        // Canvas cell -> dense offset, if the layer covers it.
+        let slot = |cx: u32, cy: u32| -> Option<usize> {
+            covered(cx, cy).map(|(lx, ly)| ((ly * w + lx) * 4) as usize)
         };
         // Seed on uncovered canvas has no buffer to fill: no-op.
         let Some(seed_off) = slot(x, y) else { return };
-        if seed_off + 3 >= snap.len() {
-            return;
-        }
-        let target = [
-            snap[seed_off],
-            snap[seed_off + 1],
-            snap[seed_off + 2],
-            snap[seed_off + 3],
-        ];
+        // Read the seed through the tile accessors: a full-layer dense copy
+        // just to sample four bytes is 256 MiB of traffic on an 8K layer.
+        let target = {
+            let pixels = &self.layers[self.active].pixels;
+            if seed_off + 3 >= pixels.len() {
+                return;
+            }
+            pixels.get4(seed_off)
+        };
         let opacity = brush.opacity.clamp(0.0, 1.0);
         // A seed already carrying the fill color is a no-op only without
         // growth; with `grow` the second fill must still extend the region.
@@ -2363,35 +2854,49 @@ impl Document {
             true
         };
         let layer = &mut self.layers[self.active];
-        let mut visited = vec![0u8; (w * h) as usize];
+        // Pixels are walked in tile-local order, so the recently touched
+        // tiles stay resident and each access is one array index instead of
+        // four `locate()` divisions. Evicted tiles are written back whole.
+        let mut fill = FillTiles::new(&layer.pixels);
+        // One bit per canvas pixel (`w * h` bits, 8 MiB at 8K): the visited
+        // set is a membership test, not a value, so a byte per pixel was 8x
+        // larger than necessary.
+        let mut visited = vec![0u8; (w as usize * h as usize).div_ceil(8)];
         let mut stack = seeds;
         let mut any = false;
+        // Grow-only on purpose: the growth pass reads `matched`, the common
+        // `grow == 0` path never does, so a whole-canvas fill at 8K must not
+        // accumulate ~0.5 GiB of coordinates nobody reads. With `grow > 0`
+        // this is filled exactly as before, so the empty check still means
+        // "the seed region matched nothing".
         let mut matched: Vec<(u32, u32)> = Vec::new();
         while let Some((cx, cy)) = stack.pop() {
             let idx = (cy * w + cx) as usize;
-            if visited[idx] == 1 {
+            let (byte, bit) = (idx / 8, 1u8 << (idx % 8));
+            if visited[byte] & bit != 0 {
                 continue;
             }
-            visited[idx] = 1;
-            let content: [u8; 4] = match slot(cx, cy) {
-                Some(o) if o + 3 < layer.pixels.len() => [
-                    layer.pixels[o],
-                    layer.pixels[o + 1],
-                    layer.pixels[o + 2],
-                    layer.pixels[o + 3],
-                ],
-                _ => [0, 0, 0, 0],
+            visited[byte] |= bit;
+            let cell = covered(cx, cy);
+            let content: [u8; 4] = match cell {
+                Some((lx, ly)) => fill.get4(&mut layer.pixels, lx, ly),
+                None => [0, 0, 0, 0],
             };
             if !matches(&content) {
                 continue;
             }
-            matched.push((cx, cy));
-            // Store only where the buffer exists (see `slot`).
-            if let Some(o) = slot(cx, cy) {
-                if o + 3 < layer.pixels.len() {
-                    layer.pixels[o..o + 4].copy_from_slice(&blend_over(content, color, opacity));
-                    any = true;
-                }
+            if grow > 0 {
+                matched.push((cx, cy));
+            }
+            // Store only where the buffer exists (see `covered`).
+            if let Some((lx, ly)) = cell {
+                fill.set4(
+                    &mut layer.pixels,
+                    lx,
+                    ly,
+                    blend_over(content, color, opacity),
+                );
+                any = true;
             }
             if cx > 0 && selected(cx - 1, cy) {
                 stack.push((cx - 1, cy));
@@ -2461,14 +2966,9 @@ impl Document {
                     let region = in_region[(ny * w + nx) as usize] == 1;
                     let mut is_open = selected(nx, ny);
                     if is_open && !region {
-                        if let Some(o) = slot(nx, ny) {
-                            if o + 3 < layer.pixels.len()
-                                && layer.pixels[o + 3] >= 128
-                                && layer.pixels[o]
-                                    .max(layer.pixels[o + 1])
-                                    .max(layer.pixels[o + 2])
-                                    < barrier
-                            {
+                        if let Some((lx, ly)) = covered(nx, ny) {
+                            let px = fill.get4(&mut layer.pixels, lx, ly);
+                            if px[3] >= 128 && px[0].max(px[1]).max(px[2]) < barrier {
                                 is_open = false;
                             }
                         }
@@ -2530,24 +3030,100 @@ impl Document {
                         continue;
                     }
                     let (nx, ny) = (bx0 + bx as u32, by0 + by as u32);
-                    if let Some(o) = slot(nx, ny) {
-                        if o + 3 < layer.pixels.len() {
-                            let content = [
-                                layer.pixels[o],
-                                layer.pixels[o + 1],
-                                layer.pixels[o + 2],
-                                layer.pixels[o + 3],
-                            ];
-                            layer.pixels[o..o + 4]
-                                .copy_from_slice(&blend_over(content, color, opacity));
-                            any = true;
-                        }
+                    if let Some((lx, ly)) = covered(nx, ny) {
+                        let content = fill.get4(&mut layer.pixels, lx, ly);
+                        fill.set4(
+                            &mut layer.pixels,
+                            lx,
+                            ly,
+                            blend_over(content, color, opacity),
+                        );
+                        any = true;
                     }
                 }
             }
         }
+        fill.flush_all(&mut layer.pixels);
         if any {
             self.mark_full_dirty();
+        }
+    }
+}
+
+/// Bounded direct-mapped tile cache for flood fill. The fill walks pixels
+/// in a DFS whose working set stays within a handful of tiles, so keeping
+/// the last 64 tiles resident turns four `locate()` divisions per pixel
+/// into one array index. A miss copies one tile (256 KiB), a miss on a
+/// dirty slot writes the evicted tile back whole; correctness does not
+/// depend on the cache holding anything in particular.
+struct FillTiles {
+    keys: [u32; Self::SLOTS],
+    dirty: [bool; Self::SLOTS],
+    bufs: Vec<Vec<u8>>,
+    tiles_x: u32,
+}
+
+impl FillTiles {
+    const SLOTS: usize = 64;
+
+    fn new(raster: &crate::raster::Raster) -> Self {
+        Self {
+            keys: [u32::MAX; Self::SLOTS],
+            dirty: [false; Self::SLOTS],
+            bufs: vec![Vec::new(); Self::SLOTS],
+            tiles_x: raster.tiles_x(),
+        }
+    }
+
+    /// Multiplicative hash: consecutive tile keys land on distinct slots,
+    /// so a scan along one tile row does not collide with itself.
+    fn slot_for(key: u32) -> usize {
+        ((key.wrapping_mul(2654435761)) >> 26) as usize & (Self::SLOTS - 1)
+    }
+
+    fn flush(&mut self, raster: &mut crate::raster::Raster, idx: usize) {
+        if !self.dirty[idx] {
+            return;
+        }
+        let key = self.keys[idx];
+        raster.write_tile(key % self.tiles_x, key / self.tiles_x, &self.bufs[idx]);
+        self.dirty[idx] = false;
+    }
+
+    fn resident(&mut self, raster: &mut crate::raster::Raster, x: u32, y: u32) -> usize {
+        let key = (y / TILE) * self.tiles_x + x / TILE;
+        let idx = Self::slot_for(key);
+        if self.keys[idx] == key {
+            return idx;
+        }
+        self.flush(raster, idx);
+        let buf = &mut self.bufs[idx];
+        buf.clear();
+        match raster.tile(key % self.tiles_x, key / self.tiles_x) {
+            Some(t) => buf.extend_from_slice(t),
+            None => buf.resize(raster.tile_len(), 0),
+        }
+        self.keys[idx] = key;
+        idx
+    }
+
+    fn get4(&mut self, raster: &mut crate::raster::Raster, x: u32, y: u32) -> [u8; 4] {
+        let idx = self.resident(raster, x, y);
+        let off = (((y % TILE) * TILE + x % TILE) as usize) * 4;
+        let b = &self.bufs[idx];
+        [b[off], b[off + 1], b[off + 2], b[off + 3]]
+    }
+
+    fn set4(&mut self, raster: &mut crate::raster::Raster, x: u32, y: u32, px: [u8; 4]) {
+        let idx = self.resident(raster, x, y);
+        let off = (((y % TILE) * TILE + x % TILE) as usize) * 4;
+        self.bufs[idx][off..off + 4].copy_from_slice(&px);
+        self.dirty[idx] = true;
+    }
+
+    fn flush_all(&mut self, raster: &mut crate::raster::Raster) {
+        for idx in 0..Self::SLOTS {
+            self.flush(raster, idx);
         }
     }
 }
@@ -2619,6 +3195,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tip_mask_rejects_bad_dimensions_and_lengths() {
+        assert!(BrushTip::from_mask(0, 4, vec![]).is_err());
+        assert!(BrushTip::from_mask(4, 0, vec![]).is_err());
+        assert!(BrushTip::from_mask(MAX_TIP_SIDE + 1, 1, vec![255]).is_err());
+        // Short and oversized masks both fail the checked product.
+        assert!(BrushTip::from_mask(2, 2, vec![255; 3]).is_err());
+        assert!(BrushTip::from_mask(2, 2, vec![255; 5]).is_err());
+        // A fully transparent tip is still rejected after the length check.
+        assert!(BrushTip::from_mask(2, 2, vec![0; 4]).is_err());
+        assert!(BrushTip::from_mask(2, 2, vec![255; 4]).is_ok());
+    }
+
+    #[test]
     fn flood_fill_stays_inside_barrier() {
         let mut doc = Document::new(10, 10);
         let brush = Brush {
@@ -2631,10 +3220,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 0, 5), [0, 0, 255, 255]);
@@ -2656,10 +3245,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 11 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 1, 5), [0, 255, 0, 255]);
@@ -2681,9 +3270,9 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
             ]
         };
         let brush = Brush {
@@ -2744,10 +3333,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         let brush = Brush {
@@ -2786,10 +3375,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         let brush = Brush {
@@ -2821,10 +3410,10 @@ mod tests {
         let at = |x: u32, y: u32| {
             let o = ((y * 21 + x) * 4) as usize;
             [
-                doc.layers[0].pixels[o],
-                doc.layers[0].pixels[o + 1],
-                doc.layers[0].pixels[o + 2],
-                doc.layers[0].pixels[o + 3],
+                doc.layers[0].pixels.get(o),
+                doc.layers[0].pixels.get(o + 1),
+                doc.layers[0].pixels.get(o + 2),
+                doc.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(9, 10), [0, 0, 255, 255]);
@@ -2848,10 +3437,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 10 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 3, 5), [0, 0, 255, 255]);
@@ -2875,10 +3464,10 @@ mod tests {
         let at = |d: &Document, x: u32, y: u32| {
             let o = ((y * 11 + x) * 4) as usize;
             [
-                d.layers[0].pixels[o],
-                d.layers[0].pixels[o + 1],
-                d.layers[0].pixels[o + 2],
-                d.layers[0].pixels[o + 3],
+                d.layers[0].pixels.get(o),
+                d.layers[0].pixels.get(o + 1),
+                d.layers[0].pixels.get(o + 2),
+                d.layers[0].pixels.get(o + 3),
             ]
         };
         assert_eq!(at(&doc, 4, 5), [0, 0, 255, 255]);
@@ -2910,9 +3499,9 @@ mod tests {
                         continue;
                     };
                     let o = ((y * 64 + x) * 4) as usize;
-                    doc.layers[0].pixels[o] = v;
-                    doc.layers[0].pixels[o + 1] = v;
-                    doc.layers[0].pixels[o + 2] = v;
+                    doc.layers[0].pixels.set(o, v);
+                    doc.layers[0].pixels.set(o + 1, v);
+                    doc.layers[0].pixels.set(o + 2, v);
                 }
             }
         };
@@ -2926,6 +3515,7 @@ mod tests {
         let pale_halo = |d: &Document| {
             d.layers[0]
                 .pixels
+                .to_dense()
                 .chunks(4)
                 .filter(|p| (153..=222).contains(&p[0]))
                 .count()
@@ -2933,6 +3523,7 @@ mod tests {
         let dark_ramp = |d: &Document| {
             d.layers[0]
                 .pixels
+                .to_dense()
                 .chunks(4)
                 .filter(|p| (1..=152).contains(&p[0]))
                 .count()
@@ -2940,6 +3531,7 @@ mod tests {
         let black_core = |d: &Document| {
             d.layers[0]
                 .pixels
+                .to_dense()
                 .chunks(4)
                 .filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
                 .count()
@@ -2973,10 +3565,10 @@ mod tests {
                 let o = ((y * 3 + x) * 4) as usize;
                 assert_eq!(
                     [
-                        doc.layers[0].pixels[o],
-                        doc.layers[0].pixels[o + 1],
-                        doc.layers[0].pixels[o + 2],
-                        doc.layers[0].pixels[o + 3],
+                        doc.layers[0].pixels.get(o),
+                        doc.layers[0].pixels.get(o + 1),
+                        doc.layers[0].pixels.get(o + 2),
+                        doc.layers[0].pixels.get(o + 3),
                     ],
                     [0, 0, 255, 255]
                 );
@@ -3003,7 +3595,7 @@ mod tests {
         let mut peak = 0u8;
         for y in 3..=5 {
             for x in 9..=11 {
-                peak = peak.max(doc.layers[0].pixels[((y * 20 + x) * 4) as usize + 3]);
+                peak = peak.max(doc.layers[0].pixels.get(((y * 20 + x) * 4) as usize + 3));
             }
         }
         assert!(peak > 0 && peak < 255, "{peak}");
@@ -3021,7 +3613,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 10.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4) as usize + 3];
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4) as usize + 3);
         assert!(at(&doc, 2, 10) > 0);
         assert_eq!(at(&doc, 18, 10), 0);
         // Horizontal: mirrored left-right.
@@ -3048,17 +3641,17 @@ mod tests {
             ..Default::default()
         };
         doc.shape_rect(&brush, Color::rgb(255, 0, 0), 4.0, 4.0, 20.0, 20.0);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut doc2 = Document::new(32, 32);
         doc2.shape_ellipse(&brush, Color::rgb(0, 255, 0), 4.0, 4.0, 28.0, 28.0);
-        assert!(doc2.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc2.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut doc3 = Document::new(32, 32);
         doc3.fill_rect(&brush, Color::rgb(0, 0, 255), 2, 2, 6, 6);
         let o = ((4 * 32 + 4) * 4) as usize;
-        assert_eq!(doc3.layers[0].pixels[o + 3], 255);
+        assert_eq!(doc3.layers[0].pixels.get(o + 3), 255);
         let mut doc4 = Document::new(32, 32);
         doc4.fill_ellipse(&brush, Color::rgb(1, 2, 3), 2.0, 2.0, 10.0, 10.0);
-        assert!(doc4.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc4.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -3073,16 +3666,24 @@ mod tests {
             let mut doc = Document::new(48, 48);
             doc.shape_poly(&brush, Color::rgb(255, 0, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
             assert!(
-                doc.layers[0].pixels.iter().any(|&b| b != 0),
+                doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0),
                 "{kind:?} outline"
             );
             // Fill covers the middle but not the far corner.
             let mut doc = Document::new(48, 48);
             doc.fill_poly(&brush, Color::rgb(0, 255, 0), kind, 6.0, 6.0, 42.0, 42.0, 6);
             let mid = ((24 * 48 + 24) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels[mid + 3], 255, "{kind:?} fill middle");
+            assert_eq!(
+                doc.layers[0].pixels.get(mid + 3),
+                255,
+                "{kind:?} fill middle"
+            );
             let corner = ((2 * 48 + 2) * 4) as usize;
-            assert_eq!(doc.layers[0].pixels[corner + 3], 0, "{kind:?} fill corner");
+            assert_eq!(
+                doc.layers[0].pixels.get(corner + 3),
+                0,
+                "{kind:?} fill corner"
+            );
         }
         // Polygon sides clamp: 2 behaves like a triangle, 99 like 12.
         let mut doc = Document::new(48, 48);
@@ -3097,14 +3698,14 @@ mod tests {
             2,
         );
         let mid = ((30 * 48 + 24) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[mid + 3], 255);
+        assert_eq!(doc.layers[0].pixels.get(mid + 3), 255);
         // Arrow paints along its drag direction.
         let mut doc = Document::new(48, 48);
         doc.shape_arrow(&brush, Color::rgb(0, 0, 255), 4.0, 24.0, 44.0, 24.0);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let tip = ((24 * 48 + 43) * 4) as usize;
         assert!(
-            doc.layers[0].pixels[tip + 3] > 0,
+            doc.layers[0].pixels.get(tip + 3) > 0,
             "arrowhead lands at the tip"
         );
     }
@@ -3155,7 +3756,7 @@ mod tests {
         let mut s = Stroke::begin(&mut doc, brush, Color::rgb(255, 0, 0));
         s.push(16.0, 16.0);
         drop(s);
-        assert!(doc.layers[0].pixels.iter().any(|&b| b != 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().any(|&b| b != 0));
         let mut e = Stroke::begin(
             &mut doc,
             Brush {
@@ -3168,14 +3769,58 @@ mod tests {
         );
         e.push(16.0, 16.0);
         drop(e);
-        // Eraser removes alpha (destination-out); color bytes of fully
-        // transparent pixels are intentionally left alone.
-        assert!(doc.layers[0]
-            .pixels
-            .iter()
-            .skip(3)
-            .step_by(4)
-            .all(|&b| b == 0));
+        // Eraser removes alpha (destination-out); pixels it takes to alpha 0
+        // are canonicalised to [0, 0, 0, 0], so nothing invisible survives.
+        assert!(doc.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn dab_paints_across_a_tile_seam() {
+        let mut doc = Document::new(600, 100);
+        let brush = Brush {
+            size: 24.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color([255, 0, 0, 255]), 256.0, 50.0);
+        let px = &doc.layers[0].pixels;
+        assert_eq!(px.get4(((50 * 600 + 250) * 4) as usize)[3], 255);
+        assert_eq!(px.get4(((50 * 600 + 262) * 4) as usize)[3], 255);
+        assert_eq!(px.alloc_bytes(), 2 * 256 * 1024, "both tiles exist");
+    }
+
+    #[test]
+    fn eraser_clears_but_keeps_scene_undoable() {
+        let mut doc = Document::new(300, 300);
+        let brush = Brush {
+            size: 40.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color([10, 20, 30, 255]), 150.0, 150.0);
+        doc.checkpoint();
+        let eraser = Brush {
+            eraser: true,
+            ..brush
+        };
+        doc.dab(&eraser, Color([0, 0, 0, 255]), 150.0, 150.0);
+        // Destination-out clears alpha, and a pixel it takes to alpha 0 is
+        // canonicalised to [0, 0, 0, 0]: invisible pixels carry no colour, so
+        // the v12 writer's all-zero-tile omission drops exactly the invisible
+        // tiles on reload ("erased costs nothing" holds at any RGB). Partial
+        // erasure keeps its RGB — only alpha 0 is canonical.
+        assert_eq!(
+            doc.layers[0].pixels.get4(((150 * 300 + 150) * 4) as usize),
+            [0, 0, 0, 0]
+        );
+        assert!(doc.undo());
+        assert_eq!(
+            doc.layers[0]
+                .pixels
+                .get(((150 * 300 + 150) * 4 + 3) as usize),
+            255
+        );
     }
 
     fn sample_library() -> Vec<BrushPreset> {
@@ -3186,6 +3831,22 @@ mod tests {
                 brush,
             })
             .collect()
+    }
+
+    #[test]
+    fn pencil_and_ink_pen_taper_their_ends() {
+        // Sketch pens ship tapered: the stock brushes should leave the box
+        // with a lifted entry and exit, smoothstepped so the tip is round
+        // rather than a linear leaf.
+        for (name, brush) in presets() {
+            if name != "Pencil" && name != "Ink Pen" {
+                continue;
+            }
+            assert!(brush.taper.start > 0.0, "{name} has no start taper");
+            assert!(brush.taper.end > 0.0, "{name} has no end taper");
+            assert_eq!(brush.taper.shape, 1.0, "{name} taper is not smooth");
+            assert!(check_preset(name, &brush).is_ok(), "{name}");
+        }
     }
 
     #[test]
@@ -3272,6 +3933,76 @@ mod tests {
     }
 
     #[test]
+    fn taper_ends_fade_over_a_fixed_distance() {
+        let end = Taper {
+            end: 0.5,
+            ..Taper::NONE
+        };
+        // Six brush diameters: a 20 px brush fades over 120 px, so the
+        // 0.5 setting tapers the last 60.
+        assert_eq!(end.distance_factor(0.0, 0.0, 20.0), 0.0);
+        assert!((end.distance_factor(0.0, 30.0, 20.0) - 0.5).abs() < 0.001);
+        assert_eq!(end.distance_factor(0.0, 60.0, 20.0), 1.0);
+    }
+
+    #[test]
+    fn taper_start_does_not_depend_on_stroke_length() {
+        let start = Taper {
+            start: 0.5,
+            ..Taper::NONE
+        };
+        // Midway through the 60 px start ramp stays 0.5 whether the stroke
+        // ends at 61 px or runs on for hundreds: live dabs need no total.
+        assert!((start.distance_factor(30.0, 0.0, 20.0) - 0.5).abs() < 0.001);
+        assert_eq!(start.distance_factor(200.0, 0.0, 20.0), 1.0);
+    }
+
+    #[test]
+    fn live_taper_matches_the_release_width_until_the_tail() {
+        // What the pen draws while down must be what a lift leaves behind:
+        // the start ramp is live, the end ramp is only known on release.
+        let taper = Taper {
+            start: 0.25,
+            end: 0.35,
+            size: 0.7,
+            shape: 1.0,
+            ..Taper::NONE
+        };
+        let (size, total) = (6.0, 60.0);
+        let span = size * TAPER_DIAMETERS;
+        assert_eq!(taper.live_factor(0.0, size), 0.0, "start touches down");
+        let last_full = total - clamp01(taper.end) * span - 1.0;
+        for d in [span * 0.5, 30.0, 40.0, last_full] {
+            assert_eq!(
+                taper.live_factor(d, size),
+                taper.distance_factor(d, total - d, size),
+                "live width differs from the release width at {d} px"
+            );
+        }
+        assert_eq!(
+            taper.size_factor(taper.live_factor(span * 2.0, size), 1.0),
+            1.0,
+            "a live dab past the start ramp is full width"
+        );
+        // The end ramp still narrows the tail on release.
+        assert_eq!(taper.distance_factor(total, 0.0, size), 0.0);
+    }
+
+    #[test]
+    fn zero_to_end_means_the_stroke_is_over() {
+        // Regression: the live path passed 0 for `to_end`, which is not
+        // "end unknown" but "already at the end", so every live dab took
+        // the full end ramp (30% width for the default pen preset).
+        let taper = Taper {
+            end: 0.35,
+            size: 0.7,
+            ..Taper::NONE
+        };
+        assert_eq!(taper.distance_factor(100.0, 0.0, 6.0), 0.0);
+        assert_eq!(taper.live_factor(100.0, 6.0), 1.0);
+    }
+
+    #[test]
     fn taper_size_and_pressure_scale_the_transition() {
         let full = Taper {
             start: 0.5,
@@ -3323,7 +4054,7 @@ mod tests {
             dyn0,
             0.0,
         );
-        let alpha = doc.layers[0].pixels[((6 * doc.w + 6) * 4 + 3) as usize];
+        let alpha = doc.layers[0].pixels.get(((6 * doc.w + 6) * 4 + 3) as usize);
         assert!(alpha > 0, "taper size 0 should keep the tip full width");
     }
 
@@ -3365,7 +4096,7 @@ mod tests {
             DabDynamics::default(),
             0.0,
         );
-        let alpha = |x: u32| doc.layers[0].pixels[((6 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| doc.layers[0].pixels.get(((6 * doc.w + x) * 4 + 3) as usize);
         assert_eq!(alpha(3), 0);
         assert!(alpha(30) > 200, "full-taper alpha {}", alpha(30));
         assert!(alpha(20) > 0 && alpha(20) < alpha(30));
@@ -3381,7 +4112,7 @@ mod tests {
         };
         let mut doc = Document::new(8, 8);
         doc.dab(&brush, Color::rgb(255, 0, 0), 4.5, 4.5);
-        let alpha = doc.layers[0].pixels[((4 * doc.w + 4) * 4 + 3) as usize];
+        let alpha = doc.layers[0].pixels.get(((4 * doc.w + 4) * 4 + 3) as usize);
         assert!(alpha > 0 && alpha < 128, "subpixel alpha {alpha}");
     }
 
@@ -3431,7 +4162,7 @@ mod tests {
         );
         let width = |x: u32| {
             (0..doc.h)
-                .filter(|&y| doc.layers[0].pixels[((y * doc.w + x) * 4 + 3) as usize] > 0)
+                .filter(|&y| doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize) > 0)
                 .count()
         };
         assert!(width(30) < width(60), "{} vs {}", width(30), width(60));
@@ -3472,7 +4203,11 @@ mod tests {
             tail,
             0.0,
         );
-        let alpha = |x: u32| doc.layers[0].pixels[((100 * doc.w + x) * 4 + 3) as usize];
+        let alpha = |x: u32| {
+            doc.layers[0]
+                .pixels
+                .get(((100 * doc.w + x) * 4 + 3) as usize)
+        };
         let gap = (20..=220).find(|&x| alpha(x) == 0);
         assert_eq!(gap, None, "first tapered-tail gap at x={gap:?}");
     }
@@ -3499,7 +4234,9 @@ mod tests {
             dyn_,
             0.0,
         );
-        let alpha = doc.layers[0].pixels[((16 * doc.w + 28) * 4 + 3) as usize];
+        let alpha = doc.layers[0]
+            .pixels
+            .get(((16 * doc.w + 28) * 4 + 3) as usize);
         assert!(alpha > 0, "short segment endpoint alpha {alpha}");
     }
 
@@ -3541,8 +4278,14 @@ mod tests {
     }
 
     #[test]
-    fn velocity_thins_and_fades() {
-        let brush = Brush::default(); // velocity 0.6 / 0.6
+    fn velocity_thins_and_fades_when_a_brush_opts_in() {
+        // Speed dynamics moved to opt-in (the default is flat), so the M7
+        // weights are pinned through an explicit brush.
+        let brush = Brush {
+            velocity_size: 0.6,
+            velocity_opacity: 0.6,
+            ..Default::default()
+        };
         let size_full = brush.resolve_size(1.0, 1.0);
         let op_full = brush.resolve_opacity(1.0, 1.0);
         assert!(size_full < brush.size);
@@ -3577,6 +4320,7 @@ mod tests {
     fn alpha_sum(doc: &Document) -> u64 {
         doc.layers[0]
             .pixels
+            .to_dense()
             .iter()
             .skip(3)
             .step_by(4)
@@ -3590,7 +4334,7 @@ mod tests {
         let mut any = false;
         for y in 0..h {
             for x in 0..w {
-                if doc.layers[0].pixels[((y * w + x) * 4 + 3) as usize] > 0 {
+                if doc.layers[0].pixels.get(((y * w + x) * 4 + 3) as usize) > 0 {
                     any = true;
                     x0 = x0.min(x);
                     y0 = y0.min(y);
@@ -3722,7 +4466,7 @@ mod tests {
         };
         for py in 0..512 {
             for px in 0..512 {
-                let _ = grain_sample(&brush, px, py);
+                let _ = grain_sample(&brush, px, py, 22.0);
             }
         }
     }
@@ -3739,7 +4483,7 @@ mod tests {
         };
         for y in 0..512 {
             for x in 0..512 {
-                let sample = grain_sample(&brush, x, y);
+                let sample = grain_sample(&brush, x, y, 22.0);
                 assert!((0.0..=1.0).contains(&sample));
             }
         }
@@ -3837,7 +4581,10 @@ mod tests {
     }
 
     #[test]
-    fn shape_count_builds_density_at_one_point() {
+    fn coincident_shapes_share_the_stroke_opacity() {
+        // Shapes of one dab land on the same spot unless scatter/jitter
+        // separates them: they are one paint event, so the ceiling stays
+        // the brush opacity instead of stacking shape_count times.
         let single = Brush {
             size: 20.0,
             opacity: 0.25,
@@ -3851,9 +4598,10 @@ mod tests {
         let alpha = |brush: &Brush| {
             let mut doc = Document::new(48, 48);
             doc.dab(brush, Color::rgb(255, 0, 0), 24.0, 24.0);
-            doc.layers[0].pixels[(24 * 48 + 24) * 4 + 3]
+            doc.layers[0].pixels.get((24 * 48 + 24) * 4 + 3)
         };
-        assert!(alpha(&multiple) > alpha(&single));
+        assert_eq!(alpha(&multiple), alpha(&single));
+        assert!(alpha(&single) <= 64, "{}", alpha(&single));
     }
 
     #[test]
@@ -4193,13 +4941,13 @@ mod tests {
     fn smudge_drags_color_down_the_stroke() {
         let mut doc = Document::new(16, 4);
         // Solid red dot at (2, 1).
-        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
-        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        doc.layers[0].pixels.set(pxo(16, 2, 1), 255);
+        doc.layers[0].pixels.set(pxo(16, 2, 1) + 3, 255);
         let brush = smudge_brush();
         let (last, left) = doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
         assert!(last == Some((2.0, 1.0)) && left == 0.0);
         let (_, _) = doc.smudge_to(&brush, 1.0, 1.0, last, (12.0, 1.0), left);
-        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        let at = |x: u32| doc.layers[0].pixels.get(pxo(16, x, 1));
         // Red travelled right; the source faded as the finger left it.
         assert!(at(8) > 40, "mid-stroke red = {}", at(8));
         assert!(at(2) < 255, "source faded = {}", at(2));
@@ -4208,7 +4956,7 @@ mod tests {
     #[test]
     fn smudge_zero_strength_is_a_noop() {
         let mut doc = Document::new(8, 8);
-        doc.layers[0].pixels[pxo(8, 4, 4)] = 200;
+        doc.layers[0].pixels.set(pxo(8, 4, 4), 200);
         let before = doc.layers[0].pixels.clone();
         let brush = smudge_brush();
         doc.smudge_to(&brush, 0.0, 1.0, None, (4.0, 4.0), 0.0);
@@ -4219,15 +4967,15 @@ mod tests {
     #[test]
     fn smudge_finger_resets_each_stroke() {
         let mut doc = Document::new(16, 4);
-        doc.layers[0].pixels[pxo(16, 2, 1)] = 255;
-        doc.layers[0].pixels[pxo(16, 2, 1) + 3] = 255;
+        doc.layers[0].pixels.set(pxo(16, 2, 1), 255);
+        doc.layers[0].pixels.set(pxo(16, 2, 1) + 3, 255);
         let brush = smudge_brush();
         // First stroke picks up red at (2,1).
         doc.smudge_to(&brush, 1.0, 1.0, None, (2.0, 1.0), 0.0);
         // Second stroke starts on empty black: a shared finger would
         // drag red in from the first stroke.
         doc.smudge_to(&brush, 1.0, 1.0, None, (12.0, 1.0), 0.0);
-        let at = |x: u32| doc.layers[0].pixels[pxo(16, x, 1)];
+        let at = |x: u32| doc.layers[0].pixels.get(pxo(16, x, 1));
         assert_eq!(at(12), 0);
     }
 
@@ -4236,8 +4984,8 @@ mod tests {
         let mut doc = Document::new(16, 4);
         // Left half solid red, right half transparent.
         for x in 0..8u32 {
-            doc.layers[0].pixels[pxo(16, x, 1)] = 255;
-            doc.layers[0].pixels[pxo(16, x, 1) + 3] = 255;
+            doc.layers[0].pixels.set(pxo(16, x, 1), 255);
+            doc.layers[0].pixels.set(pxo(16, x, 1) + 3, 255);
         }
         // Only the left half is selected; smudge across the whole row.
         doc.selection = Some((0, 1, 7, 1));
@@ -4247,7 +4995,7 @@ mod tests {
         // Unselected half stays transparent (no red dragged across).
         for x in 8..16u32 {
             let o = pxo(16, x, 1);
-            assert_eq!(doc.layers[0].pixels[o + 3], 0, "x={x}");
+            assert_eq!(doc.layers[0].pixels.get(o + 3), 0, "x={x}");
         }
     }
 
@@ -4274,10 +5022,10 @@ mod tests {
             doc.dab(&brush, Color::rgb(255, 0, 0), 3.5, 3.5);
             let o = ((3 * 8 + 3) * 4) as usize;
             [
-                doc.layers[0].pixels[o],
-                doc.layers[0].pixels[o + 1],
-                doc.layers[0].pixels[o + 2],
-                doc.layers[0].pixels[o + 3],
+                doc.layers[0].pixels.get(o),
+                doc.layers[0].pixels.get(o + 1),
+                doc.layers[0].pixels.get(o + 2),
+                doc.layers[0].pixels.get(o + 3),
             ]
         };
         // Normal covers; Difference(|red - green|) lands on yellow.
@@ -4300,6 +5048,7 @@ mod tests {
             doc.dab(&brush, Color::rgb(255, 255, 255), 11.5, 11.5);
             doc.layers[0]
                 .pixels
+                .to_dense()
                 .iter()
                 .skip(3)
                 .step_by(4)
@@ -4326,7 +5075,12 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 255, 255), 7.5, 7.5);
-        let on = doc.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        let on = doc.layers[0]
+            .pixels
+            .to_dense()
+            .iter()
+            .filter(|&&b| b != 0)
+            .count();
         let mut plain = Document::new(16, 16);
         plain.dab(
             &Brush {
@@ -4339,15 +5093,671 @@ mod tests {
             7.5,
             7.5,
         );
-        let full = plain.layers[0].pixels.iter().filter(|&&b| b != 0).count();
+        let full = plain.layers[0]
+            .pixels
+            .to_dense()
+            .iter()
+            .filter(|&&b| b != 0)
+            .count();
         assert!(full > 0 && on < full, "full={full} dual={on}");
+    }
+
+    #[test]
+    fn scaled_tip_edge_is_bilinear_not_blocky() {
+        // A 2x2 tip blown up to 32 px: nearest sampling flips a texel
+        // column 0 -> 255 within one pixel (visible steps on a big round
+        // brush); bilinear spreads the same edge over a texel.
+        let mut doc = Document::new(48, 48);
+        let brush = Brush {
+            size: 32.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            tip: Some(BrushTip {
+                w: 2,
+                h: 2,
+                mask: vec![0, 255, 0, 255],
+            }),
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(255, 255, 255), 24.0, 24.0);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 48 + x) * 4 + 3) as usize);
+        let row: Vec<u8> = (8..=40).map(|x| alpha(x, 24)).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial >= 3, "tip edge is blocky: {row:?}");
+        assert!(
+            row.iter().any(|&a| a > 200),
+            "tip lost its solid side: {row:?}"
+        );
+    }
+
+    #[test]
+    fn hard_dab_edge_is_anti_aliased() {
+        // A hard disc used to flip 0 -> 255 in one pixel, which is what
+        // makes thin strokes stair-step and short caps read as blunt cuts.
+        let mut doc = Document::new(64, 64);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(20, 90, 220), 32.3, 31.7);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 64 + x) * 4) as usize + 3);
+        let row: Vec<u8> = (15..=48).map(|x| alpha(x, 31)).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial >= 2, "rim has no partial coverage: {row:?}");
+        let solid = row.iter().filter(|&&a| a == 255).count();
+        assert!(solid >= 10, "core lost its solidity: {row:?}");
+    }
+
+    #[test]
+    fn hard_dab_edge_ramps_instead_of_jumping() {
+        // Neighbouring pixels across the rim never jump straight from
+        // transparent to opaque: every side of the disc shows a step.
+        let mut doc = Document::new(64, 64);
+        let brush = Brush {
+            size: 20.0,
+            softness: 0.0,
+            opacity: 1.0,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&brush, Color::rgb(20, 90, 220), 31.4, 32.6);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 64 + x) * 4) as usize + 3);
+        for y in 20..=44 {
+            let mut left = None;
+            for x in 16..=32 {
+                let a = alpha(x, y);
+                if a > 0 {
+                    left = Some(a);
+                    break;
+                }
+            }
+            if let Some(a) = left {
+                assert!(a < 255, "left rim of row {y} starts at 255 ({a})");
+            }
+        }
+    }
+
+    #[test]
+    fn default_brush_edge_is_nearly_hard() {
+        // The app boots into Brush::default() and the Round preset mirrors
+        // it. Softness above a quarter turns every fresh stroke into an
+        // airbrush: the solid core shrinks to 40% of the radius and the rim
+        // ramps over 6 px at size 24, which reads as out of focus next to a
+        // hard default round.
+        let default = Brush::default();
+        assert!(
+            default.softness <= 0.25,
+            "default softness {} paints an airbrush edge",
+            default.softness
+        );
+        let round = presets()
+            .into_iter()
+            .find(|(name, _)| *name == "Round")
+            .map(|(_, b)| b)
+            .expect("Round preset");
+        assert!(round.softness <= 0.25, "Round softness {}", round.softness);
+        // At most ~1 px of rim per side at size 24, and a solid core.
+        let mut doc = Document::new(64, 64);
+        doc.dab(&default, Color::rgb(20, 90, 220), 32.0, 32.0);
+        let alpha = |x: u32| doc.layers[0].pixels.get(((32 * 64 + x) * 4) as usize + 3);
+        let row: Vec<u8> = (18..=46).map(alpha).collect();
+        let partial = row.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(partial <= 6, "default rim ramps over {partial} px: {row:?}");
+        let solid = row.iter().filter(|&&a| a >= 250).count();
+        assert!(solid >= 16, "default core only {solid} px solid: {row:?}");
+    }
+
+    /// One straight stroke through the engine, chained like the app does.
+    fn stroke_flat(doc: &mut Document, brush: &Brush, y: f32, x0: f32, x1: f32) {
+        let mut last = None;
+        let mut left = 0.0;
+        let d = DabDynamics {
+            pressure: 1.0,
+            speed_norm: 0.0,
+            angle: 0.0,
+            taper: 1.0,
+        };
+        let mut x = x0;
+        while x <= x1 {
+            let (l, lo) =
+                doc.stroke_to_dyn(brush, Color::rgb(10, 10, 10), last, d, (x, y), d, left);
+            last = l;
+            left = lo;
+            x += 2.0;
+        }
+    }
+
+    fn max_alpha(doc: &Document) -> u8 {
+        (0..doc.h)
+            .flat_map(|y| (0..doc.w).map(move |x| (x, y)))
+            .map(|(x, y)| doc.layers[0].pixels.get(((y * doc.w + x) * 4) as usize + 3))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn one_stroke_stops_at_brush_opacity() {
+        // 0.25 opacity used to build to ~0.99 where dabs overlapped: every
+        // soft or translucent brush painted as a solid tube.
+        let mut doc = Document::new(140, 60);
+        let brush = Brush {
+            size: 16.0,
+            opacity: 0.25,
+            softness: 0.8,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let peak = max_alpha(&doc);
+        assert!(
+            (56..=70).contains(&peak),
+            "stroke should cap near 0.25*255, got {peak}"
+        );
+    }
+
+    #[test]
+    fn soft_stroke_keeps_its_feathered_edge() {
+        let mut doc = Document::new(140, 80);
+        let brush = Brush {
+            size: 40.0,
+            opacity: 1.0,
+            softness: 1.0,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 40.0, 12.0, 128.0);
+        let at = |dy: u32| {
+            doc.layers[0]
+                .pixels
+                .get((((40 - dy) * 140 + 70) * 4) as usize + 3)
+        };
+        // Sampled a quarter of the way out, the falloff must still read
+        // like a gradient instead of a saturated plateau.
+        assert!(at(0) > 240, "center {}", at(0));
+        assert!(at(15) < 140, "edge saturated at +15px: {}", at(15));
+        assert!(at(15) < at(0), "no gradient: {} vs {}", at(15), at(0));
+    }
+
+    #[test]
+    fn separate_strokes_still_build_up() {
+        let mut doc = Document::new(140, 60);
+        let brush = Brush {
+            size: 16.0,
+            opacity: 0.5,
+            softness: 0.6,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            grain: 0.0,
+            scatter: 0.0,
+            stabilizer: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let first = max_alpha(&doc);
+        stroke_flat(&mut doc, &brush, 30.0, 12.0, 128.0);
+        let second = max_alpha(&doc);
+        assert!((120..=140).contains(&first), "first {first}");
+        assert!(second > 175, "second stroke did not build up: {second}");
+    }
+
+    #[test]
+    fn eraser_stroke_stops_at_its_opacity() {
+        let mut doc = Document::new(140, 60);
+        let paint = Brush {
+            size: 30.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            velocity_size: 0.0,
+            velocity_opacity: 0.0,
+            ..Default::default()
+        };
+        stroke_flat(&mut doc, &paint, 30.0, 12.0, 128.0);
+        let eraser = Brush {
+            eraser: true,
+            opacity: 0.5,
+            ..paint.clone()
+        };
+        stroke_flat(&mut doc, &eraser, 30.0, 12.0, 128.0);
+        let center = doc.layers[0].pixels.get(((30 * 140 + 70) * 4) as usize + 3);
+        assert!(
+            (110..=145).contains(&center),
+            "eraser at 0.5 left alpha {center}"
+        );
     }
 
     #[test]
     fn old_brush_files_default_the_new_depth_fields() {
         // Pre-M39 library JSON has no blend/wet/dual keys: same defaults.
-        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.6,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.6,"velocity_opacity":0.6,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
+        // Every present key mirrors Brush::default(), so the assertion stays
+        // about the absent ones.
+        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.0,"velocity_opacity":0.0,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
         let brush: Brush = serde_json::from_str(old).unwrap();
         assert_eq!(brush, Brush::default());
+    }
+
+    // --- Built-in preset character ---
+    //
+    // A mouse has no pressure sensor, so speed was the only dynamics signal
+    // and every preset thinned into a thread between full-size blobs. These
+    // tests pin the preset character at full pressure and zero speed, which
+    // is exactly what a mouse stroke looks like apart from the speed term.
+
+    fn preset_brush(name: &str) -> Brush {
+        presets()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, b)| b)
+            .unwrap_or_else(|| panic!("no preset named {name}"))
+    }
+
+    /// One straight full-pressure, zero-speed stroke across a fresh document.
+    fn paint_straight(name: &str, w: u32, h: u32) -> Document {
+        paint_straight_brush(&preset_brush(name), w, h)
+    }
+
+    fn paint_straight_brush(brush: &Brush, w: u32, h: u32) -> Document {
+        let mut doc = Document::new(w, h);
+        let d = DabDynamics::default();
+        let y = h as f32 / 2.0;
+        let (x0, x1) = (8.0, w as f32 - 8.0);
+        doc.stroke_to_dyn(brush, Color::rgb(0, 0, 0), None, d, (x0, y), d, 0.0);
+        doc.stroke_to_dyn(
+            brush,
+            Color::rgb(0, 0, 0),
+            Some((x0, y)),
+            d,
+            (x1, y),
+            d,
+            0.0,
+        );
+        doc.end_stroke();
+        doc
+    }
+
+    fn alpha_at(doc: &Document, x: u32, y: u32) -> u8 {
+        doc.layers[0].pixels.get(((y * doc.w + x) * 4 + 3) as usize)
+    }
+
+    fn partial_rows(doc: &Document, x: u32) -> usize {
+        (0..doc.h)
+            .filter(|&y| {
+                let a = alpha_at(doc, x, y);
+                a > 0 && a < 200
+            })
+            .count()
+    }
+
+    #[test]
+    fn presets_that_used_speed_no_longer_thin_or_fade_with_it() {
+        for name in ["Round", "Marker", "Airbrush", "Chalk"] {
+            let b = preset_brush(name);
+            assert!(
+                (b.resolve_size(1.0, 1.0) - b.resolve_size(1.0, 0.0)).abs() < 1e-4,
+                "{name} still thins with speed"
+            );
+            assert!(
+                (b.resolve_opacity(1.0, 1.0) - b.resolve_opacity(1.0, 0.0)).abs() < 1e-4,
+                "{name} still fades with speed"
+            );
+        }
+    }
+
+    #[test]
+    fn default_brush_paints_the_same_width_at_any_speed() {
+        let b = Brush::default();
+        assert_eq!(b.resolve_size(1.0, 1.0), b.size);
+        assert_eq!(b.resolve_opacity(1.0, 1.0), b.opacity);
+    }
+
+    #[test]
+    fn pencil_and_ink_keep_their_speed_response() {
+        assert!(preset_brush("Pencil").velocity_size > 0.0);
+        assert!(preset_brush("Ink Pen").velocity_size > 0.0);
+    }
+
+    #[test]
+    fn round_preset_draws_one_even_width() {
+        let doc = paint_straight("Round", 200, 60);
+        let col = |x: u32| (0..60).filter(|&y| alpha_at(&doc, x, y) > 0).count();
+        let (a, b, c) = (col(40), col(100), col(160));
+        assert!(b >= 20, "round stroke too thin: {b} px");
+        assert!(
+            (a as i32 - b as i32).abs() <= 2 && (c as i32 - b as i32).abs() <= 2,
+            "round width wanders: {a}/{b}/{c}"
+        );
+    }
+
+    #[test]
+    fn round_preset_keeps_a_crisp_edge() {
+        let doc = paint_straight("Round", 200, 60);
+        let partial = partial_rows(&doc, 100);
+        assert!(partial <= 4, "round rim is soft: {partial} px");
+    }
+
+    #[test]
+    fn marker_preset_lays_a_hard_chisel_band() {
+        let doc = paint_straight("Marker", 240, 80);
+        let width = (0..80).filter(|&y| alpha_at(&doc, 120, y) > 0).count();
+        assert!((14..=24).contains(&width), "marker width {width} px");
+        let core = alpha_at(&doc, 120, 40);
+        assert!(
+            (150..=200).contains(&core),
+            "marker ink should stay translucent, core alpha {core}"
+        );
+        // A hard nib keeps full ink at 80% of its half-width; a soft one has
+        // already faded there. The chisel's top/bottom are a long ellipse
+        // tangent, so the nib is judged across its short axis, not by a
+        // count of rim pixels.
+        let near_rim = alpha_at(&doc, 120, 48);
+        assert!(
+            near_rim as u32 * 10 >= core as u32 * 9,
+            "marker nib is soft: {near_rim} at 80% radius, core {core}"
+        );
+    }
+
+    #[test]
+    fn chalk_preset_keeps_a_continuous_dry_core() {
+        let doc = paint_straight("Chalk", 260, 80);
+        let holes: Vec<u32> = (30..230).filter(|&x| alpha_at(&doc, x, 40) < 110).collect();
+        assert!(holes.is_empty(), "chalk core breaks at {holes:?}");
+        let row: Vec<u8> = (30..230).map(|x| alpha_at(&doc, x, 40)).collect();
+        let (min, max) = (*row.iter().min().unwrap(), *row.iter().max().unwrap());
+        assert!(max - min >= 20, "chalk lost its grain: {min}..{max}");
+    }
+
+    #[test]
+    fn grain_cell_shrinks_with_the_dab() {
+        assert_eq!(grain_cell(22.0, 1.3), 4);
+        assert_eq!(grain_cell(12.0, 1.3), 4);
+        assert_eq!(grain_cell(6.0, 1.3), 2);
+        assert_eq!(grain_cell(3.0, 1.3), 1);
+        for size in 1..=64u32 {
+            for cell in 1..=12u32 {
+                let got = grain_cell(size as f32, cell as f32 / 3.0);
+                assert!(got <= cell, "size {size} cell {cell}: grew to {got}");
+                assert!(
+                    got * 3 <= size.max(3),
+                    "size {size} cell {cell}: {got} is wider than a third of the dab"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chalk_small_size_grain_is_finer_than_the_dab() {
+        let mut brush = preset_brush("Chalk");
+        brush.size = 6.0;
+        let doc = paint_straight_brush(&brush, 200, 40);
+        let sum = |y: u32| -> u32 { (20..180).map(|x| alpha_at(&doc, x, y) as u32).sum() };
+        let core_y = (0..doc.h).max_by_key(|&y| sum(y)).unwrap();
+        let row: Vec<u8> = (20..180).map(|x| alpha_at(&doc, x, core_y)).collect();
+        assert!(
+            row.iter().all(|&a| a >= 100),
+            "chalk 6 px core breaks: {row:?}"
+        );
+        let steps = row.windows(2).filter(|p| p[0].abs_diff(p[1]) >= 40).count();
+        assert!(
+            steps >= 25,
+            "chalk 6 px grain too coarse: {steps} steps in {row:?}"
+        );
+    }
+
+    #[test]
+    fn airbrush_preset_is_a_smooth_even_haze() {
+        let doc = paint_straight("Airbrush", 260, 120);
+        let row = |y: u32| -> Vec<i32> { (40..220).map(|x| alpha_at(&doc, x, y) as i32).collect() };
+        let center = row(60);
+        let (min, max) = (*center.iter().min().unwrap(), *center.iter().max().unwrap());
+        assert!(max - min <= 6, "airbrush speckles {min}..{max}");
+        assert!((60..=100).contains(&max), "airbrush core alpha {max}");
+        let off = *row(75).iter().max().unwrap();
+        assert!(
+            off < max,
+            "airbrush has no falloff: {max} on axis, {off} off"
+        );
+    }
+
+    #[test]
+    fn spaced_substeps_inside_a_gap_do_not_ink() {
+        // Live painting walks a smoothed curve in 4 px substeps, but a
+        // 100 px brush at 0.2 spacing only owes a dab every 20 px. The
+        // endpoint-inking `stroke_to_dyn` used to stamp every substep,
+        // multiplying the dab count; `_spaced` leaves the gap empty.
+        let mut doc = Document::new(120, 64);
+        let brush = Brush {
+            size: 100.0,
+            opacity: 1.0,
+            softness: 0.0,
+            spacing: 0.2,
+            ..Default::default()
+        };
+        let color = Color::rgb(30, 30, 30);
+        let dyn_ = DabDynamics::default();
+        doc.checkpoint();
+        let (from, leftover) =
+            doc.stroke_to_dyn_spaced(&brush, color, None, dyn_, (24.0, 32.0), dyn_, 0.0);
+        // The first substep restamps the stroke start (a no-op) and starts
+        // the spacing clock; snapshot after it.
+        let (mut from, mut leftover) =
+            doc.stroke_to_dyn_spaced(&brush, color, from, dyn_, (28.0, 32.0), dyn_, leftover);
+        let after_start = doc.layers[0].pixels.clone();
+        // 12 px more, still inside the 20 px gap: nothing may change.
+        for x in [32.0, 36.0, 40.0] {
+            let (f, lo) =
+                doc.stroke_to_dyn_spaced(&brush, color, from, dyn_, (x, 32.0), dyn_, leftover);
+            from = f;
+            leftover = lo;
+        }
+        assert_eq!(
+            doc.layers[0].pixels, after_start,
+            "a substep inside the spacing gap stamped a dab"
+        );
+        // 44 px is 20 px travelled: the gap closed, the next dab lands.
+        doc.stroke_to_dyn_spaced(&brush, color, from, dyn_, (44.0, 32.0), dyn_, leftover);
+        assert_ne!(
+            doc.layers[0].pixels, after_start,
+            "the spacing gap never closed"
+        );
+    }
+
+    #[test]
+    fn spaced_substeps_match_one_call() {
+        // Chaining 4 px substeps must lay exactly the dabs one full-length
+        // call would (positions and leftover) for brush and eraser. The
+        // geometry is exact in f32: 20 px spacing steps, integer positions.
+        let run = |eraser: bool, substeps: bool| -> (crate::Raster, f32) {
+            let mut doc = Document::new(260, 72);
+            if eraser {
+                let filler = Brush {
+                    opacity: 1.0,
+                    ..Default::default()
+                };
+                doc.fill_rect(&filler, Color::rgb(210, 140, 60), 0, 0, 259, 71);
+            }
+            let brush = Brush {
+                size: 100.0,
+                opacity: 0.8,
+                softness: 0.4,
+                spacing: 0.2,
+                eraser,
+                ..Default::default()
+            };
+            let color = Color::rgb(20, 40, 160);
+            let dyn_ = DabDynamics::default();
+            doc.checkpoint();
+            let (from, leftover) =
+                doc.stroke_to_dyn_spaced(&brush, color, None, dyn_, (30.0, 36.0), dyn_, 0.0);
+            let leftover = if substeps {
+                let (mut from, mut leftover) = (from, leftover);
+                let mut x = 30.0;
+                while x < 230.0 {
+                    let (f, lo) = doc.stroke_to_dyn_spaced(
+                        &brush,
+                        color,
+                        from,
+                        dyn_,
+                        (x + 4.0, 36.0),
+                        dyn_,
+                        leftover,
+                    );
+                    from = f;
+                    leftover = lo;
+                    x += 4.0;
+                }
+                leftover
+            } else {
+                doc.stroke_to_dyn_spaced(&brush, color, from, dyn_, (230.0, 36.0), dyn_, leftover)
+                    .1
+            };
+            (doc.layers[0].pixels.clone(), leftover)
+        };
+        for eraser in [false, true] {
+            let (one, one_left) = run(eraser, false);
+            let (many, many_left) = run(eraser, true);
+            assert_eq!(
+                one, many,
+                "eraser {eraser}: chained substeps painted different pixels"
+            );
+            assert!(
+                (one_left - many_left).abs() < 1e-4,
+                "eraser {eraser}: leftover {one_left} vs {many_left}"
+            );
+        }
+    }
+
+    /// Filled shapes paint dense row spans now; they must land the exact
+    /// bytes the per-pixel `put_one` rule lays down (selection rect + mask,
+    /// layer offset, semi-transparent destination).
+    #[test]
+    fn dense_shape_fills_match_the_per_pixel_path() {
+        let brush = Brush {
+            opacity: 0.6,
+            size: 40.0,
+            softness: 0.3,
+            ..Default::default()
+        };
+        let color = Color::rgb(30, 140, 210);
+        let build = || {
+            let mut doc = Document::new(300, 200); // tile seam at x = 256
+            let fill = Brush {
+                opacity: 1.0,
+                ..Default::default()
+            };
+            doc.fill_rect(&fill, Color::rgb(200, 100, 50), 0, 0, 299, 199);
+            for y in (0..200).step_by(3) {
+                for x in (0..300).step_by(5) {
+                    let o = ((y * 300 + x) * 4) as usize;
+                    doc.layers[0].pixels.set4(o, [90, 180, 40, 130]);
+                }
+            }
+            doc.selection = Some((13, 9, 287, 191));
+            let mut mask: Vec<u8> = (0..300 * 200).map(|i| ((i * 13) % 256) as u8).collect();
+            mask[0] = 0;
+            doc.selection_mask = Some(mask);
+            doc.translate_layer(0, 6, -4);
+            doc
+        };
+
+        let mut want = build();
+        for y in 0..200 {
+            for x in 0..300 {
+                want.put_one(&brush, color, x, y);
+            }
+        }
+        let mut got = build();
+        got.fill_rect(&brush, color, 0, 0, 299, 199);
+        assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "rect fill");
+
+        let mut want = build();
+        for y in 0..200u32 {
+            for x in 0..300u32 {
+                let dx = (x as f32 + 0.5 - 150.0) / 120.0;
+                let dy = (y as f32 + 0.5 - 100.0) / 80.0;
+                if dx * dx + dy * dy <= 1.0 {
+                    want.put_one(&brush, color, x, y);
+                }
+            }
+        }
+        let mut got = build();
+        got.fill_ellipse(&brush, color, 30.0, 20.0, 270.0, 180.0);
+        assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "ellipse fill");
+
+        let pts = Document::poly_vertices(ShapePoly::Triangle, 30.0, 20.0, 270.0, 180.0, 3);
+        let mut want = build();
+        for y in 0..200u32 {
+            for x in 0..300u32 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let mut inside = false;
+                let mut j = pts.len() - 1;
+                for i in 0..pts.len() {
+                    let (xi, yi) = pts[i];
+                    let (xj, yj) = pts[j];
+                    if (yi > py) != (yj > py) {
+                        let at = xi + (py - yi) / (yj - yi) * (xj - xi);
+                        if px < at {
+                            inside = !inside;
+                        }
+                    }
+                    j = i;
+                }
+                if inside {
+                    want.put_one(&brush, color, x, y);
+                }
+            }
+        }
+        let mut got = build();
+        got.fill_poly(
+            &brush,
+            color,
+            ShapePoly::Triangle,
+            30.0,
+            20.0,
+            270.0,
+            180.0,
+            3,
+        );
+        assert_eq!(got.layers[0].pixels, want.layers[0].pixels, "poly fill");
+    }
+
+    #[test]
+    fn filled_shapes_still_mirror_with_symmetry() {
+        let mut doc = Document::new(20, 20);
+        doc.symmetry = SymmetryMode::Horizontal;
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(9, 9, 9), 1, 1, 3, 3);
+        let alpha = |x: u32, y: u32| doc.layers[0].pixels.get(((y * 20 + x) * 4 + 3) as usize);
+        assert_eq!(alpha(1, 1), 255);
+        assert_eq!(alpha(18, 1), 255, "mirror across the canvas center");
+        assert_eq!(alpha(10, 1), 0);
     }
 }

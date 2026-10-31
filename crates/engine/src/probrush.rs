@@ -1806,7 +1806,7 @@ mod tests {
             ..Brush::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 16.0, 16.0);
-        doc.layers[0].pixels.clone()
+        doc.layers[0].pixels.to_dense()
     }
 
     #[test]
@@ -1834,7 +1834,7 @@ mod tests {
         };
         doc.selection = Some((0, 0, 4, 4));
         doc.dab(&brush, Color::rgb(1, 2, 3), 16.0, 16.0);
-        assert!(doc.layers[0].pixels.iter().all(|&b| b == 0));
+        assert!(doc.layers[0].pixels.to_dense().iter().all(|&b| b == 0));
     }
 
     #[test]

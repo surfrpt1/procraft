@@ -4,6 +4,7 @@
 
 mod animation;
 mod brush;
+mod composite;
 mod document;
 mod guides;
 mod import_filter;
@@ -11,6 +12,7 @@ mod palette;
 mod pointer;
 mod probrush;
 mod psd;
+mod raster;
 mod settings;
 mod shortcuts;
 mod tap;
@@ -26,6 +28,7 @@ pub use brush::{
     open_brush_library, presets, save_brush_library, Brush, BrushPreset, BrushTip, Color,
     DabDynamics, ShapePoly, Stroke, Taper, MAX_LIBRARY_BRUSHES, MAX_TIP_SIDE,
 };
+pub use composite::StackPlan;
 pub use document::{
     curves_lut, gallery_thumb, levels_lut, BlendMode, Document, Layer, LayerGroup, PaintTarget,
     SymmetryMode, MAX_CANVAS_SIDE,
@@ -42,6 +45,7 @@ pub use probrush::{
     export_tip_png, import_brush_file, import_brush_file_report, ImportOutcome, ImportedBrush,
 };
 pub use psd::{open_psd, save_psd};
+pub use raster::{Raster, TILE};
 pub use settings::{Settings, SETTINGS_VERSION};
 pub use shortcuts::{
     ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, SizeDragMode, StoredShortcuts,

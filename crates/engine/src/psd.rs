@@ -82,20 +82,36 @@ fn bei32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-/// Split RGBA bytes into planar R/G/B/A/pull-mask vectors.
-fn planes(pixels: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    let n = (w * h) as usize;
+/// Planar R/G/B/A planes of one baked layer (or the composite).
+type Planes = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Split RGBA bytes into planar R/G/B/A/pull-mask vectors. Dimensions are
+/// capped by [`MAX_SIDE`] at every entry point, but the arithmetic is
+/// checked anyway and a short buffer is an error, not an index panic.
+fn planes(pixels: &[u8], w: u32, h: u32) -> Result<Planes, String> {
+    let n = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| "PSD dimensions overflow".to_string())?;
+    let expected = n
+        .checked_mul(4)
+        .ok_or_else(|| "PSD dimensions overflow".to_string())?;
+    if pixels.len() < expected {
+        return Err(format!(
+            "PSD layer buffer is truncated: expected {expected} bytes, got {}",
+            pixels.len()
+        ));
+    }
     let mut r = vec![0u8; n];
     let mut g = vec![0u8; n];
     let mut b = vec![0u8; n];
     let mut a = vec![0u8; n];
-    for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate().take(n) {
+    for (i, px) in pixels[..expected].as_chunks::<4>().0.iter().enumerate() {
         r[i] = px[0];
         g[i] = px[1];
         b[i] = px[2];
         a[i] = px[3];
     }
-    (r, g, b, a)
+    Ok((r, g, b, a))
 }
 
 /// One entry in the PSD layer-record section, in file (top-first) order.
@@ -283,7 +299,7 @@ fn emit_layer(
     n: usize,
 ) -> Result<(), String> {
     let layer = &doc.layers[index];
-    let Some((baked_px, baked_mask)) = doc.baked_layer(index) else {
+    let Some((baked_px, baked_mask)) = doc.baked_layer(index)? else {
         return Err("layer has wrong pixel size".to_string());
     };
     let has_mask = baked_mask.as_deref().map(|m| m.len() == n).unwrap_or(false);
@@ -325,7 +341,7 @@ fn emit_layer(
     be32(records, extra.len() as u32);
     records.extend_from_slice(&extra);
     // Channel bytes: raw compression + planar data.
-    let (r, g, b, a) = planes(&baked_px, w, h);
+    let (r, g, b, a) = planes(&baked_px, w, h)?;
     let mut push = |plane: &[u8]| {
         be16(channel_data, 0);
         channel_data.extend_from_slice(plane);
@@ -355,13 +371,20 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
     if doc.groups.len() > 256 {
         return Err("document has too many groups".to_string());
     }
-    let n = (w * h) as usize;
+    let n = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| "canvas has bad dimensions".to_string())?;
+    let n4 = n
+        .checked_mul(4)
+        .ok_or_else(|| "canvas has bad dimensions".to_string())?;
     for layer in &doc.layers {
-        if layer.pixels.len() != n * 4 {
+        // Geometry first: `len()` alone lets a 4x1 raster stand in for a
+        // 2x2 canvas, which would bake the wrong slots.
+        if layer.pixels.w() != w || layer.pixels.h() != h || layer.pixels.len() != n4 {
             return Err("layer has wrong pixel size".to_string());
         }
-        if let Some(m) = layer.mask.as_deref() {
-            if m.len() != n {
+        if let Some(m) = layer.mask.as_ref() {
+            if m.w() != w || m.h() != h || m.len() != n {
                 return Err("layer mask has wrong size".to_string());
             }
         }
@@ -418,8 +441,8 @@ pub fn save_psd(path: &std::path::Path, doc: &Document) -> Result<(), String> {
     be32(&mut out, 0);
     // Composite image: raw planar RGB of the flattened canvas.
     be16(&mut out, 0);
-    let flat = doc.flatten();
-    let (r, g, b, _) = planes(&flat, w, h);
+    let flat = doc.try_flatten()?;
+    let (r, g, b, _) = planes(&flat, w, h)?;
     out.extend_from_slice(&r);
     out.extend_from_slice(&g);
     out.extend_from_slice(&b);
@@ -451,7 +474,10 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
     if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
         return Err("PSD has bad dimensions".to_string());
     }
-    let expect = (w * h * 4) as usize;
+    let expect = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "PSD has bad dimensions".to_string())?;
     let mut layers = Vec::new();
     if file.layers().is_empty() {
         // Flattened-only file: the composite becomes one layer.
@@ -464,7 +490,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
-            pixels: rgba,
+            pixels: crate::Raster::from_dense(w, h, 4, &rgba),
             mask: None,
             clip: false,
             ox: 0,
@@ -495,7 +521,7 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
                 visible: !pl.visible(),
                 opacity: pl.opacity() as f32 / 255.0,
                 blend: key_blend(&format!("{:?}", pl.blend_mode())),
-                pixels: rgba,
+                pixels: crate::Raster::from_dense(w, h, 4, &rgba),
                 mask: None,
                 clip: !pl.is_clipping_mask(),
                 ox: 0,
@@ -568,19 +594,25 @@ pub fn open_psd(path: &std::path::Path) -> Result<Document, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::Raster;
+
+    /// Test-only: an RGBA raster sized to the document from dense bytes.
+    fn px_rgba(doc: &Document, bytes: &[u8]) -> Raster {
+        Raster::from_dense(doc.w, doc.h, 4, bytes)
+    }
 
     fn sample_doc() -> Document {
         let mut doc = Document::new(5, 3);
         doc.background = [10, 20, 30, 255];
         doc.layers[0].name = "A".to_string();
-        doc.layers[0].pixels = vec![200; 5 * 3 * 4];
+        doc.layers[0].pixels = px_rgba(&doc, &[200; 5 * 3 * 4]);
         doc.add_layer("BC".to_string());
         doc.layers[1].blend = BlendMode::Difference;
         doc.layers[1].opacity = 0.5;
         doc.layers[1].clip = true;
-        doc.layers[1].pixels = vec![7; 5 * 3 * 4];
+        doc.layers[1].pixels = px_rgba(&doc, &[7; 5 * 3 * 4]);
         doc.add_mask(1);
-        doc.layers[1].mask.as_mut().unwrap()[0] = 0;
+        doc.layers[1].mask.as_mut().unwrap().set(0, 0);
         doc
     }
 
@@ -654,26 +686,26 @@ mod tests {
         // A layer moved +2 exports its content at canvas 2 (cropped bake),
         // so Photoshop opens what ProCraft shows.
         let mut doc = Document::new(5, 1);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.layers[0].ox = 2;
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-offset.psd");
         save_psd(&path, &doc).unwrap();
         let back = open_psd(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(&back.layers[0].pixels[0..4], &[0, 0, 0, 0]);
-        assert_eq!(&back.layers[0].pixels[8..12], &[255, 0, 0, 255]);
+        assert_eq!(back.layers[0].pixels.get4(0), [0, 0, 0, 0]);
+        assert_eq!(back.layers[0].pixels.get4(8), [255, 0, 0, 255]);
     }
 
     #[test]
     fn psd_groups_roundtrip_nested() {
         let mut doc = Document::new(4, 2);
         doc.layers[0].name = "base".to_string();
-        doc.layers[0].pixels = [255, 0, 0, 255].repeat(8);
+        doc.layers[0].pixels = px_rgba(&doc, &([255, 0, 0, 255].repeat(8)));
         doc.add_layer("mid".to_string());
-        doc.layers[1].pixels = [0, 255, 0, 255].repeat(8);
+        doc.layers[1].pixels = px_rgba(&doc, &([0, 255, 0, 255].repeat(8)));
         doc.add_layer("top".to_string());
-        doc.layers[2].pixels = [0, 0, 255, 255].repeat(8);
+        doc.layers[2].pixels = px_rgba(&doc, &([0, 0, 255, 255].repeat(8)));
         let inner = doc.new_group("Inner".to_string());
         doc.set_group_opacity(inner, 0.5);
         doc.move_layer_into_group(0, Some(inner)); // base
@@ -758,7 +790,47 @@ mod tests {
         assert!(open_psd(&path).is_err());
         let _ = std::fs::remove_file(&path);
         let mut doc = Document::new(2, 2);
-        doc.layers[0].pixels.truncate(3);
+        // Wrong geometry (not a 2x2 RGBA raster) exercises the size guard.
+        doc.layers[0].pixels = Raster::new(1, 1, 4);
         assert!(save_psd(&dir.join("procraft-badsize.psd"), &doc).is_err());
+    }
+
+    #[test]
+    fn planes_rejects_truncated_and_overflowing_buffers() {
+        // A short layer buffer is an error, never an index panic.
+        assert!(planes(&[0u8; 15], 2, 2).is_err());
+        assert!(planes(&[], 2, 2).is_err());
+        // Dimensions whose byte count cannot be represented fail before
+        // any allocation is attempted.
+        assert!(planes(&[], u32::MAX, u32::MAX).is_err());
+        // Excess trailing bytes are ignored, not read.
+        let mut px = vec![0u8; 24];
+        for (i, b) in px.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (r, g, b, a) = planes(&px, 2, 2).unwrap();
+        assert_eq!((r.len(), g.len(), b.len(), a.len()), (4, 4, 4, 4));
+        assert_eq!((r[1], g[1], b[1], a[1]), (4, 5, 6, 7));
+    }
+
+    #[test]
+    fn psd_guard_checks_geometry_not_byte_length() {
+        let dir = std::env::temp_dir();
+        // 4x1 RGBA holds the same 16 bytes as a 2x2 canvas but is not its
+        // geometry: the guard must reject it before any baking.
+        let mut doc = Document::new(2, 2);
+        doc.layers[0].pixels = Raster::rgba(4, 1);
+        assert_eq!(
+            save_psd(&dir.join("procraft-badshape.psd"), &doc),
+            Err("layer has wrong pixel size".to_string())
+        );
+        // 4x1 mask holds the canvas pixel count (4) but not its shape; the
+        // old byte-length guard accepted it and dropped the mask.
+        let mut doc = Document::new(2, 2);
+        doc.layers[0].mask = Some(Raster::mask(4, 1));
+        assert_eq!(
+            save_psd(&dir.join("procraft-badmask.psd"), &doc),
+            Err("layer mask has wrong size".to_string())
+        );
     }
 }

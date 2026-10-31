@@ -1,5 +1,115 @@
 //! Layers, documents, compositing and undo.
 
+use crate::brush::{slot_span, slot_x};
+use crate::raster::{Raster, TILE};
+
+/// Write one raster as a v12 tile table: `u32 count`, then per listed
+/// tile `u16 tx, u16 ty, u32 len, len bytes` of zlib-compressed raw tile
+/// bytes. Unallocated tiles are omitted, and so are allocated-but-all-zero
+/// tiles: an eraser flow zeroes an allocated tile without freeing the slot,
+/// so it is visually empty and would otherwise cost its payload on save
+/// plus a fresh 256 KiB (64 KiB for masks) on load. A sparse 8K layer
+/// therefore saves only tiles that actually hold content.
+///
+/// The count precedes the records, so it is reserved as a placeholder and
+/// patched afterwards: that keeps the write a single streaming pass over
+/// every tile (the deflate already touches the bytes) instead of buffering
+/// a whole layer's compressed payloads in memory.
+fn write_tile_table<W: std::io::Write + std::io::Seek>(
+    f: &mut W,
+    raster: &Raster,
+) -> Result<(), String> {
+    use std::io::{SeekFrom, Write};
+    let count_at = f.stream_position().map_err(|e| e.to_string())?;
+    f.write_all(&0u32.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut count = 0u32;
+    for (tx, ty, tile) in raster.allocated_tiles() {
+        // One scan decides both omission and whether to deflate.
+        if !tile.iter().any(|&b| b != 0) {
+            continue;
+        }
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(tile).map_err(|e| e.to_string())?;
+        let packed = enc.finish().map_err(|e| e.to_string())?;
+        f.write_all(&(tx as u16).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(ty as u16).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(packed.len() as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&packed).map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    let end = f.stream_position().map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(count_at))
+        .map_err(|e| e.to_string())?;
+    f.write_all(&count.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(end)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read a v12 tile table into a fresh raster. `take` hands out the file
+/// bytes and fails closed on truncation. Every record is validated against
+/// the canvas grid, a sane payload length and the exact tile size, so a
+/// corrupt table returns `Err` instead of loading wrong pixels.
+fn read_tile_table<'a>(
+    take: &mut impl FnMut(usize) -> Result<&'a [u8], String>,
+    w: u32,
+    h: u32,
+    bpp: u8,
+) -> Result<Raster, String> {
+    use std::io::Read;
+    let mut raster = Raster::new(w, h, bpp);
+    let slots = raster.tiles_x() as u64 * raster.tiles_y() as u64;
+    let count = u32::from_le_bytes(
+        take(4)?[..4]
+            .try_into()
+            .map_err(|_| "bad tile count".to_string())?,
+    );
+    if count as u64 > slots {
+        return Err("project has bad tile count".to_string());
+    }
+    let tile_len = raster.tile_len();
+    for _ in 0..count {
+        let tx = u16::from_le_bytes(
+            take(2)?[..2]
+                .try_into()
+                .map_err(|_| "bad tile x".to_string())?,
+        ) as u32;
+        let ty = u16::from_le_bytes(
+            take(2)?[..2]
+                .try_into()
+                .map_err(|_| "bad tile y".to_string())?,
+        ) as u32;
+        if tx >= raster.tiles_x() || ty >= raster.tiles_y() {
+            return Err("project has out-of-range tile".to_string());
+        }
+        let len = u32::from_le_bytes(
+            take(4)?[..4]
+                .try_into()
+                .map_err(|_| "bad tile length".to_string())?,
+        ) as usize;
+        if len == 0 || len > tile_len + 10 * 1024 * 1024 {
+            return Err("project has bad tile length".to_string());
+        }
+        let packed = take(len)?;
+        // Bound the inflate at the tile size so a bomb cannot balloon the
+        // read; a short or long result is a corrupt tile.
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(packed)
+            .take(tile_len as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|_| "project has corrupt tile".to_string())?;
+        if raw.len() != tile_len {
+            return Err("project has corrupt tile".to_string());
+        }
+        raster.tile_mut(tx, ty).copy_from_slice(&raw);
+    }
+    Ok(raster)
+}
+
 /// How a layer's pixels combine with what's beneath.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
@@ -256,6 +366,9 @@ impl SymmetryMode {
     }
 }
 
+/// One baked layer: canvas-sized RGBA bytes plus an optional reveal mask.
+pub type BakedLayer = (Vec<u8>, Option<Vec<u8>>);
+
 /// One raster layer: row-major RGBA bytes plus presentation state.
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -264,11 +377,12 @@ pub struct Layer {
     /// 0.0 (transparent) ..= 1.0 (opaque).
     pub opacity: f32,
     pub blend: BlendMode,
-    pub pixels: Vec<u8>,
-    /// Optional grayscale reveal mask (row-major, 255 = fully shown).
+    /// Tiled RGBA pixels: dense-index reads/writes, allocated per 256² tile.
+    pub pixels: Raster,
+    /// Optional grayscale reveal mask (tiled, 255 = fully shown).
     /// Multiplies the layer's alpha at composite time. Session-painted;
     /// saved to v5 project files.
-    pub mask: Option<Vec<u8>>,
+    pub mask: Option<Raster>,
     /// Clipping mask: confine this layer to the opaque content beneath it.
     pub clip: bool,
     /// Canvas offset of the buffer's top-left in pixels. The Move tool only
@@ -316,7 +430,7 @@ impl Layer {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
-            pixels: vec![0; (w * h * 4) as usize],
+            pixels: Raster::rgba(w, h),
             mask: None,
             clip: false,
             ox: 0,
@@ -408,6 +522,16 @@ pub struct Document {
     /// mutations made behind their back (e.g. a transform session holding
     /// a pre-transform pixel base). Session-only, never saved.
     rev: u64,
+    /// Per-stroke peak coverage (0..=255 per canvas pixel) for the active
+    /// stroke: a pixel keeps the strongest single dab instead of summing
+    /// every dab that crosses it, so one stroke stops at the brush opacity
+    /// and keeps its soft rim. Session-only, never saved.
+    pub(crate) stroke_peak: Option<Raster>,
+    /// Canvas bbox touched by the active stroke (inclusive), for cheap
+    /// stroke-local restores. Session-only.
+    pub(crate) stroke_rect: Option<(u32, u32, u32, u32)>,
+    /// Active liquify stroke (snapshot + displacement field). Session-only.
+    liquify: Option<LiquifyStroke>,
 }
 
 /// History cap: at most 32 steps per stack (backstop)…
@@ -417,15 +541,17 @@ const MAX_UNDO_ENTRIES: usize = 32;
 /// cap binds on small ones (32 steps x ~5 MiB at 1280x800).
 const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
 
-/// Canvas side cap for crop/resize: bounds reallocations (one 4096x4096
-/// layer is 64 MiB) and matches the GIF import dimension cap.
-pub const MAX_CANVAS_SIDE: u32 = 4096;
+/// Canvas side cap for crop/resize: bounds reallocations (tiles are
+/// allocated on demand, so an 8192² layer that is never painted costs
+/// nothing; a painted one is 1024 tiles, 256 MiB) and matches the 8K
+/// export target.
+pub const MAX_CANVAS_SIDE: u32 = 8192;
 
 #[derive(Clone, Debug)]
 struct UndoEntry {
     layer: usize,
-    pixels: Vec<u8>,
-    mask: Option<Vec<u8>>,
+    pixels: Raster,
+    mask: Option<Raster>,
     ox: i32,
     oy: i32,
     /// Text-layer vector source at snapshot time, so undo/redo restore the
@@ -435,12 +561,183 @@ struct UndoEntry {
 
 impl UndoEntry {
     fn byte_size(&self) -> usize {
-        self.pixels.len()
-            + self.mask.as_ref().map_or(0, Vec::len)
+        self.pixels.alloc_bytes()
+            + self.mask.as_ref().map_or(0, Raster::alloc_bytes)
             + self.text.as_ref().map_or(0, |t| {
                 t.text.len() + t.style.font_bytes.as_ref().map_or(0, Vec::len)
             })
     }
+}
+
+/// Sparse per-canvas-pixel sample offsets for one liquify stroke, in
+/// lazily allocated `TILE`-side tiles of `[f32; 2]` (x, y). A pixel with no
+/// entry has never been pushed and is never resampled, so an untouched 8K
+/// layer costs nothing and untouched pixels keep their exact bytes. Tiles
+/// are copy-on-write like the layer rasters, so an autosave snapshot of the
+/// open document shares the field instead of copying it.
+#[derive(Clone, Debug)]
+struct LiquifyField {
+    tiles_x: u32,
+    tiles: std::collections::HashMap<u32, std::sync::Arc<Vec<f32>>>,
+}
+
+impl LiquifyField {
+    fn new(w: u32) -> Self {
+        Self {
+            tiles_x: w.div_ceil(TILE),
+            tiles: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Dense copy of `rect` (inclusive) into `out`, row-major with stride =
+    /// rect width; returns that stride. Copies whole tile rows, so a
+    /// disc-sized read does not pay a hash lookup per pixel.
+    fn snapshot_into(&self, rect: (u32, u32, u32, u32), out: &mut Vec<[f32; 2]>) -> u32 {
+        let (x0, y0, x1, y1) = rect;
+        let rw = x1 - x0 + 1;
+        out.clear();
+        out.resize((rw * (y1 - y0 + 1)) as usize, [0.0f32; 2]);
+        for ty in (y0 / TILE)..=(y1 / TILE) {
+            for tx in (x0 / TILE)..=(x1 / TILE) {
+                let Some(t) = self.tiles.get(&(ty * self.tiles_x + tx)) else {
+                    continue;
+                };
+                let gx0 = x0.max(tx * TILE);
+                let gx1 = x1.min(tx * TILE + TILE - 1);
+                let gy0 = y0.max(ty * TILE);
+                let gy1 = y1.min(ty * TILE + TILE - 1);
+                for gy in gy0..=gy1 {
+                    let src = (((gy % TILE) * TILE + gx0 % TILE) * 2) as usize;
+                    let dst = ((gy - y0) * rw + (gx0 - x0)) as usize;
+                    for k in 0..(gx1 - gx0 + 1) as usize {
+                        out[dst + k] = [t[src + k * 2], t[src + k * 2 + 1]];
+                    }
+                }
+            }
+        }
+        rw
+    }
+
+    /// Write a dense `rect` (row-major, `stride` pixels per row) back into
+    /// the tiles, materialising each touched tile once instead of once per
+    /// pixel.
+    fn commit(&mut self, rect: (u32, u32, u32, u32), dense: &[[f32; 2]], stride: u32) {
+        let (x0, y0, x1, y1) = rect;
+        for ty in (y0 / TILE)..=(y1 / TILE) {
+            for tx in (x0 / TILE)..=(x1 / TILE) {
+                let gx0 = x0.max(tx * TILE);
+                let gx1 = x1.min(tx * TILE + TILE - 1);
+                let gy0 = y0.max(ty * TILE);
+                let gy1 = y1.min(ty * TILE + TILE - 1);
+                let tile = self.tiles.entry(ty * self.tiles_x + tx).or_insert_with(|| {
+                    std::sync::Arc::new(vec![0.0f32; (TILE * TILE * 2) as usize])
+                });
+                let t = std::sync::Arc::make_mut(tile);
+                for gy in gy0..=gy1 {
+                    let dst = (((gy % TILE) * TILE + gx0 % TILE) * 2) as usize;
+                    let src = ((gy - y0) * stride + (gx0 - x0)) as usize;
+                    for k in 0..(gx1 - gx0 + 1) as usize {
+                        t[dst + k * 2] = dense[src + k][0];
+                        t[dst + k * 2 + 1] = dense[src + k][1];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One liquify stroke: the layer as it was when the stroke opened plus the
+/// displacement field, which is carried along with the content it moves (a
+/// push shifts the offsets of the pixels it touches, like dragging paint).
+/// Rendering happens once per pointer segment over the swept region, so a
+/// pixel is resampled once per stroke instead of once per push: a drag can
+/// no longer soften what its own earlier pushes already warped.
+#[derive(Clone, Debug)]
+struct LiquifyStroke {
+    layer: usize,
+    src: Raster,
+    field: LiquifyField,
+    /// Dense scratch reused by the pushes and the segment render so a drag
+    /// frame does not allocate per push. Cleared after use; only the
+    /// capacity (never the bytes) persists across frames.
+    scratch_off: Vec<[f32; 2]>,
+    scratch_disc: Vec<[f32; 2]>,
+    scratch_cov: Vec<u8>,
+    scratch_src: Vec<u8>,
+    scratch_row: Vec<u8>,
+    /// `Document::rev` after the last render. Any other write invalidates
+    /// the snapshot, so the next push starts a fresh stroke from the
+    /// current pixels instead of resurrecting stale ones.
+    rev: u64,
+}
+
+impl LiquifyStroke {
+    fn new(index: usize, src: Raster, canvas_w: u32, rev: u64) -> Self {
+        Self {
+            layer: index,
+            src,
+            field: LiquifyField::new(canvas_w),
+            scratch_off: Vec::new(),
+            scratch_disc: Vec::new(),
+            scratch_cov: Vec::new(),
+            scratch_src: Vec::new(),
+            scratch_row: Vec::new(),
+            rev,
+        }
+    }
+}
+
+/// Group pushed rects that overlap or touch, so a deferred render covers
+/// the swept path once while mirror copies far apart stay separate (their
+/// joint bounding box would span the canvas between them).
+fn merge_rects(rects: Vec<(u32, u32, u32, u32)>) -> Vec<Vec<(u32, u32, u32, u32)>> {
+    fn touch(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
+        a.0 <= b.2.saturating_add(1)
+            && b.0 <= a.2.saturating_add(1)
+            && a.1 <= b.3.saturating_add(1)
+            && b.1 <= a.3.saturating_add(1)
+    }
+    let mut groups: Vec<Vec<(u32, u32, u32, u32)>> = Vec::new();
+    for r in rects {
+        let hits: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, parts)| parts.iter().any(|&p| touch(p, r)))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.split_first() {
+            None => groups.push(vec![r]),
+            Some((&first, rest)) => {
+                for &i in rest.iter().rev() {
+                    let merged = groups.remove(i);
+                    groups[first].extend(merged);
+                }
+                groups[first].push(r);
+            }
+        }
+    }
+    groups
+}
+
+/// Split one pointer segment into liquify pushes no longer than `max_step`,
+/// so a fast drag warps the whole segment in this frame instead of trailing
+/// the pointer. The 64-push ceiling keeps a pathological one-frame jump
+/// from stalling the frame.
+fn liquify_steps(from: (f32, f32), to: (f32, f32), max_step: f32) -> Vec<((f32, f32), (f32, f32))> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len == 0.0 {
+        return Vec::new();
+    }
+    let steps = (len / max_step.max(1.0)).ceil().clamp(1.0, 64.0);
+    let mut pushes = Vec::with_capacity(steps as usize);
+    for i in 1..=steps as u32 {
+        let t = i as f32 / steps;
+        let t0 = (i - 1) as f32 / steps;
+        let (sx, sy) = (dx * (t - t0), dy * (t - t0));
+        pushes.push(((from.0 + dx * t, from.1 + dy * t), (sx, sy)));
+    }
+    pushes
 }
 
 impl Document {
@@ -466,6 +763,9 @@ impl Document {
             next_group_id: 1,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
+            liquify: None,
         }
     }
 
@@ -494,6 +794,9 @@ impl Document {
             next_group_id: 1,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
+            liquify: None,
         }
     }
     /// Mirror center in canvas pixels (canvas middle when never moved).
@@ -522,6 +825,22 @@ impl Document {
     /// snapshot it to detect mutations that happen behind their back.
     pub fn revision(&self) -> u64 {
         self.rev
+    }
+
+    /// Tiles held by live layers (not history): what the memory readout shows.
+    pub fn layer_alloc_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.pixels.alloc_bytes() + l.mask.as_ref().map_or(0, Raster::alloc_bytes))
+            .sum()
+    }
+
+    pub fn tiles_x(&self) -> u32 {
+        self.w.div_ceil(TILE)
+    }
+
+    pub fn tiles_y(&self) -> u32 {
+        self.h.div_ceil(TILE)
     }
 
     /// Mark the whole canvas dirty (structural changes, undo, background).
@@ -655,6 +974,56 @@ impl Document {
     /// Create an empty top-level group and return its id. Structural like
     /// add/remove layer: not undoable, marks the view dirty.
     pub fn new_group(&mut self, name: String) -> u32 {
+        self.push_group(name, None)
+    }
+
+    /// Create a group around one layer in place. Out-of-range indexes
+    /// change nothing and return `None`.
+    pub fn group_layer(&mut self, index: usize, name: String) -> Option<u32> {
+        self.group_layers(&[index], name)
+    }
+
+    /// Create a group around every listed layer, preserving the stacking
+    /// order (Photoshop's Group Layers). Out-of-range and duplicate
+    /// indexes are ignored; an empty or entirely invalid list returns
+    /// `None`. The group nests inside the selection's common group when
+    /// all of it already shares one, and lands at the top level when the
+    /// selection spans groups.
+    pub fn group_layers(&mut self, indexes: &[usize], name: String) -> Option<u32> {
+        let mut picked: Vec<usize> = indexes
+            .iter()
+            .copied()
+            .filter(|&i| i < self.layers.len())
+            .collect();
+        picked.sort_unstable();
+        picked.dedup();
+        if picked.is_empty() {
+            return None;
+        }
+        let parent = self.shared_group(&picked);
+        let id = self.push_group(name, parent);
+        for &i in &picked {
+            self.layers[i].group = Some(id);
+        }
+        self.mark_full_dirty();
+        Some(id)
+    }
+
+    /// The group every listed layer already belongs to, if any. Invalid
+    /// indexes are ignored. `None` when the list is empty, spans groups,
+    /// sits at the top level, or names a group that no longer exists.
+    pub fn shared_group(&self, indexes: &[usize]) -> Option<u32> {
+        let mut valid = indexes.iter().copied().filter(|&i| i < self.layers.len());
+        let first = valid.next()?;
+        let parent = self.layers[first].group?;
+        if valid.all(|i| self.layers[i].group == Some(parent)) && self.group(parent).is_some() {
+            Some(parent)
+        } else {
+            None
+        }
+    }
+
+    fn push_group(&mut self, name: String, parent: Option<u32>) -> u32 {
         // Ids start at 1; 0 always reads as "no group".
         let id = self.next_group_id.max(1);
         self.next_group_id = id.saturating_add(1).max(1);
@@ -664,7 +1033,7 @@ impl Document {
             visible: true,
             collapsed: false,
             opacity: 1.0,
-            parent: None,
+            parent,
         });
         self.mark_full_dirty();
         id
@@ -730,6 +1099,85 @@ impl Document {
         self.mark_full_dirty();
     }
 
+    /// Move a layer up one level: out of its group into the group's parent
+    /// (the top level for a root group). The stack position is kept, so the
+    /// canvas does not restack. Returns false for a top-level or invalid
+    /// layer.
+    pub fn move_layer_out_of_group(&mut self, index: usize) -> bool {
+        let Some(group) = self.layers.get(index).and_then(|l| l.group) else {
+            return false;
+        };
+        let parent = self.group(group).and_then(|g| g.parent);
+        self.layers[index].group = parent;
+        self.mark_full_dirty();
+        true
+    }
+
+    /// Layer indexes inside `id`, nested groups included.
+    pub fn group_layer_indexes(&self, id: u32) -> Vec<usize> {
+        let mut ids = vec![id];
+        let mut k = 0;
+        while k < ids.len() {
+            let cur = ids[k];
+            for g in &self.groups {
+                if g.parent == Some(cur) && !ids.contains(&g.id) {
+                    ids.push(g.id);
+                }
+            }
+            k += 1;
+        }
+        (0..self.layers.len())
+            .filter(|&i| self.layers[i].group.is_some_and(|g| ids.contains(&g)))
+            .collect()
+    }
+
+    /// Whether `move_group` would change the stack: the group's layers must
+    /// form one contiguous block with a layer to swap past.
+    pub fn can_move_group(&self, id: u32, up: bool) -> bool {
+        let list = self.group_layer_indexes(id);
+        let Some((&lo, &hi)) = list.first().zip(list.last()) else {
+            return false;
+        };
+        if hi - lo + 1 != list.len() {
+            return false;
+        }
+        if up {
+            hi + 1 < self.layers.len()
+        } else {
+            lo > 0
+        }
+    }
+
+    /// Move a group's whole layer block one step up (`up`) or down, carrying
+    /// nested groups with it. Returns false and leaves the stack alone for
+    /// empty groups and for groups interleaved with other layers.
+    pub fn move_group(&mut self, id: u32, up: bool) -> bool {
+        if !self.can_move_group(id, up) {
+            return false;
+        }
+        let list = self.group_layer_indexes(id);
+        let (lo, hi) = (list[0], list[list.len() - 1]);
+        if up {
+            let other = self.layers.remove(hi + 1);
+            self.layers.insert(lo, other);
+            if self.active == hi + 1 {
+                self.active = lo;
+            } else if self.active >= lo && self.active <= hi {
+                self.active += 1;
+            }
+        } else {
+            let other = self.layers.remove(lo - 1);
+            self.layers.insert(hi, other);
+            if self.active == lo - 1 {
+                self.active = hi;
+            } else if self.active >= lo && self.active <= hi {
+                self.active -= 1;
+            }
+        }
+        self.mark_full_dirty();
+        true
+    }
+
     /// Disband a group: member layers (and subgroups) move up one level,
     /// the group row disappears. Contents always survive (no destructive
     /// group delete in v1).
@@ -756,6 +1204,9 @@ impl Document {
     /// Snapshot the active layer for one undo step (call when a stroke starts).
     /// A new checkpoint discards the redo history.
     pub fn checkpoint(&mut self) {
+        // A new undo step is a new stroke: drop any liquify field so its
+        // displacements cannot leak into the fresh step.
+        self.liquify = None;
         if let Some(entry) = self.snapshot() {
             self.push_undo(entry);
             self.redo.clear();
@@ -822,6 +1273,78 @@ impl Document {
         true
     }
 
+    /// Rewind only `rect` (inclusive canvas pixels) of the active layer to
+    /// the newest checkpoint, leaving the rest of the layer alone: the
+    /// tapered stroke replay pays for the stroke bbox instead of a full
+    /// layer copy (256 MiB at 8K). The checkpoint stays on the undo stack.
+    pub fn restore_checkpoint_region(&mut self, rect: (u32, u32, u32, u32)) -> bool {
+        let Some(entry) = self.undo.last() else {
+            return false;
+        };
+        let index = entry.layer;
+        let (x0, y0) = (
+            rect.0.min(self.w.saturating_sub(1)),
+            rect.1.min(self.h.saturating_sub(1)),
+        );
+        let (x1, y1) = (
+            rect.2.min(self.w.saturating_sub(1)),
+            rect.3.min(self.h.saturating_sub(1)),
+        );
+        if x0 > x1 || y0 > y1 {
+            return false;
+        }
+        let (w, h) = (self.w as i32, self.h as i32);
+        {
+            let Some(layer) = self.layers.get_mut(index) else {
+                return false;
+            };
+            let (lox, loy) = (entry.ox, entry.oy);
+            layer.ox = entry.ox;
+            layer.oy = entry.oy;
+            // One run per row: the rewind copies whole spans into the tiles
+            // instead of a get/set per byte (a full-8K stroke bbox would
+            // otherwise be hundreds of millions of calls).
+            for py in y0..=y1 {
+                let ly = py as i32 - loy;
+                if !(0..h).contains(&ly) {
+                    continue;
+                }
+                let start = (x0 as i32 - lox).max(0);
+                let end = (x1 as i32 - lox).min(w - 1);
+                if start > end {
+                    continue;
+                }
+                let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
+                layer
+                    .pixels
+                    .copy_run(&entry.pixels, start, ly, start, ly, run);
+            }
+            // A mask the stroke created has no checkpoint copy: it started
+            // fully revealed (255).
+            if let Some(layer_mask) = layer.mask.as_mut() {
+                for py in y0..=y1 {
+                    let ly = py as i32 - loy;
+                    if !(0..h).contains(&ly) {
+                        continue;
+                    }
+                    let start = (x0 as i32 - lox).max(0);
+                    let end = (x1 as i32 - lox).min(w - 1);
+                    if start > end {
+                        continue;
+                    }
+                    let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
+                    match entry.mask.as_ref() {
+                        Some(m) => layer_mask.copy_run(m, start, ly, start, ly, run),
+                        None => layer_mask.fill_run(ly, start, run, 255),
+                    }
+                }
+            }
+        }
+        self.active = index.min(self.layers.len().saturating_sub(1));
+        self.mark_dirty(x0, y0, x1, y1);
+        true
+    }
+
     /// Restore the most recent snapshot. Returns false when history is empty.
     pub fn undo(&mut self) -> bool {
         if let Some(entry) = self.undo.pop() {
@@ -864,7 +1387,10 @@ impl Document {
         false
     }
 
-    fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
+    /// Reference compositor: one pixel, walking every layer through dense
+    /// reads. The tile compositor (`composite_tile`) must match it byte for
+    /// byte; tests compare the two.
+    pub(crate) fn composite_pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let (mut r, mut g, mut b) = (
             self.background[0] as f32,
             self.background[1] as f32,
@@ -886,12 +1412,13 @@ impl Document {
             let Some(o) = layer.local_offset(x, y, self.w, self.h) else {
                 continue;
             };
-            if o + 3 >= layer.pixels.len() {
+            if o + 4 > layer.pixels.len() {
                 continue;
             }
-            let mut a = layer.pixels[o + 3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0) * gop;
-            if let Some(m) = layer.mask.as_deref() {
-                a *= m.get(o / 4).copied().unwrap_or(255) as f32 / 255.0;
+            let px = layer.pixels.get4(o);
+            let mut a = px[3] as f32 / 255.0 * layer.opacity.clamp(0.0, 1.0) * gop;
+            if let Some(m) = layer.mask.as_ref() {
+                a *= m.get(o / 4) as f32 / 255.0;
             }
             if layer.clip {
                 a *= below_a;
@@ -900,9 +1427,9 @@ impl Document {
                 continue;
             }
             let blend = layer.blend;
-            r = blend.apply(layer.pixels[o] as f32, r) * a + r * (1.0 - a);
-            g = blend.apply(layer.pixels[o + 1] as f32, g) * a + g * (1.0 - a);
-            b = blend.apply(layer.pixels[o + 2] as f32, b) * a + b * (1.0 - a);
+            r = blend.apply(px[0] as f32, r) * a + r * (1.0 - a);
+            g = blend.apply(px[1] as f32, g) * a + g * (1.0 - a);
+            b = blend.apply(px[2] as f32, b) * a + b * (1.0 - a);
             below_a = a + below_a * (1.0 - a);
         }
         [
@@ -914,28 +1441,75 @@ impl Document {
     }
 
     /// Composite bottom-to-top over the background into RGBA bytes.
+    /// Walks tiles through the stack plan: one composite per 256² tile,
+    /// then tile rows are copied into canvas rows.
     pub fn flatten(&self) -> Vec<u8> {
-        let n = (self.w * self.h) as usize;
-        let mut out = vec![0u8; n * 4];
-        for y in 0..self.h {
-            for x in 0..self.w {
-                let i = ((y * self.w + x) * 4) as usize;
-                out[i..i + 4].copy_from_slice(&self.composite_pixel(x, y));
-            }
-        }
+        let mut out = vec![0u8; (self.w as usize) * (self.h as usize) * 4];
+        self.fill_flat(&mut out);
         out
     }
 
+    /// [`Self::flatten`] with checked size and a fallible allocation: 8K
+    /// RGBA is ~132 MB, so export paths on a tablet must surface OOM as
+    /// an error instead of aborting the process.
+    pub fn try_flatten(&self) -> Result<Vec<u8>, String> {
+        let len = (self.w as usize)
+            .checked_mul(self.h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        let mut out = crate::raster::try_zeroed(len)?;
+        self.fill_flat(&mut out);
+        Ok(out)
+    }
+
+    fn fill_flat(&self, out: &mut [u8]) {
+        let plan = self.stack_plan();
+        for ty in 0..self.tiles_y() {
+            for tx in 0..self.tiles_x() {
+                let tile = self.composite_tile(&plan, tx, ty);
+                let x0 = (tx * TILE) as usize;
+                let y0 = (ty * TILE) as usize;
+                let tw = (self.w as usize - x0).min(TILE as usize);
+                let th = (self.h as usize - y0).min(TILE as usize);
+                for row in 0..th {
+                    let src = row * TILE as usize * 4;
+                    let dst = ((y0 + row) * self.w as usize + x0) * 4;
+                    out[dst..dst + tw * 4].copy_from_slice(&tile[src..src + tw * 4]);
+                }
+            }
+        }
+    }
+
     /// Composite only the inclusive region `(x0, y0)..=(x1, y1)` (clamped),
-    /// row-major RGBA, for partial texture uploads.
+    /// row-major RGBA, for partial texture uploads. Tiles are composited
+    /// once per tile row and emitted in canvas row order, so a region
+    /// spanning tiles still yields a contiguous row-major buffer.
     pub fn flatten_region(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
+        if self.w == 0 || self.h == 0 {
+            // No tiles exist; the pixel loop used to emit the single
+            // background pixel at (0, 0). Keep that result.
+            return self.composite_pixel(0, 0).to_vec();
+        }
         let x1 = x1.min(self.w.saturating_sub(1));
         let y1 = y1.min(self.h.saturating_sub(1));
         let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let plan = self.stack_plan();
         let mut out = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1) * 4) as usize);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                out.extend_from_slice(&self.composite_pixel(x, y));
+        let (tx0, tx1) = (x0 / TILE, x1 / TILE);
+        for ty in y0 / TILE..=y1 / TILE {
+            let row_tiles: Vec<Vec<u8>> = (tx0..=tx1)
+                .map(|tx| self.composite_tile(&plan, tx, ty))
+                .collect();
+            for y in y0.max(ty * TILE)..=y1.min((ty + 1) * TILE - 1) {
+                let row_in_tile = (y % TILE) as usize * TILE as usize;
+                for (i, tx) in (tx0..=tx1).enumerate() {
+                    let cx0 = (tx * TILE).max(x0);
+                    let cx1 = ((tx + 1) * TILE - 1).min(x1);
+                    for x in cx0..=cx1 {
+                        let o = (row_in_tile + (x % TILE) as usize) * 4;
+                        out.extend_from_slice(&row_tiles[i][o..o + 4]);
+                    }
+                }
             }
         }
         out
@@ -997,33 +1571,6 @@ impl Document {
         (sx, sy)
     }
 
-    /// Slide a layer buffer by (`sx`,`sy`) with zero-fill (far-edge tails
-    /// trim). `stride` is 4 for pixels, 1 for masks.
-    fn slide_buffer(buf: &mut [u8], w: u32, h: u32, stride: usize, sx: i32, sy: i32) {
-        if (sx == 0 && sy == 0) || w == 0 || h == 0 {
-            return;
-        }
-        let mut next = vec![0u8; buf.len()];
-        for y in 0..h {
-            let old_y = y as i32 - sy;
-            if old_y < 0 || old_y >= h as i32 {
-                continue;
-            }
-            for x in 0..w {
-                let old_x = x as i32 - sx;
-                if old_x < 0 || old_x >= w as i32 {
-                    continue;
-                }
-                let s = ((old_y as u32 * w + old_x as u32) as usize) * stride;
-                let d = ((y * w + x) as usize) * stride;
-                if s + stride <= buf.len() && d + stride <= next.len() {
-                    next[d..d + stride].copy_from_slice(&buf[s..s + stride]);
-                }
-            }
-        }
-        buf.copy_from_slice(&next);
-    }
-
     /// Make canvas bbox [`x0`..=`x1`]×[`y0`..=`y1`] paintable on a moved
     /// layer: slide pixels (and mask) so the bbox maps inside the buffer,
     /// adjusting the offset equally — on-screen content does not move and
@@ -1032,19 +1579,23 @@ impl Document {
     /// then marks the whole layer dirty — content moved outside the dab
     /// rect too). Caller checkpoints first (paint strokes do, so undo
     /// restores buffer and offset together).
+    ///
+    /// This runs per dab, and a stroke that keeps moving outward slides on
+    /// every dab, so the slide itself is tile-granular
+    /// ([`Raster::slide_in_place`]): one tile-grid copy, no dense buffer
+    /// and no whole-canvas temporary.
     pub fn absorb_offset(&mut self, index: usize, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
         if index >= self.layers.len() {
             return false;
         }
-        let (w, h) = (self.w, self.h);
         let (ox, oy) = (self.layers[index].ox, self.layers[index].oy);
-        let (sx, sy) = Self::fit_shift(w, h, ox, oy, x0, y0, x1, y1);
+        let (sx, sy) = Self::fit_shift(self.w, self.h, ox, oy, x0, y0, x1, y1);
         if sx == 0 && sy == 0 {
             return false;
         }
-        Self::slide_buffer(&mut self.layers[index].pixels, w, h, 4, sx, sy);
+        self.layers[index].pixels.slide_in_place(sx, sy);
         if let Some(m) = self.layers[index].mask.as_mut() {
-            Self::slide_buffer(m, w, h, 1, sx, sy);
+            m.slide_in_place(sx, sy);
         }
         // Content slid +s in the buffer reads at the same screen cell
         // exactly when the offset drops by s.
@@ -1123,9 +1674,17 @@ impl Document {
         let (old_w, old_h) = (self.w, self.h);
         for layer in self.layers.iter_mut() {
             let (sx, sy) = (-dx - layer.ox, -dy - layer.oy);
-            layer.pixels = carry(&layer.pixels, old_w, old_h, new_w, new_h, 4, sx, sy);
+            let dense = layer.pixels.to_dense();
+            let next = carry(&dense, old_w, old_h, new_w, new_h, 4, sx, sy);
+            layer.pixels = Raster::from_dense(new_w, new_h, 4, &next);
             if let Some(m) = layer.mask.take() {
-                layer.mask = Some(carry(&m, old_w, old_h, new_w, new_h, 1, sx, sy));
+                let md = m.to_dense();
+                layer.mask = Some(Raster::from_dense(
+                    new_w,
+                    new_h,
+                    1,
+                    &carry(&md, old_w, old_h, new_w, new_h, 1, sx, sy),
+                ));
             }
             layer.ox = 0;
             layer.oy = 0;
@@ -1242,19 +1801,21 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
+        let src = self.layers[index].pixels.to_dense();
         // Pivot: content bbox center keeps paint in place; empty layers
         // keep the old canvas-center behavior (invisible either way).
-        let center = Self::content_center(&self.layers[index].pixels, w, h);
+        let center = Self::content_center(&src, w, h);
         let pivot = center.unwrap_or((w as f32 * 0.5, h as f32 * 0.5));
         let quarters = (degrees / 90.0).round();
         let exact = (scale - 1.0).abs() < 1e-6 && (degrees - quarters * 90.0).abs() < 1e-3;
-        let src = self.layers[index].pixels.clone();
-        self.layers[index].pixels =
-            Self::affine_buffer(&src, w, h, scale, degrees, pivot.0, pivot.1, exact);
-        if let Some(m) = self.layers[index].mask.clone() {
-            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+        let out = Self::affine_buffer(&src, w, h, scale, degrees, pivot.0, pivot.1, exact);
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
+        if let Some(m) = self.layers[index].mask.take() {
+            let md = m.to_dense();
+            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
             let out = Self::affine_buffer(&rgba, w, h, scale, degrees, pivot.0, pivot.1, exact);
-            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         if center.is_none() {
             // Empty layer: carry the offset through the forward map about
@@ -1286,7 +1847,7 @@ impl Document {
     pub fn content_bounds(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
         let (w, h) = (self.w, self.h);
         let layer = self.layers.get(index)?;
-        Self::pixel_bounds(&layer.pixels, w, h)
+        Self::pixel_bounds(&layer.pixels.to_dense(), w, h)
     }
 
     fn pixel_bounds(pixels: &[u8], w: u32, h: u32) -> Option<(f32, f32, f32, f32)> {
@@ -1369,12 +1930,15 @@ impl Document {
         if w < 2 || h < 2 {
             return;
         }
-        let src = self.layers[index].pixels.clone();
-        self.layers[index].pixels = Self::quad_buffer(&src, w, h, &quad);
-        if let Some(m) = self.layers[index].mask.clone() {
-            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+        let src = self.layers[index].pixels.to_dense();
+        let out = Self::quad_buffer(&src, w, h, &quad);
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
+        if let Some(m) = self.layers[index].mask.take() {
+            let md = m.to_dense();
+            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
             let out = Self::quad_buffer(&rgba, w, h, &quad);
-            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
     }
@@ -1424,12 +1988,15 @@ impl Document {
         if grid.len() != ((cols + 1) * (rows + 1)) as usize {
             return;
         }
-        let src = self.layers[index].pixels.clone();
-        self.layers[index].pixels = Self::warp_buffer(&src, w, h, cols, rows, grid);
-        if let Some(m) = self.layers[index].mask.clone() {
-            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+        let src = self.layers[index].pixels.to_dense();
+        let out = Self::warp_buffer(&src, w, h, cols, rows, grid);
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
+        if let Some(m) = self.layers[index].mask.take() {
+            let md = m.to_dense();
+            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
             let out = Self::warp_buffer(&rgba, w, h, cols, rows, grid);
-            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
     }
@@ -1501,12 +2068,15 @@ impl Document {
         if src == dst {
             return;
         }
-        let pixels = self.layers[index].pixels.clone();
-        self.layers[index].pixels = Self::tri_buffer(&pixels, w, h, src, dst, tris);
-        if let Some(m) = self.layers[index].mask.clone() {
-            let rgba: Vec<u8> = m.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
+        let pixels = self.layers[index].pixels.to_dense();
+        let out = Self::tri_buffer(&pixels, w, h, src, dst, tris);
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
+        if let Some(m) = self.layers[index].mask.take() {
+            let md = m.to_dense();
+            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
             let out = Self::tri_buffer(&rgba, w, h, src, dst, tris);
-            self.layers[index].mask = Some(out.as_chunks::<4>().0.iter().map(|p| p[0]).collect());
+            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
     }
@@ -1571,7 +2141,7 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.clone();
+        let src = self.layers[index].pixels.to_dense();
         let mut next = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -1580,18 +2150,19 @@ impl Document {
                 next[d..d + 4].copy_from_slice(&src[s..s + 4]);
             }
         }
-        self.layers[index].pixels = next;
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].ox = -self.layers[index].ox;
-        if let Some(m) = self.layers[index].mask.clone() {
+        if let Some(m) = self.layers[index].mask.take() {
+            let m = m.to_dense();
             let mut nm = vec![0u8; (w * h) as usize];
             for y in 0..h {
                 for x in 0..w {
                     nm[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
                 }
             }
-            self.layers[index].mask = Some(nm);
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
         }
         self.mark_full_dirty();
     }
@@ -1603,7 +2174,7 @@ impl Document {
             return;
         }
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.clone();
+        let src = self.layers[index].pixels.to_dense();
         let mut next = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -1612,18 +2183,19 @@ impl Document {
                 next[d..d + 4].copy_from_slice(&src[s..s + 4]);
             }
         }
-        self.layers[index].pixels = next;
+        self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].oy = -self.layers[index].oy;
-        if let Some(m) = self.layers[index].mask.clone() {
+        if let Some(m) = self.layers[index].mask.take() {
+            let m = m.to_dense();
             let mut nm = vec![0u8; (w * h) as usize];
             for y in 0..h {
                 for x in 0..w {
                     nm[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
                 }
             }
-            self.layers[index].mask = Some(nm);
+            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
         }
         self.mark_full_dirty();
     }
@@ -1652,6 +2224,8 @@ impl Document {
             return false;
         }
         let src = self.layers[index].clone();
+        let src_px = src.pixels.to_dense();
+        let src_mask = src.mask.as_ref().map(|m| m.to_dense());
         let sa_base = if self.is_layer_shown(index) {
             src.opacity.clamp(0.0, 1.0)
         } else {
@@ -1663,6 +2237,8 @@ impl Document {
         // vanishes with `src`). Pixels already match, so only the block drops.
         self.layers[index - 1].text = None;
         let dst = &mut self.layers[index - 1];
+        let mut dst_px = dst.pixels.to_dense();
+        let dst_mask = dst.mask.as_ref().map(|m| m.to_dense());
         let (dox, doy) = (dst.ox, dst.oy);
         for y in 0..h {
             for x in 0..w {
@@ -1673,7 +2249,7 @@ impl Document {
                     continue;
                 }
                 let o = ((dly as u32 * w + dlx as u32) * 4) as usize;
-                if o + 3 >= dst.pixels.len() {
+                if o + 3 >= dst_px.len() {
                     continue;
                 }
                 let (slx, sly) = (x as i32 - src.ox, y as i32 - src.oy);
@@ -1682,39 +2258,39 @@ impl Document {
                         (0, 0, 0, 0.0)
                     } else {
                         let so = ((sly as u32 * w + slx as u32) * 4) as usize;
-                        if so + 3 >= src.pixels.len() {
+                        if so + 3 >= src_px.len() {
                             (0, 0, 0, 0.0)
                         } else {
-                            let mut a = sa_base * src.pixels[so + 3] as f32 / 255.0;
-                            if let Some(m) = src.mask.as_deref() {
+                            let mut a = sa_base * src_px[so + 3] as f32 / 255.0;
+                            if let Some(m) = src_mask.as_deref() {
                                 a *= m.get(so / 4).copied().unwrap_or(255) as f32 / 255.0;
                             }
-                            (src.pixels[so], src.pixels[so + 1], src.pixels[so + 2], a)
+                            (src_px[so], src_px[so + 1], src_px[so + 2], a)
                         }
                     };
                 if src.clip {
-                    let dst_a = dst.pixels[o + 3] as f32 / 255.0;
-                    let dst_m = dst
-                        .mask
+                    let dst_a = dst_px[o + 3] as f32 / 255.0;
+                    let dst_m = dst_mask
                         .as_deref()
                         .and_then(|m| m.get(o / 4).copied())
                         .unwrap_or(255) as f32
                         / 255.0;
                     sa *= dst_a * dst_m;
                 }
-                let da = dst.pixels[o + 3] as f32 / 255.0;
+                let da = dst_px[o + 3] as f32 / 255.0;
                 let out_a = sa + da * (1.0 - sa);
                 if out_a > 0.0 {
                     for (ch, sc) in [sr, sg, sb].iter().enumerate() {
-                        let blended = src.blend.apply(*sc as f32, dst.pixels[o + ch] as f32);
-                        dst.pixels[o + ch] =
-                            ((blended * sa + dst.pixels[o + ch] as f32 * da * (1.0 - sa)) / out_a)
-                                .round() as u8;
+                        let blended = src.blend.apply(*sc as f32, dst_px[o + ch] as f32);
+                        dst_px[o + ch] = ((blended * sa + dst_px[o + ch] as f32 * da * (1.0 - sa))
+                            / out_a)
+                            .round() as u8;
                     }
-                    dst.pixels[o + 3] = (out_a * 255.0).round() as u8;
+                    dst_px[o + 3] = (out_a * 255.0).round() as u8;
                 }
             }
         }
+        dst.pixels.replace_dense(&dst_px);
         self.layers.remove(index);
         self.active = index - 1;
         self.mark_full_dirty();
@@ -1785,7 +2361,9 @@ impl Document {
         let n = (self.w * self.h) as usize;
         let slot = &mut self.layers[index].mask;
         if slot.as_ref().map(|m| m.len() != n).unwrap_or(true) {
-            *slot = Some(vec![255u8; n]);
+            let mut fresh = Raster::mask(self.w, self.h);
+            fresh.fill(255);
+            *slot = Some(fresh);
         }
         self.mark_full_dirty();
     }
@@ -1804,18 +2382,83 @@ impl Document {
     /// canvas reads concealed (black). `None` when there is no (valid) mask.
     pub fn mask_view(&self) -> Option<Vec<u8>> {
         let layer = self.layers.get(self.active)?;
-        let m = layer.mask.as_deref()?;
+        let m = layer.mask.as_ref()?;
         if m.len() != (self.w * self.h) as usize {
             return None;
         }
-        let mut out = Vec::with_capacity(m.len() * 4);
-        for y in 0..self.h {
-            for x in 0..self.w {
+        if self.w == 0 || self.h == 0 {
+            return Some(Vec::new());
+        }
+        self.mask_view_region(0, 0, self.w - 1, self.h - 1)
+    }
+
+    /// One inclusive canvas rect of [`mask_view`](Self::mask_view) as row-major
+    /// RGBA, `(x1 - x0 + 1) * (y1 - y0 + 1) * 4` bytes, clamped to the canvas:
+    /// what a dirty-rect mask upload needs. Reads the mask through the tile
+    /// accessors rather than densifying it (a dense 8K mask is 64 MB), so a
+    /// dab-sized rect costs a dab-sized read. `None` when there is no (valid)
+    /// mask, the canvas is empty, or the rect is empty.
+    pub fn mask_view_region(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<Vec<u8>> {
+        let layer = self.layers.get(self.active)?;
+        let m = layer.mask.as_ref()?;
+        if m.len() != (self.w * self.h) as usize || self.w == 0 || self.h == 0 {
+            return None;
+        }
+        let (x0, y0) = (x0.min(self.w - 1), y0.min(self.h - 1));
+        let (x1, y1) = (x1.min(self.w - 1), y1.min(self.h - 1));
+        if x0 > x1 || y0 > y1 {
+            return None;
+        }
+        let (rw, rh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+        // Uncovered canvas is black and every pixel is opaque.
+        let mut out = vec![0u8; rw * rh * 4];
+        for px in out.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        // Dense band read when the mask shares the canvas geometry (the only
+        // shape the engine creates); a ragged mask keeps the per-pixel rule.
+        if m.w() == self.w && m.h() == self.h {
+            let ly0 = (y0 as i64 - layer.oy as i64).max(0);
+            let ly1 = (y1 as i64 - layer.oy as i64).min(self.h as i64 - 1);
+            if let (true, Some((lo, hi))) = (ly0 <= ly1, slot_span(x0, x1, layer.ox, self.w)) {
+                let (cy0, cy1) = (
+                    (ly0 + layer.oy as i64) as u32,
+                    (ly1 + layer.oy as i64) as u32,
+                );
+                let bw = (hi - lo + 1) as usize;
+                let mut band = Vec::new();
+                m.region_into(
+                    (
+                        slot_x(lo, layer.ox),
+                        ly0 as u32,
+                        slot_x(hi, layer.ox),
+                        ly1 as u32,
+                    ),
+                    &mut band,
+                );
+                for (row, y) in (cy0..=cy1).enumerate() {
+                    let dst_row = (y - y0) as usize * rw;
+                    for x in lo..=hi {
+                        let v = band[row * bw + (x - lo) as usize];
+                        let d = (dst_row + (x - x0) as usize) * 4;
+                        out[d] = v;
+                        out[d + 1] = v;
+                        out[d + 2] = v;
+                    }
+                }
+            }
+            return Some(out);
+        }
+        for (ry, y) in (y0..=y1).enumerate() {
+            for (rx, x) in (x0..=x1).enumerate() {
                 let v = match layer.local_offset(x, y, self.w, self.h) {
-                    Some(o) => m.get(o / 4).copied().unwrap_or(0),
+                    Some(o) => m.get(o / 4),
                     None => 0,
                 };
-                out.extend_from_slice(&[v, v, v, 255]);
+                let d = (ry * rw + rx) * 4;
+                out[d] = v;
+                out[d + 1] = v;
+                out[d + 2] = v;
             }
         }
         Some(out)
@@ -1825,31 +2468,43 @@ impl Document {
     /// (cropped to the canvas): what interchange formats store. Returns
     /// the shifted pixels plus the shifted mask (or `None` when the layer
     /// has no valid mask, matching the exporter's existing rule).
-    pub fn baked_layer(&self, index: usize) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let layer = self.layers.get(index)?;
-        let n = (self.w * self.h) as usize;
-        if layer.pixels.len() != n * 4 {
-            return None;
+    pub fn baked_layer(&self, index: usize) -> Result<Option<BakedLayer>, String> {
+        let Some(layer) = self.layers.get(index) else {
+            return Ok(None);
+        };
+        let n = (self.w as usize)
+            .checked_mul(self.h as usize)
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        let n4 = n
+            .checked_mul(4)
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.len() != n4 {
+            return Ok(None);
         }
-        let mut px = vec![0u8; n * 4];
-        let mut mk: Option<Vec<u8>> = match layer.mask.as_deref() {
-            Some(m) if m.len() == n => Some(vec![0u8; n]),
+        let src = layer.pixels.try_to_dense()?;
+        let src_mask = match layer.mask.as_ref() {
+            Some(m) => Some(m.try_to_dense()?),
+            None => None,
+        };
+        let mut px = crate::raster::try_zeroed(n4)?;
+        let mut mk: Option<Vec<u8>> = match src_mask.as_deref() {
+            Some(m) if m.len() == n => Some(crate::raster::try_zeroed(n)?),
             _ => None,
         };
         for y in 0..self.h {
             for x in 0..self.w {
                 if let Some(o) = layer.local_offset(x, y, self.w, self.h) {
-                    if o + 3 < layer.pixels.len() {
+                    if o + 3 < src.len() {
                         let d = ((y * self.w + x) * 4) as usize;
-                        px[d..d + 4].copy_from_slice(&layer.pixels[o..o + 4]);
-                        if let (Some(m), Some(dst)) = (layer.mask.as_deref(), mk.as_mut()) {
+                        px[d..d + 4].copy_from_slice(&src[o..o + 4]);
+                        if let (Some(m), Some(dst)) = (src_mask.as_deref(), mk.as_mut()) {
                             dst[(y * self.w + x) as usize] = m.get(o / 4).copied().unwrap_or(0);
                         }
                     }
                 }
             }
         }
-        Some((px, mk))
+        Ok(Some((px, mk)))
     }
 
     /// True when `(px, py)` is inside the active selection (rectangular
@@ -2282,6 +2937,7 @@ impl Document {
             return false;
         };
         let (ox, oy) = (layer.ox, layer.oy);
+        let src = layer.pixels.to_dense();
         let mut mask = vec![0u8; (w * h) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -2290,8 +2946,8 @@ impl Document {
                     0
                 } else {
                     let o = ((ly as u32 * w + lx as u32) * 4) as usize;
-                    if o + 3 < layer.pixels.len() {
-                        layer.pixels[o + 3]
+                    if o + 3 < src.len() {
+                        src[o + 3]
                     } else {
                         0
                     }
@@ -2380,10 +3036,29 @@ impl Document {
             let fat = Self::morph_gray(&gray, w, h, r, true);
             edge = fat.into_iter().map(|v| v != 0).collect();
         }
-        for y in 0..h {
-            for x in 0..w {
-                if edge[(y * w + x) as usize] {
-                    self.put(brush, color, x, y);
+        if self.symmetry == SymmetryMode::Off {
+            // Dense row spans: one read/write per row instead of a tile
+            // lookup per edge pixel.
+            let mut row = Vec::new();
+            for y in 0..h {
+                let base = (y * w) as usize;
+                let Some(first) = (0..w as usize).find(|&i| edge[base + i]) else {
+                    continue;
+                };
+                let last = (0..w as usize)
+                    .rev()
+                    .find(|&i| edge[base + i])
+                    .unwrap_or(first);
+                self.put_row_span(brush, color, y, first as u32, last as u32, &mut row, |x| {
+                    edge[base + x as usize]
+                });
+            }
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    if edge[(y * w + x) as usize] {
+                        self.put(brush, color, x, y);
+                    }
                 }
             }
         }
@@ -2454,7 +3129,7 @@ impl Document {
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -2480,6 +3155,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2491,14 +3167,14 @@ impl Document {
         }
         let (w, h) = (self.w, self.h);
         let blurred = Self::box_blur(
-            &self.layers[index].pixels.clone(),
+            &self.layers[index].pixels.to_dense(),
             w,
             h,
             radius.min(25) as i32,
         );
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 let selected = !matches!(sel, Some((a, b, c, d)) if x < a || x > c || y < b || y > d)
@@ -2517,6 +3193,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2529,11 +3206,11 @@ impl Document {
         }
         let amount = amount.min(2.0);
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.clone();
+        let src = self.layers[index].pixels.to_dense();
         let blurred = Self::box_blur(&src, w, h, 2);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 let selected = !matches!(sel, Some((a, b, c, d)) if x < a || x > c || y < b || y > d)
@@ -2554,6 +3231,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2567,7 +3245,7 @@ impl Document {
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -2592,6 +3270,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2611,7 +3290,7 @@ impl Document {
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -2647,6 +3326,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2661,7 +3341,7 @@ impl Document {
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -2686,6 +3366,7 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
@@ -2703,7 +3384,7 @@ impl Document {
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
+        let mut pixels = self.layers[index].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -2730,15 +3411,18 @@ impl Document {
                 }
             }
         }
+        self.layers[index].pixels.replace_dense(&pixels);
         self.mark_full_dirty();
     }
 
     /// M40 Liquify push: displace layer pixels along the drag vector
-    /// `(dx, dy)` within `size` px of `(x, y)`, reverse-mapped with
-    /// bilinear sampling so no holes tear open. `strength` 0..=1 scales
-    /// the push; falloff is smooth to the rim. Honors the active
-    /// selection for writes (graduated-mask mixed, like blur). Caller
-    /// checkpoints once per stroke; zero push is a no-op.
+    /// `(dx, dy)` within `size` px of `(x, y)`. `strength` 0..=1 scales the
+    /// push; falloff is smooth to the rim. Honors the active selection.
+    /// Repeated calls (or one `liquify_begin`/`liquify_end` stroke) accumulate
+    /// into a displacement field carried along with the content, and re-render
+    /// the swept region from the stroke's snapshot, so a stroke resamples each
+    /// pixel at most once: in place resampling would smear the previous warp
+    /// again on every push. Zero push is a no-op.
     #[allow(clippy::too_many_arguments)]
     pub fn liquify(
         &mut self,
@@ -2759,8 +3443,92 @@ impl Document {
         if self.w == 0 || self.h == 0 {
             return;
         }
-        // One push per symmetry mirror, deduped when a mirror lands on an
-        // identical (point, vector) pair (e.g. kaleidoscope center).
+        let mut stroke = self.take_stroke(index);
+        let mut dirty = Vec::new();
+        for (px, py, pdx, pdy) in self.liquify_mirrors(x, y, dx, dy) {
+            if let Some(rect) =
+                self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength)
+            {
+                dirty.push(rect);
+            }
+        }
+        self.flush_liquify(&mut stroke, dirty);
+        self.liquify = Some(stroke);
+    }
+
+    /// Open a liquify stroke on `index`: the snapshot every push resamples
+    /// from. The app calls it once per drag (right after the undo
+    /// checkpoint) and [`Self::liquify_end`] on release; pushes also open a
+    /// stroke on their own when none is active.
+    pub fn liquify_begin(&mut self, index: usize) {
+        if let Some(stroke) = self.liquify.as_ref() {
+            if stroke.layer == index && stroke.rev == self.rev {
+                return;
+            }
+        }
+        self.liquify = self
+            .layers
+            .get(index)
+            .map(|layer| LiquifyStroke::new(index, layer.pixels.clone(), self.w, self.rev));
+    }
+
+    /// Close the active liquify stroke and free its snapshot and field.
+    pub fn liquify_end(&mut self) {
+        self.liquify = None;
+    }
+
+    /// Warp along one pointer segment. The segment is split into pushes no
+    /// longer than an eighth of the brush size (min 2 px) so a fast drag
+    /// warps all of it this frame instead of trailing the pointer; the last
+    /// push ends exactly at the pointer. The field updates of the whole
+    /// segment accumulate first and the swept region renders once, so a long
+    /// jump costs one resample of the path instead of one full disc render
+    /// per sub-push.
+    pub fn liquify_segment(
+        &mut self,
+        index: usize,
+        from: (f32, f32),
+        to: (f32, f32),
+        size: f32,
+        strength: f32,
+    ) {
+        if index >= self.layers.len() || size < 1.0 || strength <= 0.0 {
+            return;
+        }
+        if self.w == 0 || self.h == 0 {
+            return;
+        }
+        let steps = liquify_steps(from, to, (size * 0.125).max(2.0));
+        if steps.is_empty() {
+            return;
+        }
+        let mut stroke = self.take_stroke(index);
+        let mut dirty = Vec::new();
+        for ((x, y), (dx, dy)) in steps {
+            for (px, py, pdx, pdy) in self.liquify_mirrors(x, y, dx, dy) {
+                if let Some(rect) =
+                    self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength)
+                {
+                    dirty.push(rect);
+                }
+            }
+        }
+        self.flush_liquify(&mut stroke, dirty);
+        self.liquify = Some(stroke);
+    }
+
+    /// Reuse the open stroke only while its snapshot still matches the
+    /// layer: any other write (paint, undo, filter) starts a new one.
+    fn take_stroke(&mut self, index: usize) -> LiquifyStroke {
+        match self.liquify.take() {
+            Some(stroke) if stroke.layer == index && stroke.rev == self.rev => stroke,
+            _ => LiquifyStroke::new(index, self.layers[index].pixels.clone(), self.w, self.rev),
+        }
+    }
+
+    /// One push per symmetry mirror, deduped when a mirror lands on an
+    /// identical (point, vector) pair (e.g. kaleidoscope center).
+    fn liquify_mirrors(&self, x: f32, y: f32, dx: f32, dy: f32) -> Vec<(f32, f32, f32, f32)> {
         let (ccx, ccy) = self.symmetry_center_px();
         let pushes = self
             .symmetry
@@ -2776,26 +3544,33 @@ impl Document {
                 continue;
             }
             done.push((px, py, pdx, pdy));
-            self.liquify_push(index, px, py, pdx, pdy, size, strength);
+        }
+        done
+    }
+
+    /// Render the pushed rects once each (grouped by proximity) and store
+    /// the stroke's new revision.
+    fn flush_liquify(&mut self, stroke: &mut LiquifyStroke, dirty: Vec<(u32, u32, u32, u32)>) {
+        for group in merge_rects(dirty) {
+            self.liquify_render(stroke, &group);
         }
     }
 
-    /// One warp centered at (x, y) pushing pixels by (dx, dy). Reads from
-    /// a bounded region copy (disc plus sample reach), not the full layer.
+    /// Add one warp to the stroke's field. The disc is read from a dense
+    /// snapshot, rewritten dense, then committed tile by tile, so a push
+    /// pays one hash lookup per tile rather than one per pixel. Returns the
+    /// disc rect to render, or `None` when the push moves nothing.
     #[allow(clippy::too_many_arguments)]
-    fn liquify_push(
+    fn liquify_field_push(
         &mut self,
-        index: usize,
+        stroke: &mut LiquifyStroke,
         x: f32,
         y: f32,
         dx: f32,
         dy: f32,
         size: f32,
         strength: f32,
-    ) {
-        if dx == 0.0 && dy == 0.0 {
-            return;
-        }
+    ) -> Option<(u32, u32, u32, u32)> {
         let (w, h) = (self.w, self.h);
         let radius = size * 0.5;
         let bx0 = ((x - radius).floor().max(0.0)) as u32;
@@ -2803,80 +3578,284 @@ impl Document {
         let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
         let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
         if bx0 > bx1 || by0 > by1 {
+            return None;
+        }
+        let selection = self.selection;
+        let mask = self.selection_mask.as_deref();
+        let dw = (bx1 - bx0 + 1) as usize;
+        let dh = (by1 - by0 + 1) as usize;
+        // The displacement this push gives each pixel (reverse sample offset
+        // direction: content moves along `(dx, dy)`).
+        let mut disp = std::mem::take(&mut stroke.scratch_disc);
+        disp.clear();
+        disp.resize(dw * dh, [0.0f32; 2]);
+        let mut step = 0.0f32;
+        let r2 = radius * radius;
+        for gy in 0..dh {
+            let py = by0 + gy as u32;
+            for gx in 0..dw {
+                let px = bx0 + gx as u32;
+                let (qx, qy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let d2 = qx * qx + qy * qy;
+                // Smooth falloff: full push at the center, zero at the rim.
+                // Past the rim the cosine lands exactly on zero, so the rim
+                // test skips the sqrt and the cos for the rect's corners.
+                let f = if d2 >= r2 {
+                    0.0
+                } else {
+                    0.5 + 0.5 * (std::f32::consts::PI * (d2.sqrt() / radius).min(1.0)).cos()
+                };
+                let in_rect = !matches!(
+                    selection,
+                    Some((a, b, c, d)) if px < a || px > c || py < b || py > d
+                );
+                let k = if in_rect {
+                    Self::sel_k(mask, w, px, py)
+                } else {
+                    0.0
+                };
+                // A feathered selection scales the displacement, so a pixel at
+                // k = 0 samples itself and stays put.
+                let d = [-dx * strength * f * k, -dy * strength * f * k];
+                step = step.max(d[0].abs()).max(d[1].abs());
+                disp[gy * dw + gx] = d;
+            }
+        }
+        if step == 0.0 {
+            stroke.scratch_disc = disp;
+            return None;
+        }
+        // The offset is carried with the content, like dragging the pixels:
+        // `F_new(p) = F_old(p + d) + d`. Summing `d` at a fixed pixel instead
+        // only moves content while the disc passes over it, so a drag
+        // transfers barely half its distance and the warp reads as a stiff
+        // block instead of a pull. Reading the pre-push field needs a dense
+        // copy of the disc plus the bilinear support.
+        let pad = step.ceil() as u32 + 1;
+        let (sx0, sy0) = (bx0.saturating_sub(pad), by0.saturating_sub(pad));
+        let (sx1, sy1) = ((bx1 + pad).min(w - 1), (by1 + pad).min(h - 1));
+        let sw = stroke
+            .field
+            .snapshot_into((sx0, sy0, sx1, sy1), &mut stroke.scratch_off) as usize;
+        let old = &stroke.scratch_off;
+        for gy in 0..dh {
+            let py = by0 + gy as u32;
+            for gx in 0..dw {
+                let px = bx0 + gx as u32;
+                let i = gy * dw + gx;
+                let d = disp[i];
+                if d[0] == 0.0 && d[1] == 0.0 {
+                    // Untouched by this push: keep the field as it was.
+                    disp[i] = old[(py - sy0) as usize * sw + (px - sx0) as usize];
+                    continue;
+                }
+                let sx = (px as f32 + d[0]).clamp(0.0, w as f32 - 1.0);
+                let sy = (py as f32 + d[1]).clamp(0.0, h as f32 - 1.0);
+                let (ix0, iy0) = (sx.floor() as u32, sy.floor() as u32);
+                let (ix1, iy1) = ((ix0 + 1).min(w - 1), (iy0 + 1).min(h - 1));
+                let (fx, fy) = (sx - ix0 as f32, sy - iy0 as f32);
+                let at = |x: u32, y: u32| old[(y - sy0) as usize * sw + (x - sx0) as usize];
+                let (a, b, c, e) = (at(ix0, iy0), at(ix1, iy0), at(ix0, iy1), at(ix1, iy1));
+                let prev = [
+                    a[0] * (1.0 - fx) * (1.0 - fy)
+                        + b[0] * fx * (1.0 - fy)
+                        + c[0] * (1.0 - fx) * fy
+                        + e[0] * fx * fy,
+                    a[1] * (1.0 - fx) * (1.0 - fy)
+                        + b[1] * fx * (1.0 - fy)
+                        + c[1] * (1.0 - fx) * fy
+                        + e[1] * fx * fy,
+                ];
+                // Clamp to the canvas: a sample past the edge folds back to
+                // the same clamped read, and the clamp bounds the region copy
+                // a long drag makes.
+                disp[i] = [
+                    (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32),
+                    (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32),
+                ];
+            }
+        }
+        stroke.field.commit((bx0, by0, bx1, by1), &disp, dw as u32);
+        stroke.scratch_disc = disp;
+        Some((bx0, by0, bx1, by1))
+    }
+
+    /// Re-render the pushed rects of one group from the stroke snapshot
+    /// through the displacement field. Offsets and source pixels come from
+    /// dense copies (one copy per tile row), and rows go back tile-segment
+    /// wise, skipping bytes that did not change. Filtering is premultiplied
+    /// and the writes unpremultiplied, so transparent black never bleeds
+    /// into a warped edge and darkens its color.
+    fn liquify_render(&mut self, stroke: &mut LiquifyStroke, parts: &[(u32, u32, u32, u32)]) {
+        let (w, h) = (self.w, self.h);
+        let Some(&first) = parts.first() else {
+            return;
+        };
+        if w == 0 || h == 0 {
             return;
         }
-        // Reverse samples reach up to |d| * strength px back along the
-        // push; copy that hull so the whole warp reads from the region.
-        let reach = (dx.hypot(dy) * strength).ceil() as u32 + 1;
-        let rx0 = bx0.saturating_sub(reach);
-        let ry0 = by0.saturating_sub(reach);
-        let rx1 = (bx1 + reach).min(w - 1);
-        let ry1 = (by1 + reach).min(h - 1);
-        let rw = rx1 - rx0 + 1;
-        let src_pixels = &self.layers[index].pixels;
-        let mut src = Vec::with_capacity((rw * (ry1 - ry0 + 1) * 4) as usize);
-        for ry in ry0..=ry1 {
-            let s = ((ry * w + rx0) * 4) as usize;
-            src.extend_from_slice(&src_pixels[s..s + (rw * 4) as usize]);
+        let mut rect = first;
+        for &p in &parts[1..] {
+            rect = (
+                rect.0.min(p.0),
+                rect.1.min(p.1),
+                rect.2.max(p.2),
+                rect.3.max(p.3),
+            );
         }
-        let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
-            let sx = sx.clamp(0.0, w as f32 - 1.0);
-            let sy = sy.clamp(0.0, h as f32 - 1.0);
-            let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
-            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let at = |x: u32, y: u32| src[(((y - ry0) * rw + (x - rx0)) * 4) as usize + ch] as f32;
-            at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-                + at(x1, y0) * fx * (1.0 - fy)
-                + at(x0, y1) * (1.0 - fx) * fy
-                + at(x1, y1) * fx * fy
-        };
-        let sel = self.selection;
-        let mask = self.selection_mask.as_deref();
-        let pixels = &mut self.layers[index].pixels;
-        for py in by0..=by1 {
-            for px in bx0..=bx1 {
-                let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2)).sqrt()
-                    / radius)
-                    .min(1.0);
-                // Smooth falloff: full push at the center, zero at the rim.
-                let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
-                let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
-                if (ox - px as f32).abs() < f32::EPSILON && (oy - py as f32).abs() < f32::EPSILON {
+        let (x0, y0) = (rect.0.min(w - 1), rect.1.min(h - 1));
+        let (x1, y1) = (rect.2.min(w - 1), rect.3.min(h - 1));
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let (bw, bh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+        // Cover only the pushed rects inside the group's box: the extra
+        // pixels a merged box adds are never resampled, so they keep their
+        // exact bytes. A single rect covers its own box, so it needs no map.
+        let mut cov = std::mem::take(&mut stroke.scratch_cov);
+        cov.clear();
+        if parts.len() > 1 {
+            cov.resize(bw * bh, 0);
+            for &(px0, py0, px1, py1) in parts {
+                let (px1, py1) = (px1.min(x1), py1.min(y1));
+                let (px0, py0) = (px0.min(px1), py0.min(py1));
+                if px0 > px1 || py0 > py1 {
                     continue;
                 }
-                let selected = !matches!(sel, Some((a, b, c, d)) if px < a || px > c || py < b || py > d)
-                    && match mask {
-                        Some(m) => m[(py * w + px) as usize] != 0,
-                        None => true,
-                    };
-                if !selected {
-                    continue;
-                }
-                let o = ((py * w + px) * 4) as usize;
-                if o + 3 >= pixels.len() {
-                    continue;
-                }
-                let k = Self::sel_k(mask, w, px, py);
-                for ch in 0..4 {
-                    let v = sample(ox, oy, ch);
-                    pixels[o + ch] = (pixels[o + ch] as f32 * (1.0 - k) + v * k).round() as u8;
+                let n = (px1 - px0 + 1) as usize;
+                for py in py0..=py1 {
+                    let o = (py - y0) as usize * bw + (px0 - x0) as usize;
+                    cov[o..o + n].fill(1);
                 }
             }
         }
-        self.mark_dirty(bx0, by0, bx1, by1);
+        let fw = stroke
+            .field
+            .snapshot_into((x0, y0, x1, y1), &mut stroke.scratch_off);
+        // Furthest reverse sample over the pushed pixels: the source region
+        // must reach that far outside the rewritten rect. `+ 1` covers the
+        // far bilinear corner.
+        let mut furthest = 0.0f32;
+        for &(px0, py0, px1, py1) in parts {
+            let (px1, py1) = (px1.min(x1), py1.min(y1));
+            let (px0, py0) = (px0.min(px1), py0.min(py1));
+            if px0 > px1 || py0 > py1 {
+                continue;
+            }
+            let n = (px1 - px0 + 1) as usize;
+            for py in py0..=py1 {
+                let o = (py - y0) as usize * fw as usize + (px0 - x0) as usize;
+                for v in &stroke.scratch_off[o..o + n] {
+                    furthest = furthest.max(v[0].abs()).max(v[1].abs());
+                }
+            }
+        }
+        let reach = furthest.ceil() as u32 + 1;
+        let rx0 = x0.saturating_sub(reach);
+        let ry0 = y0.saturating_sub(reach);
+        let rx1 = (x1 + reach).min(w - 1);
+        let ry1 = (y1 + reach).min(h - 1);
+        let rw = (rx1 - rx0 + 1) as usize;
+        let mut src_buf = std::mem::take(&mut stroke.scratch_src);
+        stroke.src.region_into((rx0, ry0, rx1, ry1), &mut src_buf);
+        let region = &src_buf;
+        let sample = |sx: f32, sy: f32| -> [u8; 4] {
+            let sx = sx.clamp(0.0, w as f32 - 1.0);
+            let sy = sy.clamp(0.0, h as f32 - 1.0);
+            let (cx0, cy0) = (sx.floor() as u32, sy.floor() as u32);
+            let (cx1, cy1) = ((cx0 + 1).min(w - 1), (cy0 + 1).min(h - 1));
+            let (fx, fy) = ((sx - cx0 as f32) as f64, (sy - cy0 as f32) as f64);
+            let at = |x: u32, y: u32| -> [u8; 4] {
+                let o = ((y - ry0) as usize * rw + (x - rx0) as usize) * 4;
+                [region[o], region[o + 1], region[o + 2], region[o + 3]]
+            };
+            let (mut pr, mut pg, mut pb, mut pa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (x, y, weight) in [
+                (cx0, cy0, (1.0 - fx) * (1.0 - fy)),
+                (cx1, cy0, fx * (1.0 - fy)),
+                (cx0, cy1, (1.0 - fx) * fy),
+                (cx1, cy1, fx * fy),
+            ] {
+                let [r, g, b, a] = at(x, y);
+                let a = a as f64 * weight;
+                pa += a;
+                pr += r as f64 * a;
+                pg += g as f64 * a;
+                pb += b as f64 * a;
+            }
+            if pa <= 0.0 {
+                return [0, 0, 0, 0];
+            }
+            [
+                (pr / pa).round().clamp(0.0, 255.0) as u8,
+                (pg / pa).round().clamp(0.0, 255.0) as u8,
+                (pb / pa).round().clamp(0.0, 255.0) as u8,
+                pa.round().clamp(0.0, 255.0) as u8,
+            ]
+        };
+        let mut row = std::mem::take(&mut stroke.scratch_row);
+        row.clear();
+        row.resize(bw * 4, 0);
+        let field = &stroke.scratch_off;
+        let layer = &mut self.layers[stroke.layer];
+        for py in y0..=y1 {
+            let f_row = (py - y0) as usize * fw as usize;
+            let cov_row = if cov.is_empty() {
+                &[][..]
+            } else {
+                &cov[(py - y0) as usize * bw..][..bw]
+            };
+            for gx in 0..bw {
+                if !cov_row.is_empty() && cov_row[gx] == 0 {
+                    continue;
+                }
+                let off = field[f_row + gx];
+                let out = if off[0] == 0.0 && off[1] == 0.0 {
+                    // The pixel samples itself: the filtered value is its own
+                    // bytes, except that zero alpha normalises colour away.
+                    let o = ((py - ry0) as usize * rw + (x0 + gx as u32 - rx0) as usize) * 4;
+                    if region[o + 3] == 0 {
+                        [0, 0, 0, 0]
+                    } else {
+                        [region[o], region[o + 1], region[o + 2], region[o + 3]]
+                    }
+                } else {
+                    sample((x0 + gx as u32) as f32 + off[0], py as f32 + off[1])
+                };
+                row[gx * 4..gx * 4 + 4].copy_from_slice(&out);
+            }
+            if cov_row.is_empty() {
+                let _ = layer.pixels.write_row_changed(x0, py, &row);
+                continue;
+            }
+            let mut gx = 0;
+            while gx < bw {
+                if cov_row[gx] == 0 {
+                    gx += 1;
+                    continue;
+                }
+                let start = gx;
+                while gx < bw && cov_row[gx] != 0 {
+                    gx += 1;
+                }
+                let _ =
+                    layer
+                        .pixels
+                        .write_row_changed(x0 + start as u32, py, &row[start * 4..gx * 4]);
+            }
+        }
+        stroke.scratch_cov = cov;
+        stroke.scratch_src = src_buf;
+        stroke.scratch_row = row;
+        self.mark_dirty(x0, y0, x1, y1);
+        stroke.rev = self.rev;
     }
 
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
-        image::save_buffer(
-            path,
-            &self.flatten(),
-            self.w,
-            self.h,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|e| e.to_string())
+        let flat = self.try_flatten()?;
+        image::save_buffer(path, &flat, self.w, self.h, image::ColorType::Rgba8)
+            .map_err(|e| e.to_string())
     }
 
     /// Save the composite as JPEG at `quality` (1-100, higher keeps more
@@ -2886,7 +3865,7 @@ impl Document {
         if !(1..=100).contains(&quality) {
             return Err(format!("bad JPEG quality: {quality} (want 1-100)"));
         }
-        let flat = self.flatten();
+        let flat = self.try_flatten()?;
         let mut rgb = Vec::with_capacity((self.w * self.h) as usize * 3);
         for i in 0..flat.len() / 4 {
             let o = i * 4;
@@ -2905,7 +3884,7 @@ impl Document {
     /// no layers or extras — the layered original stays in `.procraft`).
     pub fn save_tiff(&self, path: &std::path::Path) -> Result<(), String> {
         use image::ImageEncoder;
-        let flat = self.flatten();
+        let flat = self.try_flatten()?;
         let mut buf = Vec::new();
         {
             let enc = image::codecs::tiff::TiffEncoder::new(std::io::Cursor::new(&mut buf));
@@ -2917,9 +3896,12 @@ impl Document {
 
     /// Load an image file flattened onto a fresh layer.
     /// M45 hardening: files over 64MB fail closed on metadata, and
-    /// dimensions are checked from the header before the full decode
-    /// so a phone panorama can't OOM the session (cap matches
-    /// [`MAX_CANVAS_SIDE`], the GIF import cap, and `rehome_canvas`).
+    /// dimensions are checked from the header before the full decode.
+    /// That bounds the encoded input, not peak memory: at the
+    /// [`MAX_CANVAS_SIDE`] cap a decode can still hold ~268 MB dense
+    /// plus ~256 MB of tiles, so the guard stops absurd files rather
+    /// than promising the session cannot OOM. The cap matches
+    /// `rehome_canvas`.
     pub fn load_background(&mut self, path: &std::path::Path) -> Result<(), String> {
         const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -2948,7 +3930,7 @@ impl Document {
         self.w = w;
         self.h = h;
         let mut layer = Layer::blank("Imported".to_string(), w, h);
-        layer.pixels.copy_from_slice(img.as_raw());
+        layer.pixels = Raster::from_dense(w, h, 4, img.as_raw());
         self.layers = vec![layer];
         self.active = 0;
         self.selection = None;
@@ -2961,14 +3943,27 @@ impl Document {
     }
 
     /// Save the full project (layers, opacity, blend, background, symmetry)
-    /// to a `.procraft` file: magic + little-endian records, zlib-compressed
-    /// pixels. Version 11 adds per-layer text blocks (v10 and older files
-    /// still open text-less; old app versions cleanly refuse v11 files at
-    /// the magic).
+    /// to a `.procraft` file: magic + little-endian records. Version 12
+    /// stores per-tile zlib payloads (only allocated 256² tiles are
+    /// written), so sparse 8K documents stay small; older readers cleanly
+    /// refuse v12 files at the magic. Versions 1-11 stay readable.
     pub fn save_project(&self, path: &std::path::Path) -> Result<(), String> {
-        use std::io::Write;
         let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        f.write_all(b"PCRAFT11").map_err(|e| e.to_string())?;
+        self.write_project(&mut f)
+    }
+
+    /// Encode the project into memory instead of a file. Deflating an 8K
+    /// document's tiles takes ~600 ms, so autosave runs this on a worker
+    /// thread (the `Document` clone it reads shares every tile through
+    /// `Arc`) and the UI thread writes the short result.
+    pub fn save_project_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        self.write_project(&mut out)?;
+        Ok(out.into_inner())
+    }
+
+    fn write_project(&self, f: &mut (impl std::io::Write + std::io::Seek)) -> Result<(), String> {
+        f.write_all(b"PCRAFT12").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
         f.write_all(&self.h.to_le_bytes())
@@ -3067,28 +4062,17 @@ impl Document {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
                 }
             }
-            let expect = (self.w * self.h * 4) as usize;
-            if layer.pixels.len() != expect {
+            // v12 writes only the tiles that hold content; a dense layer
+            // with assigned tiles serializes as a tile table.
+            if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.bpp() != 4 {
                 return Err("layer has wrong pixel size".to_string());
             }
-            let mut enc =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            enc.write_all(&layer.pixels).map_err(|e| e.to_string())?;
-            let packed = enc.finish().map_err(|e| e.to_string())?;
-            f.write_all(&(packed.len() as u32).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&packed).map_err(|e| e.to_string())?;
-            // Optional reveal mask, zlib-compressed like the pixels.
-            match layer.mask.as_deref() {
-                Some(m) if m.len() == (self.w * self.h) as usize => {
+            write_tile_table(&mut *f, &layer.pixels)?;
+            // Optional reveal mask, one byte per pixel, same tile table.
+            match layer.mask.as_ref() {
+                Some(m) if m.w() == self.w && m.h() == self.h && m.bpp() == 1 => {
                     f.write_all(&[1u8]).map_err(|e| e.to_string())?;
-                    let mut enc =
-                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-                    enc.write_all(m).map_err(|e| e.to_string())?;
-                    let packed = enc.finish().map_err(|e| e.to_string())?;
-                    f.write_all(&(packed.len() as u32).to_le_bytes())
-                        .map_err(|e| e.to_string())?;
-                    f.write_all(&packed).map_err(|e| e.to_string())?;
+                    write_tile_table(&mut *f, m)?;
                 }
                 _ => {
                     f.write_all(&[0u8]).map_err(|e| e.to_string())?;
@@ -3172,7 +4156,8 @@ impl Document {
             Ok(head)
         };
         let magic = take(8)?.to_vec();
-        let v11 = magic == b"PCRAFT11";
+        let v12 = magic == b"PCRAFT12";
+        let v11 = v12 || magic == b"PCRAFT11";
         let v10 = v11 || magic == b"PCRAFT10";
         let v9 = v10 || magic == b"PCRAFT09";
         let v8 = v9 || magic == b"PCRAFT08";
@@ -3406,33 +4391,44 @@ impl Document {
                 None
             };
             let expect = (w * h * 4) as usize;
-            let pixels = if v4 {
-                let comp_len = u32::from_le_bytes(
-                    take(4)?[..4]
-                        .try_into()
-                        .map_err(|_| "bad compressed size".to_string())?,
-                ) as usize;
-                if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
-                    return Err("project has bad compressed size".to_string());
-                }
-                let packed = take(comp_len)?.to_vec();
-                let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
-                let mut raw = Vec::with_capacity(expect);
-                use std::io::Read;
-                dec.read_to_end(&mut raw)
-                    .map_err(|_| "project has corrupt pixels".to_string())?;
-                if raw.len() != expect {
-                    return Err("project has corrupt pixels".to_string());
-                }
-                raw
+            // v12 stores a tile table; v1-v11 store one dense zlib payload,
+            // which `Raster::from_dense` splits into tiles on load (all-zero
+            // tiles stay unallocated, so a resave flattens identically).
+            let pixels = if v12 {
+                read_tile_table(&mut take, w, h, 4)?
             } else {
-                take(expect)?.to_vec()
+                let raw = if v4 {
+                    let comp_len = u32::from_le_bytes(
+                        take(4)?[..4]
+                            .try_into()
+                            .map_err(|_| "bad compressed size".to_string())?,
+                    ) as usize;
+                    if comp_len == 0 || comp_len > expect.saturating_add(10 * 1024 * 1024) {
+                        return Err("project has bad compressed size".to_string());
+                    }
+                    let packed = take(comp_len)?.to_vec();
+                    let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
+                    let mut raw = Vec::with_capacity(expect);
+                    use std::io::Read;
+                    dec.read_to_end(&mut raw)
+                        .map_err(|_| "project has corrupt pixels".to_string())?;
+                    if raw.len() != expect {
+                        return Err("project has corrupt pixels".to_string());
+                    }
+                    raw
+                } else {
+                    take(expect)?.to_vec()
+                };
+                Raster::from_dense(w, h, 4, &raw)
             };
-            // v5 appends an optional zlib-compressed reveal mask per layer.
+            // v5 appends an optional reveal mask per layer: dense in v5-v11,
+            // a tile table in v12.
             let mask = if v5 {
                 let flag = take(1)?[0];
                 if flag == 0 {
                     None
+                } else if v12 {
+                    Some(read_tile_table(&mut take, w, h, 1)?)
                 } else {
                     let want = (w * h) as usize;
                     let comp_len = u32::from_le_bytes(
@@ -3452,7 +4448,7 @@ impl Document {
                     if raw.len() != want {
                         return Err("project has corrupt mask".to_string());
                     }
-                    Some(raw)
+                    Some(Raster::from_dense(w, h, 1, &raw))
                 }
             } else {
                 None
@@ -3616,6 +4612,9 @@ impl Document {
             next_group_id,
             smudge_finger: None,
             rev: 0,
+            stroke_peak: None,
+            stroke_rect: None,
+            liquify: None,
         })
     }
 }
@@ -3705,6 +4704,16 @@ pub fn curves_lut(shadow: i32, mid: i32, high: i32) -> [u8; 256] {
 mod tests {
     use super::*;
 
+    /// Test-only: an RGBA raster sized to the document from dense bytes.
+    fn px_rgba(doc: &Document, bytes: &[u8]) -> Raster {
+        Raster::from_dense(doc.w, doc.h, 4, bytes)
+    }
+
+    /// Test-only: a 1-bpp mask sized to the document from dense bytes.
+    fn px_mask(doc: &Document, bytes: &[u8]) -> Raster {
+        Raster::from_dense(doc.w, doc.h, 1, bytes)
+    }
+
     #[test]
     fn revision_advances_on_dirty_marks() {
         let mut doc = Document::new(8, 8);
@@ -3719,18 +4728,88 @@ mod tests {
     }
 
     #[test]
+    fn region_restore_rewinds_only_the_rect() {
+        let mut doc = Document::new(8, 8);
+        let idx = |x: u32, y: u32| ((y * 8 + x) * 4) as usize;
+        doc.layers[0].pixels.set4(idx(1, 1), [10, 0, 0, 255]);
+        doc.layers[0].pixels.set4(idx(6, 6), [20, 0, 0, 255]);
+        doc.checkpoint();
+        doc.layers[0].pixels.set4(idx(1, 1), [99, 0, 0, 255]);
+        doc.layers[0].pixels.set4(idx(6, 6), [99, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 0, 3, 3)));
+        assert_eq!(doc.layers[0].pixels.get4(idx(1, 1)), [10, 0, 0, 255]);
+        // Outside the rect the live edit stands: the replay redraws it.
+        assert_eq!(doc.layers[0].pixels.get4(idx(6, 6)), [99, 0, 0, 255]);
+    }
+
+    #[test]
+    fn region_restore_copies_wide_bands_across_tiles() {
+        // 600 px wide crosses two 256-px tile borders.
+        let mut doc = Document::new(600, 4);
+        let idx = |x: u32, y: u32| ((y * 600 + x) * 4) as usize;
+        for x in 0..600 {
+            doc.layers[0].pixels.set4(idx(x, 1), [7, 0, 0, 255]);
+        }
+        doc.checkpoint();
+        for x in 0..600 {
+            doc.layers[0].pixels.set4(idx(x, 1), [99, 0, 0, 255]);
+        }
+        doc.layers[0].pixels.set4(idx(0, 0), [5, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 1, 599, 1)));
+        for x in 0..600 {
+            assert_eq!(
+                doc.layers[0].pixels.get4(idx(x, 1)),
+                [7, 0, 0, 255],
+                "x={x}"
+            );
+        }
+        assert_eq!(doc.layers[0].pixels.get4(idx(0, 0)), [5, 0, 0, 255]);
+    }
+
+    #[test]
+    fn region_restore_refills_a_mask_the_stroke_created() {
+        let mut doc = Document::new(4, 2);
+        doc.checkpoint();
+        // Mask created after the checkpoint: it has no snapshot to copy back.
+        doc.layers[0].mask = Some(Raster::from_dense(
+            4,
+            2,
+            1,
+            &[10, 20, 30, 40, 50, 60, 70, 80],
+        ));
+        assert!(doc.restore_checkpoint_region((0, 0, 3, 1)));
+        assert_eq!(
+            doc.layers[0].mask.as_ref().unwrap().to_dense(),
+            vec![255; 8]
+        );
+    }
+
+    #[test]
+    fn region_restore_follows_the_checkpoint_offset() {
+        let mut doc = Document::new(8, 2);
+        // Layer shifted left by one: canvas x maps to local x + 1.
+        doc.layers[0].ox = -1;
+        let at = ((8 + 2) * 4) as usize;
+        doc.layers[0].pixels.set4(at, [3, 0, 0, 255]);
+        doc.checkpoint();
+        doc.layers[0].pixels.set4(at, [99, 0, 0, 255]);
+        assert!(doc.restore_checkpoint_region((0, 1, 7, 1)));
+        assert_eq!(doc.layers[0].pixels.get4(at), [3, 0, 0, 255]);
+    }
+
+    #[test]
     fn opaque_top_layer_wins() {
         let mut doc = Document::new(2, 1);
         // Bottom layer: solid red.
         {
             let l = &mut doc.layers[0];
-            l.pixels = vec![255, 0, 0, 255, 255, 0, 0, 255];
+            l.pixels = Raster::from_dense(2, 1, 4, &[255, 0, 0, 255, 255, 0, 0, 255]);
         }
         doc.add_layer("top".to_string());
         // Top layer, first pixel green, second transparent.
         {
             let l = &mut doc.layers[1];
-            l.pixels = vec![0, 255, 0, 255, 0, 0, 0, 0];
+            l.pixels = Raster::from_dense(2, 1, 4, &[0, 255, 0, 255, 0, 0, 0, 0]);
         }
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[0, 255, 0, 255]);
@@ -3741,7 +4820,7 @@ mod tests {
     fn undo_restores_pixels() {
         let mut doc = Document::new(1, 1);
         doc.checkpoint();
-        doc.layers[0].pixels = vec![9, 9, 9, 9];
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(!doc.undo());
@@ -3752,7 +4831,7 @@ mod tests {
         let mut doc = Document::new(1, 1);
         assert!(!doc.restore_last_checkpoint());
         doc.checkpoint();
-        doc.layers[0].pixels = vec![9, 9, 9, 9];
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.restore_last_checkpoint());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         // The checkpoint survives the rewind and still undoes normally.
@@ -3765,7 +4844,7 @@ mod tests {
         let mut doc = Document::new(1, 1);
         assert!(!doc.redo());
         doc.checkpoint();
-        doc.layers[0].pixels = vec![9, 9, 9, 9];
+        doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 9]);
         assert!(doc.undo());
         assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
         assert!(doc.redo());
@@ -3779,9 +4858,9 @@ mod tests {
     #[test]
     fn group_hide_conceals_members_in_flatten() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255];
+        doc.layers[0].pixels = px_rgba(&doc, &[255, 0, 0, 255, 255, 0, 0, 255]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = vec![0, 0, 255, 255, 0, 0, 255, 255];
+        doc.layers[1].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 255, 255]);
         let g = doc.new_group("G".to_string());
         doc.move_layer_into_group(1, Some(g));
         assert!(doc.is_layer_shown(1));
@@ -3836,6 +4915,225 @@ mod tests {
     }
 
     #[test]
+    fn move_out_of_group_keeps_the_stack_position() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert!(doc.move_layer_out_of_group(0));
+        assert_eq!(doc.layers[0].group, None);
+        // Leaving the group must not restack the canvas.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "b", "c"]);
+        // A top-level layer has nowhere to go.
+        assert!(!doc.move_layer_out_of_group(0));
+        // Out-of-range indexes are a no-op, not a panic.
+        assert!(!doc.move_layer_out_of_group(9));
+    }
+
+    #[test]
+    fn move_out_of_a_nested_group_lands_in_the_parent() {
+        let mut doc = Document::new(1, 1);
+        let outer = doc.new_group("outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc
+            .group_layer(0, "inner".to_string())
+            .expect("layer 0 groups");
+        assert!(doc.move_layer_out_of_group(0));
+        assert_eq!(doc.layers[0].group, Some(outer));
+        assert!(doc.group(inner).is_some());
+    }
+
+    #[test]
+    fn move_group_shifts_its_whole_block() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.group_layer(0, "g".to_string()).expect("layer 0 groups");
+        doc.active = 0;
+        assert!(doc.move_group(g, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["b", "Layer 1", "c"]);
+        assert_eq!(doc.layers[0].group, None);
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+        assert!(doc.move_group(g, true));
+        assert_eq!(doc.layers[2].group, Some(g));
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+        // Already at the top of the stack.
+        assert!(!doc.can_move_group(g, true));
+        assert!(!doc.move_group(g, true));
+        assert!(doc.move_group(g, false));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["b", "Layer 1", "c"]);
+        assert_eq!(doc.layers[doc.active].name, "Layer 1");
+    }
+
+    #[test]
+    fn move_group_refuses_interleaved_members() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        doc.add_layer("d".to_string());
+        let g = doc
+            .group_layers(&[0, 2], "g".to_string())
+            .expect("two layers group");
+        assert!(!doc.can_move_group(g, true));
+        assert!(!doc.move_group(g, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn move_group_carries_nested_layers() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        let outer = doc.new_group("outer".to_string());
+        let inner = doc.new_group("inner".to_string());
+        doc.groups
+            .iter_mut()
+            .find(|g| g.id == inner)
+            .unwrap()
+            .parent = Some(outer);
+        doc.layers[0].group = Some(outer);
+        doc.layers[1].group = Some(inner);
+        doc.add_layer("above".to_string());
+        assert!(doc.can_move_group(outer, true));
+        assert!(doc.move_group(outer, true));
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["above", "Layer 1", "b"]);
+        assert_eq!(doc.layers[1].group, Some(outer));
+        assert_eq!(doc.layers[2].group, Some(inner));
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        // A group with no layers has no stacking position to move.
+        let empty = doc.new_group("empty".to_string());
+        assert!(!doc.can_move_group(empty, true));
+        assert!(!doc.can_move_group(empty, false));
+    }
+
+    #[test]
+    fn group_layer_wraps_a_layer_in_place() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("mid".to_string());
+        doc.add_layer("top".to_string());
+        doc.active = 1;
+        let g = doc
+            .group_layer(1, "Group 1".to_string())
+            .expect("layer 1 groups");
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert!(doc
+            .group(g)
+            .is_some_and(|gr| gr.parent.is_none() && !gr.collapsed && gr.visible));
+        // Grouping must not restack the canvas.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "mid", "top"]);
+        assert_eq!(doc.active, 1);
+        // Out-of-range indexes are a no-op, not a panic.
+        let before = doc.groups.len();
+        assert!(doc.group_layer(99, "nope".to_string()).is_none());
+        assert_eq!(doc.groups.len(), before);
+    }
+
+    #[test]
+    fn group_layer_nests_inside_the_parent_group() {
+        let mut doc = Document::new(1, 1);
+        let outer = doc.new_group("outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc
+            .group_layer(0, "inner".to_string())
+            .expect("layer 0 groups");
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        assert_eq!(doc.layers[0].group, Some(inner));
+        // The outer group now only holds the nested group, not the layer.
+        assert_eq!(
+            doc.layers.iter().filter(|l| l.group == Some(outer)).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn shared_group_requires_one_common_parent() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.new_group("g".to_string());
+        doc.layers[0].group = Some(g);
+        doc.layers[1].group = Some(g);
+        assert_eq!(doc.shared_group(&[0, 1]), Some(g));
+        // Mixed parentage and empty/unknown indexes have no common group.
+        assert_eq!(doc.shared_group(&[0, 2]), None);
+        assert_eq!(doc.shared_group(&[]), None);
+        assert_eq!(doc.shared_group(&[9]), None);
+        // A dangling group id is not a home.
+        doc.layers[0].group = Some(999);
+        assert_eq!(doc.shared_group(&[0]), None);
+    }
+
+    #[test]
+    fn group_layers_wraps_every_selected_layer() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("mid".to_string());
+        doc.add_layer("top".to_string());
+        let g = doc
+            .group_layers(&[0, 2], "Both".to_string())
+            .expect("two layers group");
+        assert_eq!(doc.groups.len(), 1);
+        assert!(doc.group(g).is_some_and(|gr| gr.parent.is_none()));
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert_eq!(doc.layers[1].group, None);
+        assert_eq!(doc.layers[2].group, Some(g));
+        // Non-contiguous members keep their stacking positions.
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Layer 1", "mid", "top"]);
+    }
+
+    #[test]
+    fn group_layers_ignores_bad_and_duplicate_indexes() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        assert!(doc.group_layers(&[], "none".to_string()).is_none());
+        assert!(doc.group_layers(&[5, 9], "none".to_string()).is_none());
+        assert!(doc.groups.is_empty());
+        let g = doc
+            .group_layers(&[1, 1, 0], "both".to_string())
+            .expect("valid indexes group");
+        assert_eq!(doc.layers[0].group, Some(g));
+        assert_eq!(doc.layers[1].group, Some(g));
+        assert_eq!(doc.groups.len(), 1);
+    }
+
+    #[test]
+    fn group_layers_nests_only_when_the_selection_shares_a_group() {
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let outer = doc.new_group("outer".to_string());
+        doc.layers[0].group = Some(outer);
+        doc.layers[1].group = Some(outer);
+        let inner = doc
+            .group_layers(&[0, 1], "inner".to_string())
+            .expect("shared-parent selection groups");
+        assert_eq!(doc.group(inner).unwrap().parent, Some(outer));
+        assert_eq!(doc.layers[0].group, Some(inner));
+        assert_eq!(doc.layers[1].group, Some(inner));
+
+        // A selection spanning parents lands at the top level.
+        let mut doc = Document::new(1, 1);
+        doc.add_layer("b".to_string());
+        doc.add_layer("c".to_string());
+        let g = doc.new_group("g".to_string());
+        doc.layers[0].group = Some(g);
+        let mixed = doc
+            .group_layers(&[0, 2], "mixed".to_string())
+            .expect("mixed selection groups");
+        assert_eq!(doc.group(mixed).unwrap().parent, None);
+        assert_eq!(doc.layers[0].group, Some(mixed));
+        assert_eq!(doc.layers[1].group, None);
+        assert_eq!(doc.layers[2].group, Some(mixed));
+    }
+
+    #[test]
     fn move_into_group_lands_adjacent() {
         let mut doc = Document::new(1, 1);
         doc.add_layer("b".to_string());
@@ -3863,7 +5161,7 @@ mod tests {
         let path = dir.join("procraft-v8.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -3880,7 +5178,7 @@ mod tests {
     #[test]
     fn group_opacity_fades_members() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = [255, 0, 0, 255].repeat(2);
+        doc.layers[0].pixels = px_rgba(&doc, &([255, 0, 0, 255].repeat(2)));
         let g = doc.new_group("Fade".to_string());
         doc.move_layer_into_group(0, Some(g));
         assert_eq!(doc.group_opacity(0), 1.0);
@@ -3906,7 +5204,7 @@ mod tests {
     #[test]
     fn v9_roundtrip_keeps_group_opacity() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = [255, 0, 0, 255].repeat(2);
+        doc.layers[0].pixels = px_rgba(&doc, &([255, 0, 0, 255].repeat(2)));
         let g = doc.new_group("Fade".to_string());
         doc.set_group_opacity(g, 0.5);
         doc.move_layer_into_group(0, Some(g));
@@ -3914,7 +5212,7 @@ mod tests {
         let path = dir.join("procraft-v9.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.groups.len(), 1);
@@ -3982,7 +5280,7 @@ mod tests {
         let path = dir.join("procraft-v10.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].hold, 3);
@@ -4079,14 +5377,354 @@ mod tests {
     }
 
     #[test]
-    fn save_emits_v11_magic() {
+    fn save_emits_v12_magic() {
         let doc = Document::new(2, 1);
         let dir = std::env::temp_dir();
-        let path = dir.join("procraft-v11-magic.pcraft");
+        let path = dir.join("procraft-v12-magic.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
+    }
+
+    /// Hand-build a v12 record with one layer holding one tile. Returns the
+    /// buffer plus the offsets the validation tests mutate.
+    struct V12Fixture {
+        buf: Vec<u8>,
+        count_at: usize,
+        tx_at: usize,
+        len_at: usize,
+        payload_at: usize,
+        payload_end: usize,
+    }
+
+    fn v12_fixture(tx: u16, ty: u16, raw: &[u8]) -> V12Fixture {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT12");
+        buf.extend_from_slice(&256u32.to_le_bytes());
+        buf.extend_from_slice(&256u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One layer.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Active layer.
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No group.
+        let count_at = buf.len();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // One tile.
+        let tx_at = buf.len();
+        buf.extend_from_slice(&tx.to_le_bytes());
+        buf.extend_from_slice(&ty.to_le_bytes());
+        let len_at = buf.len();
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(raw).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        let payload_at = buf.len();
+        buf.extend_from_slice(&packed);
+        let payload_end = buf.len();
+        buf.extend_from_slice(&[0]); // No mask.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+        buf.extend_from_slice(&[0]); // No text.
+        V12Fixture {
+            buf,
+            count_at,
+            tx_at,
+            len_at,
+            payload_at,
+            payload_end,
+        }
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_sparse_layers_small() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-sparse.procraft");
+        let mut doc = Document::new(8192, 8192);
+        doc.add_layer("second".into());
+        doc.layers[0].pixels.set4(0, [1, 2, 3, 255]);
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "sparse 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        assert_eq!(back.layers[0].pixels.get4(0), [1, 2, 3, 255]);
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 256 * 1024);
+        assert_eq!(back.layers[1].pixels.alloc_bytes(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v12_roundtrip_omits_fully_erased_tiles() {
+        use crate::brush::{Brush, Color};
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-erased.procraft");
+        let mut doc = Document::new(8192, 8192);
+        // Paint black, then erase it: the eraser only zeroes alpha, so the
+        // tile stays allocated (allocated-but-empty), which is the case the
+        // writer must drop.
+        let paint = Brush {
+            size: 16.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&paint, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert_eq!(doc.layers[0].pixels.allocated_tiles().count(), 1);
+        let eraser = Brush {
+            eraser: true,
+            size: 32.0,
+            ..paint
+        };
+        doc.dab(&eraser, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert_eq!(
+            doc.layers[0].pixels.allocated_tiles().count(),
+            1,
+            "the erased tile stays allocated"
+        );
+        assert!(
+            doc.layers[0]
+                .pixels
+                .allocated_tiles()
+                .all(|(_, _, t)| t.iter().all(|&b| b == 0)),
+            "the erased tile is all zero"
+        );
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "fully erased 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 0);
+    }
+
+    #[test]
+    fn v12_roundtrip_omits_fully_erased_colored_tiles() {
+        use crate::brush::{Brush, Color};
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-erased-colored.procraft");
+        let mut doc = Document::new(8192, 8192);
+        // Coloured counterpart of the black case: the eraser canonicalises
+        // alpha-0 pixels to [0, 0, 0, 0], so a fully erased coloured tile is
+        // all-zero and the writer omits it. Without that, reload would
+        // re-allocate 256 KiB for a tile nobody can see.
+        let paint = Brush {
+            size: 16.0,
+            softness: 0.0,
+            ..Default::default()
+        };
+        doc.dab(&paint, Color::rgb(200, 40, 40), 16.0, 16.0);
+        assert_eq!(doc.layers[0].pixels.allocated_tiles().count(), 1);
+        let eraser = Brush {
+            eraser: true,
+            size: 32.0,
+            ..paint
+        };
+        doc.dab(&eraser, Color::rgb(0, 0, 0), 16.0, 16.0);
+        assert!(
+            doc.layers[0]
+                .pixels
+                .allocated_tiles()
+                .all(|(_, _, t)| t.iter().all(|&b| b == 0)),
+            "erased coloured pixels are canonical zero, not [200, 40, 40, 0]"
+        );
+        doc.save_project(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "fully erased 8K project is {size} bytes");
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            back.layers[0].pixels.alloc_bytes(),
+            0,
+            "the erased coloured tile allocates nothing on reload"
+        );
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_masks_and_groups() {
+        let mut doc = Document::new(300, 300);
+        doc.add_mask(0);
+        let last = 299 * 300 + 299;
+        doc.layers[0].mask.as_mut().unwrap().set(last, 0);
+        doc.layers[0].pixels.set4(0, [10, 20, 30, 255]);
+        doc.layers[0].pixels.set4(last * 4, [40, 50, 60, 255]);
+        let g = doc.new_group("G".to_string());
+        doc.set_group_opacity(g, 0.5);
+        doc.layers[0].group = Some(g);
+        doc.add_layer("empty".to_string());
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-tiles.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.layers.len(), 2);
+        assert_eq!(back.layers[0].pixels.get4(0), [10, 20, 30, 255]);
+        assert_eq!(back.layers[0].pixels.get4(last * 4), [40, 50, 60, 255]);
+        // Two painted corner tiles, not the whole 2x2 grid.
+        assert_eq!(back.layers[0].pixels.alloc_bytes(), 2 * 256 * 1024);
+        assert_eq!(back.layers[1].pixels.alloc_bytes(), 0);
+        assert_eq!(back.layers[0].mask.as_ref().unwrap().get(last), 0);
+        assert_eq!(back.layers[0].group, Some(g));
+        assert_eq!(back.group_opacity(0), 0.5);
+        assert_eq!(back.flatten(), doc.flatten());
+    }
+
+    #[test]
+    fn v12_roundtrip_keeps_empty_and_nested_groups() {
+        let mut doc = Document::new(16, 16);
+        let outer = doc.new_group("Outer".to_string());
+        doc.move_layer_into_group(0, Some(outer));
+        let inner = doc.group_layer(0, "Inner".to_string()).unwrap();
+        let empty = doc.new_group("Empty".to_string());
+        doc.set_group_collapsed(empty, true);
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-nested-groups.pcraft");
+        doc.save_project(&path).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.groups.len(), 3);
+        let outer_back = back.group(outer).expect("outer group survives");
+        assert_eq!(outer_back.name, "Outer");
+        assert_eq!(outer_back.parent, None);
+        let inner_back = back.group(inner).expect("nested group survives");
+        assert_eq!(inner_back.name, "Inner");
+        assert_eq!(inner_back.parent, Some(outer));
+        assert_eq!(back.layers[0].group, Some(inner));
+        let empty_back = back.group(empty).expect("empty group survives");
+        assert_eq!(empty_back.name, "Empty");
+        assert_eq!(empty_back.parent, None);
+        assert!(empty_back.collapsed);
+        assert_eq!(back.flatten(), doc.flatten());
+    }
+
+    #[test]
+    fn v11_file_resaves_as_v12_with_identical_flatten() {
+        // Hand-build a valid version-11 record (dense pixels, mask, text
+        // tail) so the resave exercises the dense-to-tile split.
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v11-to-v12.pcraft");
+        let resave = dir.join("procraft-v11-to-v12-resaved.pcraft");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"PCRAFT11");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[255, 255, 255, 255]);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Symmetry off.
+        buf.extend_from_slice(&[6]);
+        buf.extend_from_slice(&[0]); // No mirror center.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // No groups.
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(b"L");
+        buf.extend_from_slice(&[1]);
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // Blend: Normal.
+        buf.extend_from_slice(&[0]); // Clip: off.
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No group.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[7u8; 4 * 2 * 4]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&[1]); // Has a mask.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&[200u8; 4 * 2]).unwrap();
+        let packed = enc.finish().unwrap();
+        buf.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // Frame hold.
+        buf.extend_from_slice(&[1]); // Has text.
+        buf.extend_from_slice(&4.0f32.to_le_bytes());
+        buf.extend_from_slice(&3.0f32.to_le_bytes());
+        buf.extend_from_slice(&12.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0, 0, 0, 255]);
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&[0]); // No outline.
+        buf.extend_from_slice(&[0]); // No font.
+        let t = b"hi";
+        buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        buf.extend_from_slice(t);
+        let head = buf.clone();
+        std::fs::write(&path, &buf).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let flat = back.flatten();
+        back.save_project(&resave).unwrap();
+        let raw = std::fs::read(&resave).unwrap();
+        assert_eq!(&raw[..8], b"PCRAFT12");
+        assert_eq!(&head[..8], b"PCRAFT11", "the crafted input stays v11");
+        let again = Document::open_project(&resave).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&resave);
+        assert_eq!(again.flatten(), flat);
+        assert_eq!(again.layers[0].pixels, vec![7u8; 4 * 2 * 4]);
+        assert_eq!(again.layers[0].mask.as_ref().unwrap().get(3), 200);
+        assert!(again.layers[0].is_text());
+        assert_eq!(again.layers[0].text.as_ref().unwrap().text, "hi");
+    }
+
+    #[test]
+    fn v12_tile_table_rejects_corrupt_records() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-v12-corrupt.pcraft");
+        let mut raw = vec![0u8; 256 * 256 * 4];
+        raw[..4].copy_from_slice(&[1, 2, 3, 255]);
+        let base = v12_fixture(0, 0, &raw);
+        let check = |bad: &[u8]| -> String {
+            std::fs::write(&path, bad).unwrap();
+            let err = Document::open_project(&path).unwrap_err();
+            assert!(!err.is_empty(), "empty error message");
+            err
+        };
+        // Absurd tile count.
+        let mut bad = base.buf.clone();
+        bad[base.count_at..base.count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(check(&bad).contains("tile count"));
+        // Tile outside the 1x1 grid.
+        let mut bad = base.buf.clone();
+        bad[base.tx_at..base.tx_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(check(&bad).contains("tile"));
+        // Absurd payload length.
+        let mut bad = base.buf.clone();
+        bad[base.len_at..base.len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        check(&bad);
+        // Corrupt payload bytes (zlib checksum catches them).
+        let mut bad = base.buf.clone();
+        for b in bad[base.payload_at..base.payload_end].iter_mut() {
+            *b ^= 0xFF;
+        }
+        check(&bad);
+        // A payload shorter than the full tile must not be padded silently.
+        let short = v12_fixture(0, 0, &[1, 2, 3, 255]);
+        assert!(check(&short.buf).contains("corrupt tile"));
+        // Truncations at every field boundary fail closed.
+        for n in [
+            base.count_at,
+            base.count_at + 2,
+            base.tx_at,
+            base.tx_at + 2,
+            base.len_at,
+            base.len_at + 2,
+            base.payload_at,
+            base.payload_at + 1,
+            base.payload_end,
+        ] {
+            check(&base.buf[..n]);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -4196,11 +5834,7 @@ mod tests {
         // Solid red: lossy error stays one-sided and easy to bound.
         let px = &mut doc.layers[0].pixels;
         for i in 0..px.len() / 4 {
-            let o = i * 4;
-            px[o] = 255;
-            px[o + 1] = 0;
-            px[o + 2] = 0;
-            px[o + 3] = 255;
+            px.set4(i * 4, [255, 0, 0, 255]);
         }
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-m28.jpg");
@@ -4229,11 +5863,7 @@ mod tests {
         let mut doc = Document::new(8, 6);
         let px = &mut doc.layers[0].pixels;
         for i in 0..px.len() / 4 {
-            let o = i * 4;
-            px[o] = (i % 251) as u8;
-            px[o + 1] = 17;
-            px[o + 2] = 200;
-            px[o + 3] = 255;
+            px.set4(i * 4, [(i % 251) as u8, 17, 200, 255]);
         }
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-m28.tiff");
@@ -4256,8 +5886,8 @@ mod tests {
         for y in 0..4u32 {
             for x in 0..2u32 {
                 let o = ((y * 6 + x) * 4) as usize;
-                px[o] = 255;
-                px[o + 3] = 255;
+                px.set(o, 255);
+                px.set(o + 3, 255);
             }
         }
         doc.layers[0].ox = 2;
@@ -4279,8 +5909,8 @@ mod tests {
         let mut doc = Document::new(4, 4);
         let o = (5 * 4) as usize;
         let px = &mut doc.layers[0].pixels;
-        px[o + 2] = 255;
-        px[o + 3] = 255;
+        px.set(o + 2, 255);
+        px.set(o + 3, 255);
         doc.selection = Some((1, 1, 2, 2));
         doc.set_symmetry_center(1.0, 1.0);
         // Pad to 8x8: old canvas sits at (2, 2).
@@ -4308,8 +5938,8 @@ mod tests {
         // reads cells shifted by x0. The bottom-right corner must ride along.
         let mut doc = Document::new(6, 4);
         let at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
-        doc.layers[0].pixels[at(5, 3)..at(5, 3) + 4].copy_from_slice(&[255, 0, 0, 255]);
-        doc.layers[0].pixels[at(4, 2)..at(4, 2) + 4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.layers[0].pixels.set4(at(5, 3), [255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(at(4, 2), [0, 255, 0, 255]);
         doc.crop(1, 1, 5, 3).unwrap();
         assert_eq!((doc.w, doc.h), (5, 3));
         let flat = doc.flatten();
@@ -4326,8 +5956,8 @@ mod tests {
         // x=6 must land at new x=5, and old x=7 (trimmed) must be gone.
         let mut doc = Document::new(8, 4);
         let at = |x: u32, y: u32| ((y * 8 + x) * 4) as usize;
-        doc.layers[0].pixels[at(6, 1)..at(6, 1) + 4].copy_from_slice(&[0, 255, 0, 255]);
-        doc.layers[0].pixels[at(7, 1)..at(7, 1) + 4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.layers[0].pixels.set4(at(6, 1), [0, 255, 0, 255]);
+        doc.layers[0].pixels.set4(at(7, 1), [0, 0, 255, 255]);
         doc.rehome_canvas(6, 4, -1, 0).unwrap();
         let flat = doc.flatten();
         let n_at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
@@ -4346,9 +5976,9 @@ mod tests {
         // old canvas shifts by dx=-2 and the layer re-bases to ox=0.
         let mut doc = Document::new(6, 4);
         let at = |x: u32, y: u32| ((y * 6 + x) * 4) as usize;
-        doc.layers[0].pixels[at(0, 0)..at(0, 0) + 4].copy_from_slice(&[255, 0, 0, 255]);
-        doc.layers[0].pixels[at(1, 0)..at(1, 0) + 4].copy_from_slice(&[0, 255, 0, 255]);
-        doc.layers[0].pixels[at(4, 0)..at(4, 0) + 4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.layers[0].pixels.set4(at(0, 0), [255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(at(1, 0), [0, 255, 0, 255]);
+        doc.layers[0].pixels.set4(at(4, 0), [0, 0, 255, 255]);
         doc.layers[0].ox = 1;
         doc.crop(2, 0, 5, 3).unwrap();
         assert_eq!((doc.w, doc.h), (4, 4));
@@ -4376,9 +6006,25 @@ mod tests {
         assert!(doc.crop(5, 0, 9, 3).is_err());
         assert!(doc.crop(3, 0, 1, 3).is_err());
         assert!(doc.rehome_canvas(0, 8, 0, 0).is_err());
-        assert!(doc.rehome_canvas(5000, 8, 0, 0).is_err());
+        assert!(doc.rehome_canvas(8193, 8, 0, 0).is_err());
         // Failed ops touch nothing.
         assert_eq!((doc.w, doc.h), (8, 8));
+    }
+
+    #[test]
+    fn canvas_cap_allows_8k_but_not_more() {
+        assert_eq!(MAX_CANVAS_SIDE, 8192);
+        // Grow a small document to the cap: a same-size rehome
+        // short-circuits, so growth is the real boundary.
+        let mut doc = Document::new(64, 64);
+        doc.rehome_canvas(8192, 8192, 0, 0).unwrap();
+        assert_eq!((doc.w, doc.h), (8192, 8192));
+        // Area outside the old 64x64 content reads the page background.
+        assert_eq!(doc.sample(8000, 8000), Some([255, 255, 255]));
+        let err = Document::new(64, 64)
+            .rehome_canvas(8193, 64, 0, 0)
+            .unwrap_err();
+        assert!(err.contains("want 1-8192 each"), "{err}");
     }
 
     #[test]
@@ -4432,9 +6078,12 @@ mod tests {
 
     #[test]
     fn undo_byte_budget_binds_on_large_canvas() {
-        // 2048x2048 RGBA = 16 MiB per step: the 256 MiB budget caps at 16,
-        // well under the 32-count backstop.
+        // 2048x2048 RGBA of allocated tiles = 16 MiB per step: the 256 MiB
+        // budget caps at 16, well under the 32-count backstop.
         let mut doc = Document::new(2048, 2048);
+        // Touch every tile first: a blank layer holds no tiles now, so only
+        // real storage can make the byte budget bind.
+        doc.layers[0].pixels.fill(255);
         for _ in 0..40 {
             doc.checkpoint();
         }
@@ -4468,14 +6117,17 @@ mod tests {
     fn mask_multiplies_layer_alpha() {
         let mut doc = Document::new(4, 1);
         doc.background = [255, 255, 255, 255];
-        doc.layers[0].pixels = vec![
-            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
-        ];
+        doc.layers[0].pixels = px_rgba(
+            &doc,
+            &(vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ]),
+        );
         doc.add_mask(0);
         // Conceal the left half.
         if let Some(m) = doc.layers[0].mask.as_mut() {
-            m[0] = 0;
-            m[1] = 0;
+            m.set(0, 0);
+            m.set(1, 0);
         }
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
@@ -4492,10 +6144,10 @@ mod tests {
         let mut doc = Document::new(4, 1);
         doc.background = [255, 255, 255, 255];
         // Base: single red dot at x=1.
-        doc.layers[0].pixels[7] = 255;
-        doc.layers[0].pixels[4] = 255;
+        doc.layers[0].pixels.set(7, 255);
+        doc.layers[0].pixels.set(4, 255);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = [0, 255, 0, 255].repeat(4);
+        doc.layers[1].pixels = px_rgba(&doc, &([0, 255, 0, 255].repeat(4)));
         doc.layers[1].clip = true;
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[255, 255, 255, 255]);
@@ -4522,15 +6174,15 @@ mod tests {
         doc.dab(&brush, Color::rgb(0, 0, 0), 8.0, 8.0);
         // Black paint concealed the middle; mask auto-materialized.
         let m = doc.layers[0].mask.as_ref().expect("mask created");
-        assert!(m.iter().any(|&b| b < 255));
+        assert!(m.to_dense().iter().any(|&b| b < 255));
         // Eraser reveals back toward white.
-        let before: Vec<u8> = m.clone();
+        let before: Vec<u8> = m.to_dense();
         let eraser = Brush {
             eraser: true,
             ..brush
         };
         doc.dab(&eraser, Color::rgb(0, 0, 0), 8.0, 8.0);
-        let after = doc.layers[0].mask.as_ref().unwrap();
+        let after = doc.layers[0].mask.as_ref().unwrap().to_dense();
         assert!(after.iter().zip(before.iter()).all(|(&a, &b)| a >= b));
         assert!(after.iter().any(|&b| b > 0));
         // Undo restores the pre-stroke state (no mask at all).
@@ -4544,24 +6196,24 @@ mod tests {
     fn v6_roundtrip_keeps_masks_clips_and_blends() {
         let mut doc = Document::new(4, 2);
         doc.layers[0].blend = BlendMode::Difference;
-        doc.layers[0].pixels = vec![200; 4 * 2 * 4];
+        doc.layers[0].pixels = px_rgba(&doc, &[200; 4 * 2 * 4]);
         doc.add_mask(0);
-        doc.layers[0].mask.as_mut().unwrap()[3] = 0;
+        doc.layers[0].mask.as_mut().unwrap().set(3, 0);
         doc.add_layer("clipped".to_string());
         doc.layers[1].blend = BlendMode::SoftLight;
         doc.layers[1].clip = true;
-        doc.layers[1].pixels = vec![7; 4 * 2 * 4];
+        doc.layers[1].pixels = px_rgba(&doc, &[7; 4 * 2 * 4]);
         doc.layers[1].ox = -3;
         doc.layers[1].oy = 2;
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-v6.pcraft");
         doc.save_project(&path).unwrap();
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].blend, BlendMode::Difference);
-        assert_eq!(back.layers[0].mask.as_ref().unwrap()[3], 0);
+        assert_eq!(back.layers[0].mask.as_ref().unwrap().get(3), 0);
         assert_eq!(back.layers[1].blend, BlendMode::SoftLight);
         assert!(back.layers[1].clip);
         assert_eq!(back.layers[1].pixels, vec![7; 4 * 2 * 4]);
@@ -4647,32 +6299,32 @@ mod tests {
     fn merge_bakes_mask_and_clip() {
         let mut doc = Document::new(2, 1);
         // Below: blue, left pixel only.
-        doc.layers[0].pixels = vec![0, 0, 255, 255, 0, 0, 0, 0];
+        doc.layers[0].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 0, 0]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = vec![255, 0, 0, 255, 255, 0, 0, 255];
+        doc.layers[1].pixels = px_rgba(&doc, &[255, 0, 0, 255, 255, 0, 0, 255]);
         doc.add_mask(1);
         // Mask hides the right pixel of the top layer.
-        doc.layers[1].mask.as_mut().unwrap()[1] = 0;
+        doc.layers[1].mask.as_mut().unwrap().set(1, 0);
         doc.layers[1].clip = true;
         assert!(doc.merge_down(1));
         // Left: red over blue = red. Right: top hidden by mask AND outside
         // the blue content, so it stays transparent.
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
-        assert_eq!(&doc.layers[0].pixels[4..8], &[0, 0, 0, 0]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(4), [0, 0, 0, 0]);
     }
 
     #[test]
     fn transforms_carry_the_mask() {
         let mut doc = Document::new(4, 1);
         doc.add_mask(0);
-        doc.layers[0].mask.as_mut().unwrap()[0] = 0;
+        doc.layers[0].mask.as_mut().unwrap().set(0, 0);
         doc.translate_layer(0, 1, 0);
         // With offsets, mask data doesn't move; offset changes instead.
         assert_eq!(doc.layers[0].ox, 1);
-        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[0], 0);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(0), 0);
         doc.flip_layer_horizontal(0);
         // 4-pixel wide: horizontal flip mirrors mask indices 0<->3, 1<->2.
-        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[3], 0);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(3), 0);
         assert_eq!(doc.layers[0].ox, -1);
         // Affine keeps dimensions and mask presence.
         doc.affine_layer(0, 1.0, 90.0);
@@ -4684,10 +6336,10 @@ mod tests {
     fn new_stroke_clears_redo() {
         let mut doc = Document::new(1, 1);
         doc.checkpoint();
-        doc.layers[0].pixels = vec![1, 1, 1, 1];
+        doc.layers[0].pixels = px_rgba(&doc, &[1, 1, 1, 1]);
         assert!(doc.undo());
         doc.checkpoint();
-        doc.layers[0].pixels = vec![2, 2, 2, 2];
+        doc.layers[0].pixels = px_rgba(&doc, &[2, 2, 2, 2]);
         assert!(!doc.redo());
     }
 
@@ -4695,7 +6347,7 @@ mod tests {
     fn multiply_blends_channels() {
         let mut doc = Document::new(1, 1);
         doc.background = [255, 255, 255, 255];
-        doc.layers[0].pixels = vec![128, 200, 64, 255];
+        doc.layers[0].pixels = px_rgba(&doc, &[128, 200, 64, 255]);
         doc.layers[0].blend = BlendMode::Multiply;
         let flat = doc.flatten();
         assert_eq!(&flat[0..4], &[128, 200, 64, 255]);
@@ -4714,7 +6366,7 @@ mod tests {
     fn project_roundtrip_keeps_everything() {
         let mut doc = Document::new(4, 3);
         doc.background = [10, 20, 30, 255];
-        doc.layers[0].pixels = vec![7; 4 * 3 * 4];
+        doc.layers[0].pixels = px_rgba(&doc, &[7; 4 * 3 * 4]);
         doc.layers[0].opacity = 0.5;
         doc.layers[0].blend = BlendMode::Overlay;
         doc.symmetry = SymmetryMode::Both;
@@ -4738,6 +6390,27 @@ mod tests {
         assert_eq!(back.symmetry, SymmetryMode::Both);
         assert_eq!(back.symmetry_center, Some((1.5, 1.0)));
         assert!(Document::open_project(&dir.join("missing.pcraft")).is_err());
+    }
+
+    #[test]
+    fn project_bytes_open_like_the_saved_file_and_a_clone_is_a_snapshot() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(300, 260);
+        doc.layers[0].pixels = px_rgba(&doc, &[9; 4 * 300 * 260]);
+        let bytes = doc.save_project_bytes().unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join("procraft-bytes.pcraft");
+        std::fs::write(&path, &bytes).unwrap();
+        let back = Document::open_project(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.w, 300);
+        assert_eq!(back.layers[0].pixels, vec![9; 4 * 300 * 260]);
+        // Autosave encodes a clone on a worker thread: painting on the live
+        // document must leave that snapshot's bytes untouched.
+        let snapshot = doc.clone();
+        doc.dab(&Brush::default(), Color::rgb(1, 2, 3), 10.0, 10.0);
+        assert_eq!(snapshot.save_project_bytes().unwrap(), bytes);
+        assert_ne!(doc.save_project_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -4785,7 +6458,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 5.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
         assert!(at(&doc, 2, 5) > 0);
         assert!(at(&doc, 8, 5) > 0);
         assert_eq!(at(&doc, 18, 5), 0);
@@ -4837,33 +6511,33 @@ mod tests {
     #[test]
     fn flip_horizontal_mirrors_pixels() {
         let mut doc = Document::new(4, 1);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.flip_layer_horizontal(0);
-        assert_eq!(&doc.layers[0].pixels[12..16], &[255, 0, 0, 255]);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(doc.layers[0].pixels.get4(12), [255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 0, 0]);
         // Double flip restores.
         doc.flip_layer_horizontal(0);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     #[test]
     fn flip_vertical_mirrors_pixels() {
         let mut doc = Document::new(1, 4);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[0, 255, 0, 255]);
+        doc.layers[0].pixels.set4(0, [0, 255, 0, 255]);
         doc.flip_layer_vertical(0);
-        assert_eq!(&doc.layers[0].pixels[12..16], &[0, 255, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(12), [0, 255, 0, 255]);
         doc.flip_layer_vertical(0);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 255, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [0, 255, 0, 255]);
     }
 
     #[test]
     fn translate_shifts_pixels() {
         let mut doc = Document::new(4, 1);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.translate_layer(0, 2, 0);
         // With offsets, pixels don't move; offset changes instead.
         assert_eq!(doc.layers[0].ox, 2);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     #[test]
@@ -4872,8 +6546,8 @@ mod tests {
         // on return because translate cropped destructively. Offsets keep
         // every pixel, so the round trip is exact.
         let mut doc = Document::new(8, 4);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
-        doc.layers[0].pixels[4..8].copy_from_slice(&[0, 255, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(4, [0, 255, 0, 255]);
         let want = doc.layers[0].pixels.clone();
         // Paint shows at the origin.
         assert_eq!(&doc.flatten()[0..4], &[255, 0, 0, 255]);
@@ -4938,7 +6612,7 @@ mod tests {
         assert_eq!(at(&doc, 10, 10), [255, 0, 0, 255]);
         // ...stored shifted in the buffer (local 5, 10).
         let o = ((10 * 32 + 5) * 4) as usize;
-        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
         // A far-moved layer still paints the page: the buffer slides
         // home (only invisible tails trim) instead of refusing the dab.
         doc.translate_layer(0, 1000, 0);
@@ -4950,14 +6624,14 @@ mod tests {
     fn merge_with_offsets_bakes_positions() {
         // dst blue at canvas 0; src red lives at buffer 0 but ox=1.
         let mut doc = Document::new(3, 1);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[0, 0, 255, 255]);
+        doc.layers[0].pixels.set4(0, [0, 0, 255, 255]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[1].pixels.set4(0, [255, 0, 0, 255]);
         doc.layers[1].ox = 1;
         assert!(doc.merge_down(1));
         // Red baked at canvas 1 (buffer 1), blue kept at canvas 0.
-        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 255, 255]);
-        assert_eq!(&doc.layers[0].pixels[4..8], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 255, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(4), [255, 0, 0, 255]);
         assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (0, 0));
     }
 
@@ -4976,7 +6650,7 @@ mod tests {
     fn mask_view_follows_offset() {
         let mut doc = Document::new(4, 1);
         doc.add_mask(0);
-        doc.layers[0].mask.as_mut().unwrap()[0] = 200;
+        doc.layers[0].mask.as_mut().unwrap().set(0, 200);
         // Unshifted: viewer shows the value at canvas 0.
         assert_eq!(&doc.mask_view().unwrap()[0..4], &[200, 200, 200, 255]);
         // Shifted right: canvas 0 reads concealed, canvas 1 shows it.
@@ -4984,6 +6658,50 @@ mod tests {
         let view = doc.mask_view().unwrap();
         assert_eq!(&view[0..4], &[0, 0, 0, 255]);
         assert_eq!(&view[4..8], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn mask_view_region_matches_the_sub_rect_of_mask_view() {
+        let mut doc = Document::new(300, 300);
+        doc.add_mask(0);
+        // Partially painted mask: every byte differs, some are zero.
+        let pattern: Vec<u8> = (0..300u32 * 300)
+            .map(|i| ((i * 7 + i / 300) % 256) as u8)
+            .collect();
+        doc.layers[0].mask.as_mut().unwrap().replace_dense(&pattern);
+        // Non-zero offset: the left 251 columns and the bottom 37 rows hold
+        // no layer content, so those region pixels must read concealed.
+        doc.layers[0].ox = 251;
+        doc.layers[0].oy = -37;
+        let full = doc.mask_view().unwrap();
+        for &(x0, y0, x1, y1) in &[
+            (0u32, 0u32, 63u32, 47u32), // fully outside the layer
+            (200, 0, 299, 60),          // straddles the left edge
+            (251, 250, 299, 299),       // straddles the bottom edge
+            (0, 0, 299, 299),           // the whole canvas
+        ] {
+            let region = doc.mask_view_region(x0, y0, x1, y1).unwrap();
+            let rw = (x1 - x0 + 1) as usize;
+            assert_eq!(region.len(), rw * (y1 - y0 + 1) as usize * 4);
+            for y in y0..=y1 {
+                let got = (y - y0) as usize * rw * 4;
+                let want = (y as usize * 300 + x0 as usize) * 4;
+                assert_eq!(
+                    &region[got..got + rw * 4],
+                    &full[want..want + rw * 4],
+                    "row {y} of ({x0}, {y0})-({x1}, {y1})"
+                );
+            }
+        }
+        assert!(
+            doc.mask_view_region(0, 0, 63, 47)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0, 0, 0, 255]),
+            "out-of-layer pixels read concealed"
+        );
     }
 
     #[test]
@@ -5008,9 +6726,7 @@ mod tests {
     #[test]
     fn affine_identity_keeps_pixels() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 100;
-        }
+        doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         doc.affine_layer(0, 1.0, 0.0);
         assert_eq!(doc.layers[0].pixels, before);
@@ -5018,6 +6734,7 @@ mod tests {
         doc.affine_layer(0, 2.0, 0.0);
         assert!(doc.layers[0]
             .pixels
+            .to_dense()
             .as_chunks::<4>()
             .0
             .iter()
@@ -5029,7 +6746,7 @@ mod tests {
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
         for y in 0..h {
             for x in 0..w {
-                if doc.layers[0].pixels[((y * w + x) * 4 + 3) as usize] != 0 {
+                if doc.layers[0].pixels.get(((y * w + x) * 4 + 3) as usize) != 0 {
                     x0 = x0.min(x);
                     y0 = y0.min(y);
                     x1 = x1.max(x);
@@ -5083,17 +6800,22 @@ mod tests {
         for y in 4..12u32 {
             for x in 4..12u32 {
                 let o = ((y * 16 + x) * 4) as usize;
-                doc.layers[0].pixels[o] = (x * 16 + y) as u8;
-                doc.layers[0].pixels[o + 1] = 200;
-                doc.layers[0].pixels[o + 2] = 100;
-                doc.layers[0].pixels[o + 3] = 255;
+                doc.layers[0].pixels.set(o, (x * 16 + y) as u8);
+                doc.layers[0].pixels.set(o + 1, 200);
+                doc.layers[0].pixels.set(o + 2, 100);
+                doc.layers[0].pixels.set(o + 3, 255);
             }
         }
         let before = doc.layers[0].pixels.clone();
-        let count: usize = before.chunks(4).filter(|p| p[3] != 0).count();
+        let count: usize = before.to_dense().chunks(4).filter(|p| p[3] != 0).count();
         doc.affine_layer(0, 1.0, 90.0);
         assert_eq!(
-            doc.layers[0].pixels.chunks(4).filter(|p| p[3] != 0).count(),
+            doc.layers[0]
+                .pixels
+                .to_dense()
+                .chunks(4)
+                .filter(|p| p[3] != 0)
+                .count(),
             count
         );
         // Four quarter-turns return every byte exactly.
@@ -5106,9 +6828,7 @@ mod tests {
     #[test]
     fn distort_identity_quad_is_noop() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 100;
-        }
+        doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         doc.distort_layer(0, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
         assert_eq!(doc.layers[0].pixels, before);
@@ -5120,13 +6840,13 @@ mod tests {
         // canvas center. Dest (0,0) now samples the empty center, and
         // the mask travels with the paint.
         let mut doc = Document::new(8, 8);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         let mut m = vec![0u8; 64];
         m[0] = 255;
-        doc.layers[0].mask = Some(m);
+        doc.layers[0].mask = Some(px_mask(&doc, &(m)));
         doc.distort_layer(0, [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[0, 0, 0, 0]);
-        assert_eq!(doc.layers[0].mask.as_ref().unwrap()[0], 0);
+        assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 0, 0]);
+        assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(0), 0);
         // Bad index is a silent no-op, never a panic.
         let before = doc.layers[0].pixels.clone();
         doc.distort_layer(9, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
@@ -5136,9 +6856,9 @@ mod tests {
     #[test]
     fn distort_degenerate_canvas_is_noop() {
         let mut doc = Document::new(1, 1);
-        doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.distort_layer(0, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     fn identity_lattice(w: f32, h: f32, cols: u32, rows: u32) -> Vec<(f32, f32)> {
@@ -5154,9 +6874,7 @@ mod tests {
     #[test]
     fn warp_identity_lattice_is_noop() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 100;
-        }
+        doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let grid = identity_lattice(8.0, 8.0, 2, 2);
         doc.warp_layer(0, 2, 2, &grid);
@@ -5169,18 +6887,22 @@ mod tests {
         // the origin. Dest (4,4) sits exactly on lattice point (1,1),
         // so it samples the painted texel; the mask travels with it.
         let mut doc = Document::new(8, 8);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         let mut m = vec![0u8; 64];
         m[0] = 255;
-        doc.layers[0].mask = Some(m);
+        doc.layers[0].mask = Some(px_mask(&doc, &(m)));
         let mut grid = identity_lattice(8.0, 8.0, 2, 2);
         // Row-major (row 1, col 1) of the 3-wide lattice.
         grid[4] = (0.0, 0.0);
         doc.warp_layer(0, 2, 2, &grid);
         let o = ((4 * 8 + 4) * 4) as usize;
-        assert_eq!(&doc.layers[0].pixels[o..o + 4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
         assert_eq!(
-            doc.layers[0].mask.as_ref().unwrap()[(4 * 8 + 4) as usize],
+            doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .get((4 * 8 + 4) as usize),
             255
         );
         // Bad grid (wrong point count) is a silent no-op.
@@ -5192,9 +6914,9 @@ mod tests {
     #[test]
     fn warp_degenerate_canvas_is_noop() {
         let mut doc = Document::new(1, 1);
-        doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         doc.warp_layer(0, 1, 1, &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(&doc.layers[0].pixels, &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     fn tri_pins(w: f32, h: f32, center: (f32, f32)) -> Vec<(f32, f32)> {
@@ -5212,9 +6934,7 @@ mod tests {
     #[test]
     fn tri_identity_pins_are_noop() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 100;
-        }
+        doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         doc.warp_layer_tris(0, &src, &src, &TRI_FAN);
@@ -5228,20 +6948,24 @@ mod tests {
         // samples the paint's original spot and the mask travels with it.
         let mut doc = Document::new(8, 8);
         let o = ((4 * 8 + 4) * 4) as usize;
-        doc.layers[0].pixels[o..o + 4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(o, [255, 0, 0, 255]);
         let mut m = vec![0u8; 64];
         m[(4 * 8 + 4) as usize] = 255;
-        doc.layers[0].mask = Some(m);
+        doc.layers[0].mask = Some(px_mask(&doc, &(m)));
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
         doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
         let d = ((2 * 8 + 2) * 4) as usize;
-        assert_eq!(&doc.layers[0].pixels[d..d + 4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(d), [255, 0, 0, 255]);
         assert_eq!(
-            doc.layers[0].mask.as_ref().unwrap()[(2 * 8 + 2) as usize],
+            doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .get((2 * 8 + 2) as usize),
             255
         );
-        assert_eq!(doc.layers[0].pixels[o + 3], 0);
+        assert_eq!(doc.layers[0].pixels.get(o + 3), 0);
     }
 
     #[test]
@@ -5250,19 +6974,17 @@ mod tests {
         // corner keeps sampling itself, so a center pull does not drag
         // the whole layer.
         let mut doc = Document::new(8, 8);
-        doc.layers[0].pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
         doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     #[test]
     fn tri_bad_input_is_noop() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 100;
-        }
+        doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         doc.warp_layer_tris(9, &src, &src, &TRI_FAN);
@@ -5270,18 +6992,22 @@ mod tests {
         doc.warp_layer_tris(0, &src, &src, &[[0, 1, 99]]);
         doc.warp_layer_tris(0, &src, &src, &[]);
         let mut flat = Document::new(1, 1);
-        flat.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        flat.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         flat.warp_layer_tris(0, &src, &src, &TRI_FAN);
         assert_eq!(doc.layers[0].pixels, before);
-        assert_eq!(&flat.layers[0].pixels, &[255, 0, 0, 255]);
+        assert_eq!(flat.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     #[test]
     fn content_bounds_covers_the_painted_pixels() {
         let mut doc = Document::new(8, 8);
         assert_eq!(doc.content_bounds(0), None);
-        doc.layers[0].pixels[((3 * 8 + 2) * 4 + 3) as usize] = 255;
-        doc.layers[0].pixels[((5 * 8 + 6) * 4 + 3) as usize] = 255;
+        doc.layers[0]
+            .pixels
+            .set(((3 * 8 + 2) * 4 + 3) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((5 * 8 + 6) * 4 + 3) as usize, 255);
         assert_eq!(doc.content_bounds(0), Some((2.0, 3.0, 6.0, 5.0)));
         assert_eq!(doc.content_bounds(9), None);
     }
@@ -5289,12 +7015,12 @@ mod tests {
     #[test]
     fn tone_brightness_contrast_and_alpha() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = vec![100, 100, 100, 200, 100, 100, 100, 200];
+        doc.layers[0].pixels = px_rgba(&doc, &[100, 100, 100, 200, 100, 100, 100, 200]);
         doc.adjust_tone(0, 10, 1.0);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[110, 110, 110, 200]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [110, 110, 110, 200]);
         // Zero contrast flattens to mid-gray; alpha still untouched.
         doc.adjust_tone(0, 0, 0.0);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[128, 128, 128, 200]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [128, 128, 128, 200]);
         // Identity is a no-op.
         let before = doc.layers[0].pixels.clone();
         doc.adjust_tone(0, 0, 1.0);
@@ -5304,18 +7030,19 @@ mod tests {
     #[test]
     fn blur_spreads_dot_keeps_flat() {
         let mut doc = Document::new(8, 8);
-        for b in doc.layers[0].pixels.iter_mut() {
-            *b = 77;
-        }
+        doc.layers[0].pixels.fill(77);
         let before = doc.layers[0].pixels.clone();
         doc.blur_layer(0, 3);
         assert_eq!(doc.layers[0].pixels, before);
         // Single opaque dot on transparency spreads out.
         let mut doc = Document::new(9, 9);
-        doc.layers[0].pixels[((4 * 9 + 4) * 4 + 3) as usize] = 255;
-        doc.layers[0].pixels[((4 * 9 + 4) * 4) as usize] = 255;
+        doc.layers[0]
+            .pixels
+            .set(((4 * 9 + 4) * 4 + 3) as usize, 255);
+        doc.layers[0].pixels.set(((4 * 9 + 4) * 4) as usize, 255);
         doc.blur_layer(0, 2);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 9 + x) * 4 + 3) as usize];
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 9 + x) * 4 + 3) as usize);
         assert!(at(&doc, 4, 4) < 255);
         assert!(at(&doc, 5, 4) > 0);
         assert_eq!(at(&doc, 0, 0), 0);
@@ -5329,14 +7056,14 @@ mod tests {
             for x in 0..8 {
                 let v = if x < 4 { 100u8 } else { 200u8 };
                 let o = ((y * 8 + x) * 4) as usize;
-                doc.layers[0].pixels[o] = v;
-                doc.layers[0].pixels[o + 1] = v;
-                doc.layers[0].pixels[o + 2] = v;
-                doc.layers[0].pixels[o + 3] = 255;
+                doc.layers[0].pixels.set(o, v);
+                doc.layers[0].pixels.set(o + 1, v);
+                doc.layers[0].pixels.set(o + 2, v);
+                doc.layers[0].pixels.set(o + 3, 255);
             }
         }
         doc.sharpen_layer(0, 1.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 8 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 8 + x) * 4) as usize);
         assert!(at(&doc, 3, 4) < 100, "dark edge pixel dips");
         assert!(
             at(&doc, 4, 4) > 200 || at(&doc, 4, 4) == 255,
@@ -5350,16 +7077,14 @@ mod tests {
     #[test]
     fn filters_respect_selection() {
         let mut doc = Document::new(6, 6);
-        for b in doc.layers[0].pixels.as_chunks_mut::<4>().0 {
-            b.copy_from_slice(&[255, 255, 255, 255]);
-        }
+        doc.layers[0].pixels.fill(255);
         doc.selection = Some((0, 0, 2, 2));
         doc.adjust_tone(0, -50, 1.0);
-        assert_eq!(doc.layers[0].pixels[0], 205);
+        assert_eq!(doc.layers[0].pixels.get(0), 205);
         let o = ((5 * 6 + 5) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[o], 255);
+        assert_eq!(doc.layers[0].pixels.get(o), 255);
         doc.blur_layer(0, 2);
-        assert_eq!(doc.layers[0].pixels[o], 255);
+        assert_eq!(doc.layers[0].pixels.get(o), 255);
         doc.clear_selection();
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
     }
@@ -5386,7 +7111,8 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 14.5, 10.5);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 21 + x) * 4 + 3) as usize];
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 21 + x) * 4 + 3) as usize);
         for (x, y) in [(14, 10), (10, 14), (6, 10), (10, 6)] {
             assert!(at(&doc, x, y) > 0, "missing dab at {x},{y}");
         }
@@ -5436,28 +7162,28 @@ mod tests {
     #[test]
     fn merge_down_composites_and_removes() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = vec![0, 0, 255, 255, 0, 0, 255, 255];
+        doc.layers[0].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 255, 255]);
         doc.add_layer("top".to_string());
-        doc.layers[1].pixels = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        doc.layers[1].pixels = px_rgba(&doc, &[255, 0, 0, 255, 0, 0, 0, 0]);
         assert!(doc.merge_down(1));
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.active, 0);
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
-        assert_eq!(&doc.layers[0].pixels[4..8], &[0, 0, 255, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(4), [0, 0, 255, 255]);
         // Bottom layer refuses.
         assert!(!doc.merge_down(0));
         // Invisible top contributes nothing but still merges away.
         doc.add_layer("ghost".to_string());
         doc.layers[1].visible = false;
-        doc.layers[1].pixels = vec![0, 255, 0, 255, 0, 255, 0, 255];
+        doc.layers[1].pixels = px_rgba(&doc, &[0, 255, 0, 255, 0, 255, 0, 255]);
         assert!(doc.merge_down(1));
-        assert_eq!(&doc.layers[0].pixels[0..4], &[255, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
     #[test]
     fn duplicate_copies_layer() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = vec![7; 8];
+        doc.layers[0].pixels = px_rgba(&doc, &[7; 8]);
         doc.duplicate_layer(0);
         assert_eq!(doc.layers.len(), 2);
         assert_eq!(doc.active, 1);
@@ -5470,7 +7196,7 @@ mod tests {
     #[test]
     fn sample_reads_composite() {
         let mut doc = Document::new(2, 1);
-        doc.layers[0].pixels = vec![10, 20, 30, 255, 0, 0, 0, 0];
+        doc.layers[0].pixels = px_rgba(&doc, &[10, 20, 30, 255, 0, 0, 0, 0]);
         assert_eq!(doc.sample(0, 0), Some([10, 20, 30]));
         assert_eq!(doc.sample(9, 9), None);
     }
@@ -5492,9 +7218,9 @@ mod tests {
         };
         doc.fill_rect(&brush, Color::rgb(9, 9, 9), 0, 0, 19, 19);
         let inside = ((2 * 20 + 2) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[inside + 3], 255);
+        assert_eq!(doc.layers[0].pixels.get(inside + 3), 255);
         let outside = ((15 * 20 + 15) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[outside + 3], 0);
+        assert_eq!(doc.layers[0].pixels.get(outside + 3), 0);
         // Degenerate loops clear.
         assert!(doc.set_lasso(&[]).is_none());
         assert!(doc.selection_mask.is_none());
@@ -5513,9 +7239,9 @@ mod tests {
         };
         doc.selection = Some((2, 2, 5, 5));
         doc.fill_rect(&brush, Color::rgb(1, 2, 3), 0, 0, 9, 9);
-        assert_eq!(doc.layers[0].pixels[0..4], vec![0, 0, 0, 0]);
+        assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 0, 0]);
         let o = ((3 * 10 + 3) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[o + 3], 255);
+        assert_eq!(doc.layers[0].pixels.get(o + 3), 255);
     }
 
     #[test]
@@ -5561,7 +7287,7 @@ mod tests {
             meta.len()
         );
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..8], b"PCRAFT11");
+        assert_eq!(&head[..8], b"PCRAFT12");
         let back = Document::open_project(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.layers[0].pixels, doc.layers[0].pixels);
@@ -5572,10 +7298,13 @@ mod tests {
         // Incompressible noise must survive the zlib round trip exactly.
         let mut doc = Document::new(32, 32);
         let mut x: u32 = 0x12345678;
-        for b in doc.layers[0].pixels.iter_mut() {
-            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-            *b = (x >> 24) as u8;
-        }
+        let bytes: Vec<u8> = (0..32 * 32 * 4)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect();
+        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
         let want = doc.layers[0].pixels.clone();
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-v4-noise.pcraft");
@@ -5605,10 +7334,10 @@ mod tests {
     #[test]
     fn m45_import_rejects_oversize_dimensions() {
         // M45: a phone panorama wider than the canvas cap must fail
-        // closed instead of adopting a 5000px layer (OOM guard).
+        // closed instead of adopting an oversize layer (OOM guard).
         let dir = std::env::temp_dir();
         let path = dir.join("procraft-m45-oversize.png");
-        let wide = 5000u32;
+        let wide = MAX_CANVAS_SIDE + 8;
         let tall = 100u32;
         let raw = vec![200u8; (wide * tall * 4) as usize];
         let mut out = Vec::new();
@@ -5860,7 +7589,8 @@ mod tests {
         };
         doc.checkpoint();
         assert!(doc.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 12 + x) * 4) as usize + 3];
+        let at =
+            |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 12 + x) * 4) as usize + 3);
         // Edge pixels painted, deep interior untouched.
         assert!(at(&doc, 2, 4) > 0);
         assert!(at(&doc, 7, 7) > 0);
@@ -5886,7 +7616,7 @@ mod tests {
         // Tone applies proportionally through the ramp.
         doc.checkpoint();
         doc.adjust_tone(0, 100, 1.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 20 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 20 + x) * 4) as usize);
         assert_eq!(at(&doc, 10, 10), 100);
         let edge = at(&doc, 10, 4);
         if ramp > 0 {
@@ -5906,7 +7636,7 @@ mod tests {
             ..Default::default()
         };
         doc2.dab(&brush, Color::rgb(255, 255, 255), 10.5, 4.5);
-        let a = doc2.layers[0].pixels[((4 * 20 + 10) * 4) as usize + 3];
+        let a = doc2.layers[0].pixels.get(((4 * 20 + 10) * 4) as usize + 3);
         let ramp2 = doc2.selection_mask.clone().unwrap()[(4 * 20 + 10) as usize];
         if ramp2 > 0 {
             assert!(a > 0 && a < 255, "{a} ramp {ramp2}");
@@ -6050,15 +7780,15 @@ mod tests {
         // Only pixel (0,0) selected: it crushes, the rest is untouched.
         doc.selection = Some((0, 0, 0, 0));
         doc.apply_lut(0, &lut);
-        assert_eq!(doc.layers[0].pixels[0], 0);
+        assert_eq!(doc.layers[0].pixels.get(0), 0);
         // Pixel (1,1) offset 20 in the 4x4 RGBA buffer.
         let o = 20usize;
-        assert_eq!(doc.layers[0].pixels[o], 100);
+        assert_eq!(doc.layers[0].pixels.get(o), 100);
         // Whole canvas: mid gray crushes to 0, alpha stays 255.
         doc.clear_selection();
         doc.apply_lut(0, &lut);
-        assert_eq!(doc.layers[0].pixels[o], 0);
-        assert_eq!(doc.layers[0].pixels[o + 3], 255);
+        assert_eq!(doc.layers[0].pixels.get(o), 0);
+        assert_eq!(doc.layers[0].pixels.get(o + 3), 255);
     }
 
     #[test]
@@ -6075,15 +7805,19 @@ mod tests {
         doc.dab(&brush, Color::rgb(128, 128, 128), 1.5, 1.5);
         doc.adjust_hsl(0, 180.0, 2.0, 0.0);
         let o = 20usize;
-        assert_eq!(doc.layers[0].pixels[o], doc.layers[0].pixels[o + 1]);
-        assert_eq!(doc.layers[0].pixels[o + 1], doc.layers[0].pixels[o + 2]);
+        assert_eq!(doc.layers[0].pixels.get(o), doc.layers[0].pixels.get(o + 1));
+        assert_eq!(
+            doc.layers[0].pixels.get(o + 1),
+            doc.layers[0].pixels.get(o + 2)
+        );
         doc.adjust_hsl(0, 0.0, 1.0, 1.0);
-        assert_eq!(doc.layers[0].pixels[o], 255);
+        assert_eq!(doc.layers[0].pixels.get(o), 255);
         // Pure red rotated +120 lands on green.
         let mut doc = Document::new(2, 2);
         doc.dab(&brush, Color::rgb(255, 0, 0), 0.5, 0.5);
         doc.adjust_hsl(0, 120.0, 1.0, 0.0);
-        let px = &doc.layers[0].pixels[0..3];
+        let dense = doc.layers[0].pixels.to_dense();
+        let px = &dense[0..3];
         assert!(px[1] > 200 && px[0] < 55 && px[2] < 55, "{px:?}");
     }
 
@@ -6099,8 +7833,8 @@ mod tests {
         };
         doc.dab(&brush, Color::rgb(100, 100, 100), 0.5, 0.5);
         doc.color_balance(0, 51, 0, 0);
-        assert_eq!(doc.layers[0].pixels[0], 151);
-        assert_eq!(doc.layers[0].pixels[1], 100);
+        assert_eq!(doc.layers[0].pixels.get(0), 151);
+        assert_eq!(doc.layers[0].pixels.get(1), 100);
         // No-op guards leave pixels alone.
         let before = doc.layers[0].pixels.clone();
         doc.color_balance(0, 0, 0, 0);
@@ -6110,15 +7844,16 @@ mod tests {
         let mut doc = Document::new(2, 2);
         doc.dab(&brush, Color::rgb(128, 128, 128), 0.5, 0.5);
         doc.colorize(0, [255, 0, 0], 1.0);
-        let px = &doc.layers[0].pixels[0..3];
+        let dense = doc.layers[0].pixels.to_dense();
+        let px = &dense[0..3];
         assert!(px[0] > 200 && px[1] < 80 && px[2] < 80, "{px:?}");
         // Selection gate: excluded pixels keep their color.
         let mut doc = Document::new(4, 4);
         doc.dab(&brush, Color::rgb(100, 100, 100), 1.5, 1.5);
         doc.selection = Some((0, 0, 0, 0));
         doc.color_balance(0, 51, 51, 51);
-        assert_eq!(doc.layers[0].pixels[0], 151);
-        assert_eq!(doc.layers[0].pixels[20], 100);
+        assert_eq!(doc.layers[0].pixels.get(0), 151);
+        assert_eq!(doc.layers[0].pixels.get(20), 100);
     }
 
     #[test]
@@ -6135,7 +7870,7 @@ mod tests {
         doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 11, 27);
         // Push right at the bar's edge: the bar's rim must advance.
         doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 1.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
         assert!(at(&doc, 14, 15) > 200, "rim advanced");
         assert_eq!(at(&doc, 24, 15), 0, "far field untouched");
         // Zero push and zero strength are no-ops.
@@ -6146,101 +7881,441 @@ mod tests {
     }
 
     #[test]
-    fn liquify_honors_selection() {
+    fn liquify_pushes_across_a_tile_seam() {
         use crate::brush::{Brush, Color};
+        // x = 256 is a tile seam; the push pulls red from the left tile
+        // into the right one, so the region read must cross the seam.
+        let mut doc = Document::new(520, 40);
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 0, 0, 255, 39);
+        doc.fill_rect(&brush, Color::rgb(0, 0, 255), 256, 0, 519, 39);
+        doc.liquify(0, 256.0, 20.0, 10.0, 0.0, 24.0, 1.0);
+        let at = |x: u32| doc.layers[0].pixels.get4(((20 * 520 + x) * 4) as usize);
+        assert_eq!(
+            at(257),
+            [255, 0, 0, 255],
+            "red is pulled across the seam from the left tile"
+        );
+        assert_eq!(at(400), [0, 0, 255, 255], "far field untouched");
+    }
+
+    #[test]
+    fn liquify_moves_only_pixels_inside_the_selection() {
+        let (w, h) = (64u32, 32u32);
+        let mut doc = Document::new(w, h);
+        // Ramp images so a moved pixel reads back as a different value.
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                bytes[o] = (x * 4) as u8;
+                bytes[o + 1] = (y * 8) as u8;
+                bytes[o + 3] = 255;
+            }
+        }
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let before = doc.layers[0].pixels.clone();
+        let at = |r: &Raster, x: u32, y: u32| r.get4(((y * w + x) * 4) as usize);
+        // The disc straddles the selection edge at x = 31: inside pixels
+        // warp, outside pixels must stay byte-identical.
+        doc.selection = Some((0, 0, 31, 31));
+        doc.liquify(0, 28.0, 16.0, 0.0, 6.0, 40.0, 1.0);
+        let moved = at(&doc.layers[0].pixels, 20, 16);
+        assert!(
+            (94..=96).contains(&(moved[1] as i32)),
+            "selected pixel sampled the row above: {moved:?}"
+        );
+        for (x, y) in [(36, 16), (40, 20), (63, 16)] {
+            assert_eq!(
+                at(&doc.layers[0].pixels, x, y),
+                at(&before, x, y),
+                "unselected ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn liquify_scales_the_push_by_mask_coverage() {
+        let (w, h) = (64u32, 32u32);
+        let mut doc = Document::new(w, h);
+        // A horizontal ramp in red and a vertical one in green, so a sampled
+        // position reads back as the position it came from.
+        let mut bytes = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                bytes[o] = (x * 4) as u8;
+                bytes[o + 1] = (y * 8) as u8;
+                bytes[o + 3] = 255;
+            }
+        }
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let mut mask = vec![255u8; (w * h) as usize];
+        mask[(16 * w + 28) as usize] = 64; // k = 64/255
+        mask[(16 * w + 30) as usize] = 0;
+        doc.selection_mask = Some(mask);
+        doc.liquify(0, 28.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+        let at = |x: u32, y: u32| doc.layers[0].pixels.get4(((y * w + x) * 4) as usize);
+        // A quarter-covered pixel moves a quarter of the way: it samples
+        // ~2 px back, where the ramp reads ~104.
+        let quarter = at(28, 16);
+        assert!(
+            (103..=105).contains(&(quarter[0] as i32)),
+            "quarter push sampled x~26: {quarter:?}"
+        );
+        assert_eq!(quarter[1], 128, "no vertical displacement");
+        assert_eq!(at(30, 16), [120, 128, 0, 255], "k = 0 keeps the pixel");
+    }
+
+    #[test]
+    fn liquify_matches_a_dense_field_reference() {
+        // Characterization: the tiled field and the region-bounded snapshot
+        // reads must reproduce a whole-canvas field warp bit-for-bit,
+        // including pushes whose reverse samples read far outside the
+        // rewritten disc (and clamp at the canvas edge).
+        fn field_warp(
+            src: &[u8],
+            w: u32,
+            h: u32,
+            pushes: &[(f32, f32, f32, f32, f32, f32)],
+        ) -> Vec<u8> {
+            let mut off = vec![[0.0f32; 2]; (w * h) as usize];
+            let mut touched = vec![false; (w * h) as usize];
+            let field_at = |off: &[[f32; 2]], x: f32, y: f32| -> [f32; 2] {
+                let x = x.clamp(0.0, w as f32 - 1.0);
+                let y = y.clamp(0.0, h as f32 - 1.0);
+                let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+                let at = |x: u32, y: u32| off[(y * w + x) as usize];
+                let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                [
+                    a[0] * (1.0 - fx) * (1.0 - fy)
+                        + b[0] * fx * (1.0 - fy)
+                        + c[0] * (1.0 - fx) * fy
+                        + d[0] * fx * fy,
+                    a[1] * (1.0 - fx) * (1.0 - fy)
+                        + b[1] * fx * (1.0 - fy)
+                        + c[1] * (1.0 - fx) * fy
+                        + d[1] * fx * fy,
+                ]
+            };
+            for &(x, y, dx, dy, size, strength) in pushes {
+                let before = off.clone();
+                let radius = size * 0.5;
+                let bx0 = ((x - radius).floor().max(0.0)) as u32;
+                let by0 = ((y - radius).floor().max(0.0)) as u32;
+                let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
+                let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
+                for py in by0..=by1 {
+                    for px in bx0..=bx1 {
+                        let dist = (((px as f32 + 0.5 - x).powi(2)
+                            + (py as f32 + 0.5 - y).powi(2))
+                        .sqrt()
+                            / radius)
+                            .min(1.0);
+                        let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
+                        let d = [-dx * strength * f, -dy * strength * f];
+                        let prev = field_at(&before, px as f32 + d[0], py as f32 + d[1]);
+                        let o = (py * w + px) as usize;
+                        off[o][0] = (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32);
+                        off[o][1] = (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32);
+                        touched[o] = true;
+                    }
+                }
+            }
+            // Premultiplied bilinear, unpremultiplied on write (the
+            // documented sampling rule; no selection, so k = 1).
+            let sample = |sx: f32, sy: f32| -> [u8; 4] {
+                let sx = sx.clamp(0.0, w as f32 - 1.0);
+                let sy = sy.clamp(0.0, h as f32 - 1.0);
+                let (cx0, cy0) = (sx.floor() as u32, sy.floor() as u32);
+                let (cx1, cy1) = ((cx0 + 1).min(w - 1), (cy0 + 1).min(h - 1));
+                let (fx, fy) = ((sx - cx0 as f32) as f64, (sy - cy0 as f32) as f64);
+                let at = |x: u32, y: u32| -> [u8; 4] {
+                    let o = ((y * w + x) * 4) as usize;
+                    [src[o], src[o + 1], src[o + 2], src[o + 3]]
+                };
+                let (mut pr, mut pg, mut pb, mut pa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for (x, y, weight) in [
+                    (cx0, cy0, (1.0 - fx) * (1.0 - fy)),
+                    (cx1, cy0, fx * (1.0 - fy)),
+                    (cx0, cy1, (1.0 - fx) * fy),
+                    (cx1, cy1, fx * fy),
+                ] {
+                    let [r, g, b, a] = at(x, y);
+                    let a = a as f64 * weight;
+                    pa += a;
+                    pr += r as f64 * a;
+                    pg += g as f64 * a;
+                    pb += b as f64 * a;
+                }
+                if pa <= 0.0 {
+                    return [0, 0, 0, 0];
+                }
+                [
+                    (pr / pa).round().clamp(0.0, 255.0) as u8,
+                    (pg / pa).round().clamp(0.0, 255.0) as u8,
+                    (pb / pa).round().clamp(0.0, 255.0) as u8,
+                    pa.round().clamp(0.0, 255.0) as u8,
+                ]
+            };
+            let mut out = src.to_vec();
+            for py in 0..h {
+                for px in 0..w {
+                    if !touched[(py * w + px) as usize] {
+                        continue;
+                    }
+                    let [ox, oy] = off[(py * w + px) as usize];
+                    let o = ((py * w + px) * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&sample(px as f32 + ox, py as f32 + oy));
+                }
+            }
+            out
+        }
+        // Deterministic pseudo-random paint so any region-copy slip shows.
+        let bytes: Vec<u8> = (0..32 * 32 * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        // Reach (|d| = 11.4) far beyond the disc: samples come from the
+        // ring outside the rewritten pixels, then a second push folds in.
         let mut doc = Document::new(32, 32);
+        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
+        doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
+        doc.liquify(0, 10.0, 20.0, -8.0, 5.0, 18.0, 0.6);
+        assert_eq!(
+            doc.layers[0].pixels,
+            field_warp(
+                &bytes,
+                32,
+                32,
+                &[
+                    (20.0, 12.0, 9.0, -7.0, 14.0, 1.0),
+                    (10.0, 20.0, -8.0, 5.0, 18.0, 0.6)
+                ]
+            )
+        );
+        // Corner warp: reads clamp against the canvas edge.
+        let mut doc = Document::new(32, 32);
+        doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
+        doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
+        assert_eq!(
+            doc.layers[0].pixels,
+            field_warp(&bytes, 32, 32, &[(2.0, 2.0, 5.0, 4.0, 14.0, 0.7)])
+        );
+    }
+
+    #[test]
+    fn repeated_pushes_carry_the_rim_without_smearing_it() {
+        use crate::brush::{Brush, Color};
         let brush = Brush {
             size: 30.0,
             softness: 0.0,
             opacity: 1.0,
             ..Default::default()
         };
-        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 27, 27);
-        // Selection far from the push keeps its pixels (warp still runs).
-        doc.selection = Some((24, 24, 31, 31));
-        let before = doc.layers[0].pixels.clone();
-        doc.liquify(0, 8.5, 8.5, 6.0, 0.0, 12.0, 1.0);
-        let o = ((25 * 32 + 25) * 4) as usize;
-        assert_eq!(doc.layers[0].pixels[o], before[o]);
+        let mut doc = Document::new(64, 32);
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 0, 0, 31, 31);
+        // Content is carried with the pointer: ten pushes from one spot keep
+        // pulling the rim outward instead of summing a force at fixed pixels.
+        for _ in 0..10 {
+            doc.liquify(0, 32.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+        }
+        let px = |x: u32| doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
+        let rim = (0..64u32).rev().find(|&x| px(x)[3] > 0).unwrap();
+        assert!(rim > 31, "the rim did not advance: {rim}");
+        // The moved rim stays one filter wide: it steps straight from opaque
+        // to clear between neighboring pixels instead of spreading over a
+        // ramp, and every inked pixel is still pure red.
+        let mut biggest = 0u8;
+        for x in 0..63u32 {
+            let [r, g, bl, a] = px(x);
+            biggest = biggest.max(a.abs_diff(px(x + 1)[3]));
+            if a > 0 {
+                assert_eq!([r, g, bl], [255, 0, 0], "x={x} alpha={a}");
+            }
+        }
+        assert_eq!(biggest, 255, "the rim smeared instead of stepping");
     }
 
     #[test]
-    fn liquify_matches_naive_reference_with_long_reach() {
-        // Characterization: the region-bounded copy must reproduce the
-        // original whole-buffer warp bit-for-bit, including long pushes
-        // whose reverse samples read far outside the disc (and off-canvas).
-        #[allow(clippy::too_many_arguments)]
-        fn naive_liquify(
-            src: &[u8],
-            w: u32,
-            h: u32,
-            x: f32,
-            y: f32,
-            dx: f32,
-            dy: f32,
-            size: f32,
-            strength: f32,
-        ) -> Vec<u8> {
-            let radius = size * 0.5;
-            let bx0 = ((x - radius).floor().max(0.0)) as u32;
-            let by0 = ((y - radius).floor().max(0.0)) as u32;
-            let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
-            let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
-            let sample = |sx: f32, sy: f32, ch: usize| -> f32 {
-                let sx = sx.clamp(0.0, w as f32 - 1.0);
-                let sy = sy.clamp(0.0, h as f32 - 1.0);
-                let (x0, y0) = (sx.floor() as u32, sy.floor() as u32);
-                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-                let at = |x: u32, y: u32| src[((y * w + x) as usize * 4) + ch] as f32;
-                at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-                    + at(x1, y0) * fx * (1.0 - fy)
-                    + at(x0, y1) * (1.0 - fx) * fy
-                    + at(x1, y1) * fx * fy
-            };
-            let mut pixels = src.to_vec();
-            for py in by0..=by1 {
-                for px in bx0..=bx1 {
-                    let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2))
-                        .sqrt()
-                        / radius)
-                        .min(1.0);
-                    let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
-                    let (ox, oy) = (px as f32 - dx * strength * f, py as f32 - dy * strength * f);
-                    if (ox - px as f32).abs() < f32::EPSILON
-                        && (oy - py as f32).abs() < f32::EPSILON
-                    {
-                        continue;
-                    }
-                    let o = ((py * w + px) * 4) as usize;
-                    for ch in 0..4 {
-                        // No selection: k = 1, write the sampled value.
-                        pixels[o + ch] = sample(ox, oy, ch).round() as u8;
-                    }
-                }
+    fn liquify_drag_carries_content_with_the_pointer() {
+        let (w, h) = (640u32, 360u32);
+        let mut doc = Document::new(w, h);
+        // A 6 px bar across the drag line at y = 180.
+        for y in 60..=300u32 {
+            for x in 312..=317u32 {
+                doc.layers[0]
+                    .pixels
+                    .set4(((y * w + x) * 4) as usize, [30, 144, 255, 255]);
             }
-            pixels
         }
-        let mut doc = Document::new(32, 32);
-        // Deterministic pseudo-random paint so any region-copy slip shows.
-        for (i, b) in doc.layers[0].pixels.iter_mut().enumerate() {
-            *b = ((i * 37 + 11) % 256) as u8;
+        // A 160 px drag at strength 0.5, fed as ~4 px pointer segments and
+        // starting 70 px short of the bar (it enters the disc's rim).
+        doc.liquify_begin(0);
+        let (x0, x1, y) = (242.0f32, 402.0f32, 180.0f32);
+        let n = 40u32;
+        let mut at = x0;
+        for i in 1..=n {
+            let to = x0 + (x1 - x0) * i as f32 / n as f32;
+            doc.liquify_segment(0, (at, y), (to, y), 128.0, 0.5);
+            at = to;
         }
-        // Reach (|d| = 11.4) far beyond the disc: samples come from the
-        // ring outside the write bbox.
-        let src = doc.layers[0].pixels.clone();
-        doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
-        assert_eq!(
-            doc.layers[0].pixels,
-            naive_liquify(&src, 32, 32, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0)
+        doc.liquify_end();
+        // The bar's centre (315.5) travels about half the drag: the offsets
+        // are carried with the paint instead of being summed at fixed pixels,
+        // which would stop pulling as soon as the disc's rim passed over.
+        let (mut mass, mut sum, mut max_a, mut inked) = (0.0f32, 0.0f32, 0u8, 0u32);
+        for x in 200..520u32 {
+            let p = doc.layers[0].pixels.get4(((180 * w + x) * 4) as usize);
+            if p[3] > 0 {
+                inked += 1;
+                mass += p[3] as f32;
+                sum += x as f32 * p[3] as f32;
+                max_a = max_a.max(p[3]);
+            }
+        }
+        let advance = sum / mass.max(1.0) - 315.5;
+        assert!(
+            (40.0..=60.0).contains(&advance),
+            "bar advanced {advance:.1} px (want ~50)"
         );
-        // Corner warp: reads clamp against the canvas edge.
-        let src = doc.layers[0].pixels.clone();
-        doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
-        assert_eq!(
-            doc.layers[0].pixels,
-            naive_liquify(&src, 32, 32, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7)
-        );
+        // One resample of the snapshot: the bar keeps its width, its solid
+        // interior, and a rim no wider than the filter.
+        assert_eq!(max_a, 255, "the bar was softened");
+        assert!(inked <= 8, "the bar smeared over {inked} px");
+    }
+
+    #[test]
+    fn liquify_keeps_edge_color_at_partial_alpha() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(64, 32);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 0, 0), 10, 4, 30, 27);
+        // A half-strength push stretches the bar's rim into fractional
+        // alpha. Straight-alpha filtering would drag transparent black into
+        // it (and the rim turns [227, 0, 0]); premultiplied keeps [255, 0, 0].
+        doc.liquify(0, 30.5, 16.0, 6.0, 0.0, 40.0, 0.5);
+        let mut partial = 0;
+        for x in 0..64u32 {
+            let [r, g, b, a] = doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
+            if a > 0 && a < 255 {
+                partial += 1;
+                assert_eq!([r, g, b], [255, 0, 0], "x={x} alpha={a}");
+            }
+        }
+        assert!(partial > 0, "the push must leave a soft rim");
+    }
+
+    #[test]
+    fn liquify_starts_a_new_snapshot_after_a_paint() {
+        use crate::brush::{Brush, Color};
+        let (w, h) = (32u32, 32u32);
+        let mut doc = Document::new(w, h);
+        let bytes: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+        // Paint over everything: the open stroke's snapshot is now stale,
+        // and the next push must warp the new pixels, not resurrect the old.
+        let brush = Brush {
+            size: 40.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, w - 1, h - 1);
+        for _ in 0..4 {
+            doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+        }
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    doc.layers[0].pixels.get4(((y * w + x) * 4) as usize),
+                    [255, 255, 255, 255],
+                    "({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn liquify_steps_cover_the_whole_pointer_segment() {
+        // Within the cap: one push, ending exactly at the pointer.
+        let steps = liquify_steps((0.0, 0.0), (3.0, 4.0), 10.0);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0], ((3.0, 4.0), (3.0, 4.0)));
+        // A fast move is split so every push stays under the cap, the
+        // pushes chain end-to-end, and the last anchor is the pointer —
+        // nothing is left over for the release to drop.
+        let steps = liquify_steps((0.0, 0.0), (120.0, 160.0), 10.0);
+        assert_eq!(steps.len(), 20);
+        let (mut at, mut sum) = ((0.0, 0.0), (0.0, 0.0));
+        for ((x, y), (dx, dy)) in &steps {
+            assert!(dx.hypot(*dy) <= 10.0 + 1e-4, "step {dx},{dy}");
+            assert!(
+                (at.0 + dx - x).abs() < 1e-4 && (at.1 + dy - y).abs() < 1e-4,
+                "gap before {x},{y}"
+            );
+            at = (*x, *y);
+            sum = (sum.0 + dx, sum.1 + dy);
+        }
+        assert_eq!(at, (120.0, 160.0));
+        assert!((sum.0 - 120.0).abs() < 1e-3 && (sum.1 - 160.0).abs() < 1e-3);
+        // A pathological one-frame jump stays bounded, and an idle hand has
+        // nothing to push.
+        assert_eq!(liquify_steps((0.0, 0.0), (10_000.0, 0.0), 10.0).len(), 64);
+        assert!(liquify_steps((7.0, 8.0), (7.0, 8.0), 5.0).is_empty());
+    }
+
+    #[test]
+    fn liquify_segment_matches_manual_stepping() {
+        let (w, h) = (96u32, 32u32);
+        let mut doc = Document::new(w, h);
+        let bytes: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
+        let mut manual = doc.clone();
+        let (from, to, size, strength) = ((6.0, 10.0), (84.0, 24.0), 24.0, 0.8);
+        doc.liquify_segment(0, from, to, size, strength);
+        for ((x, y), (dx, dy)) in liquify_steps(from, to, (size * 0.125).max(2.0)) {
+            manual.liquify(0, x, y, dx, dy, size, strength);
+        }
+        assert_eq!(doc.layers[0].pixels, manual.layers[0].pixels);
+    }
+
+    #[test]
+    fn liquify_segment_matches_manual_stepping_with_symmetry() {
+        // A segment renders its swept path once, per mirror; stepping push
+        // by push renders every disc. The pixels must come out identical.
+        use crate::brush::{Brush, Color};
+        let (w, h) = (96u32, 64u32);
+        let mut doc = Document::new(w, h);
+        let brush = Brush {
+            size: 30.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        doc.fill_rect(&brush, Color::rgb(255, 255, 255), 10, 10, 40, 50);
+        doc.symmetry = SymmetryMode::Horizontal;
+        let mut manual = doc.clone();
+        let (from, to, size, strength) = ((20.0, 18.0), (44.0, 40.0), 20.0, 0.8);
+        doc.liquify_segment(0, from, to, size, strength);
+        for ((x, y), (dx, dy)) in liquify_steps(from, to, (size * 0.125).max(2.0)) {
+            manual.liquify(0, x, y, dx, dy, size, strength);
+        }
+        assert_eq!(doc.layers[0].pixels, manual.layers[0].pixels);
     }
 
     #[test]
@@ -6260,7 +8335,7 @@ mod tests {
         // Push right at the left bar's rim: the mirrored push runs left
         // at the mirrored point with a mirrored direction.
         doc.liquify(0, 7.5, 15.5, 6.0, 0.0, 16.0, 1.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
         assert!(at(&doc, 10, 15) > 200, "primary rim advanced");
         assert!(at(&doc, 21, 15) > 200, "mirrored rim advanced");
         assert_eq!(at(&doc, 15, 15), 0, "between the discs untouched");
@@ -6285,7 +8360,7 @@ mod tests {
         // Push up at the east bar's middle: k=1 mirrors the point 90
         // degrees CCW (south) and rotates the push vector to point west.
         doc.liquify(0, 23.0, 16.0, 0.0, -6.0, 16.0, 1.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
         assert!(at(&doc, 23, 13) > 200, "primary push advanced the east rim");
         assert!(at(&doc, 12, 23) > 200, "k=1 push pulled the south bar west");
     }
@@ -6315,8 +8390,10 @@ mod tests {
     fn absorb_keeps_content_on_screen() {
         let mut doc = Document::new(32, 32);
         // Paint a marker, move the layer, absorb where the marker shows.
-        doc.layers[0].pixels[((4 * 32 + 4) * 4) as usize] = 255;
-        doc.layers[0].pixels[((4 * 32 + 4) * 4 + 3) as usize] = 255;
+        doc.layers[0].pixels.set(((4 * 32 + 4) * 4) as usize, 255);
+        doc.layers[0]
+            .pixels
+            .set(((4 * 32 + 4) * 4 + 3) as usize, 255);
         doc.translate_layer(0, 10, 0);
         // Canvas (0,4) maps outside the buffer: slide home, marker rides
         // along and still shows at canvas (14,4).
@@ -6341,7 +8418,7 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 255, 255), 2.0, 16.0);
-        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels[((y * 32 + x) * 4) as usize];
+        let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
         // Composite shows the dab where the user put it.
         let flat = doc.flatten();
         assert!(flat[((16 * 32 + 2) * 4) as usize] > 200);
@@ -6465,7 +8542,7 @@ mod tests {
                         continue;
                     }
                     let o = ((by as u32 * d.w + bx as u32) * 4) as usize;
-                    out.extend_from_slice(&l.pixels[o..o + 4]);
+                    out.extend_from_slice(&l.pixels.get4(o));
                 }
             }
             out
@@ -6484,5 +8561,115 @@ mod tests {
         // One hit, at the new location; the old one is gone.
         assert_eq!(doc.text_layer_at(51.0, 31.0), Some(idx));
         assert_eq!(doc.text_layer_at(40.0, 20.0), None);
+    }
+
+    #[test]
+    fn blank_layers_allocate_no_tiles() {
+        let mut doc = Document::new(2048, 2048);
+        for i in 0..100 {
+            doc.add_layer(format!("L{i}"));
+        }
+        assert_eq!(doc.layers.len(), 101);
+        assert_eq!(doc.layer_alloc_bytes(), 0);
+    }
+
+    #[test]
+    fn undo_checkpoint_costs_touched_tiles_only() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(600, 600); // 3x3 tiles
+        let brush = Brush::default();
+        doc.dab(&brush, Color([255, 0, 0, 255]), 10.0, 10.0);
+        doc.checkpoint();
+        doc.dab(&brush, Color([0, 0, 255, 255]), 550.0, 550.0);
+        assert!(
+            doc.undo_bytes <= 2 * 256 * 1024,
+            "one checkpoint of a two-tile layer: {} bytes",
+            doc.undo_bytes
+        );
+        assert!(doc.undo());
+        assert_eq!(
+            doc.layers[0].pixels.get4(((550 * 600 + 550) * 4) as usize),
+            [0; 4]
+        );
+        assert_eq!(
+            doc.layers[0].pixels.get(((10 * 600 + 10) * 4 + 3) as usize),
+            255
+        );
+    }
+
+    #[test]
+    fn duplicate_layer_shares_tiles_until_painted() {
+        use crate::brush::{Brush, Color};
+        let mut doc = Document::new(600, 600);
+        doc.dab(&Brush::default(), Color([0, 255, 0, 255]), 12.0, 12.0);
+        doc.duplicate_layer(0);
+        // Per-layer accounting counts the shared slot twice; the process holds
+        // one tile because the Arc is shared.
+        assert_eq!(doc.layer_alloc_bytes(), 2 * 256 * 1024);
+        doc.active = 1;
+        doc.dab(&Brush::default(), Color([1, 2, 3, 255]), 300.0, 300.0);
+        assert_eq!(doc.layer_alloc_bytes(), 3 * 256 * 1024);
+    }
+
+    #[test]
+    fn fallible_export_buffers_match_the_infallible_paths() {
+        let mut doc = Document::new(5, 4);
+        doc.layers[0].pixels.set(3, 200);
+        assert_eq!(doc.try_flatten().unwrap(), doc.flatten());
+        let (baked, mask) = doc.baked_layer(0).unwrap().unwrap();
+        assert_eq!(baked.len(), 5 * 4 * 4);
+        assert_eq!(mask, None);
+        // A missing layer is Ok(None) (skip it), not an error (OOM).
+        assert!(doc.baked_layer(99).unwrap().is_none());
+    }
+
+    /// The outline stroke paints dense row spans now; every mask-boundary
+    /// pixel (and nothing else) must carry ink, through the layer offset.
+    #[test]
+    fn selection_outline_paints_the_mask_boundary() {
+        use crate::brush::{Brush, Color};
+        let (w, h) = (300u32, 200u32);
+        let brush = Brush {
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut doc = Document::new(w, h);
+        let mut mask = vec![0u8; (w * h) as usize];
+        for y in 40..160u32 {
+            for x in 60..240u32 {
+                if (x as i32 - 150).abs() + (y as i32 - 100).abs() <= 60 {
+                    mask[(y * w + x) as usize] = 255;
+                }
+            }
+        }
+        doc.selection_mask = Some(mask.clone());
+        doc.translate_layer(0, 5, -3);
+        assert!(doc.stroke_selection(&brush, Color::rgb(10, 200, 20), 1));
+
+        let inside = |x: i64, y: i64| {
+            x >= 0
+                && y >= 0
+                && x < w as i64
+                && y < h as i64
+                && mask[(y as usize) * w as usize + x as usize] > 127
+        };
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let edge = inside(x, y)
+                    && !(inside(x - 1, y)
+                        && inside(x + 1, y)
+                        && inside(x, y - 1)
+                        && inside(x, y + 1));
+                // Canvas (x, y) stores at buffer (x - 5, y + 3).
+                let (lx, ly) = (x - 5, y + 3);
+                let a = if lx < 0 || ly < 0 || lx >= w as i64 || ly >= h as i64 {
+                    0
+                } else {
+                    let o = ((ly as usize * w as usize) + lx as usize) * 4;
+                    doc.layers[0].pixels.get(o + 3)
+                };
+                assert_eq!(a == 255, edge, "({x},{y})");
+            }
+        }
     }
 }
