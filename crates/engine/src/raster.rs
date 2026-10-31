@@ -15,6 +15,17 @@ pub const TILE: u32 = 256;
 /// `debug_assert` past it so misuse fails legibly in debug builds.
 const MAX_SIDE: u32 = 16384;
 
+/// Zero-filled buffer of `len` bytes, allocated fallibly: `vec![0; len]`
+/// aborts the process on OOM, which is the wrong answer for a big export
+/// on a tablet where the app can still show an error.
+pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|e| format!("out of memory for {len} bytes: {e}"))?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
 #[derive(Clone)]
 pub struct Raster {
     w: u32,
@@ -253,6 +264,20 @@ impl Raster {
 
     pub fn to_dense(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.len()];
+        self.fill_dense(&mut out);
+        out
+    }
+
+    /// [`Self::to_dense`] with a fallible allocation: one 8K RGBA layer is
+    /// ~132 MB, so an export that cannot get the buffer reports an error
+    /// instead of aborting.
+    pub fn try_to_dense(&self) -> Result<Vec<u8>, String> {
+        let mut out = try_zeroed(self.len())?;
+        self.fill_dense(&mut out);
+        Ok(out)
+    }
+
+    fn fill_dense(&self, out: &mut [u8]) {
         let step = self.bpp();
         let w = self.w as usize;
         for (tx, ty, tile) in self.allocated_tiles() {
@@ -269,7 +294,6 @@ impl Raster {
                 out[dst..dst + n].copy_from_slice(&tile[src..src + n]);
             }
         }
-        out
     }
 
     /// Replace every tile from a dense buffer sized for this geometry.
@@ -508,6 +532,13 @@ mod tests {
     }
 
     #[test]
+    fn try_zeroed_reports_impossible_sizes_instead_of_aborting() {
+        assert_eq!(try_zeroed(3).unwrap(), vec![0u8; 3]);
+        // A request no allocator can satisfy must be an Err, not an abort.
+        assert!(try_zeroed(usize::MAX).is_err());
+    }
+
+    #[test]
     fn blank_raster_costs_nothing() {
         let mut r = Raster::rgba(8192, 8192);
         assert_eq!(r.alloc_bytes(), 0);
@@ -577,7 +608,11 @@ mod tests {
         for x in 0..w {
             assert_eq!(dst.get4(at(x, 1)), [x as u8, 1, 2, 3], "x={x}");
         }
-        assert_eq!(dst.get4(at(0, 0)), [0; 4], "the source row itself is untouched");
+        assert_eq!(
+            dst.get4(at(0, 0)),
+            [0; 4],
+            "the source row itself is untouched"
+        );
 
         // A blank source neither writes nor allocates.
         let empty = Raster::rgba(w, h);

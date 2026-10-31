@@ -30,7 +30,9 @@ impl BrushTip {
         if w == 0 || h == 0 || w > MAX_TIP_SIDE || h > MAX_TIP_SIDE {
             return Err("brush tip has bad dimensions".to_string());
         }
-        if mask.len() != (w * h) as usize {
+        // `MAX_TIP_SIDE` already bounds the product; the checked form
+        // keeps a malformed tip an error rather than a wrapped length.
+        if (w as usize).checked_mul(h as usize) != Some(mask.len()) {
             return Err("brush tip has corrupt pixels".to_string());
         }
         if mask.iter().all(|&b| b == 0) {
@@ -2855,6 +2857,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tip_mask_rejects_bad_dimensions_and_lengths() {
+        assert!(BrushTip::from_mask(0, 4, vec![]).is_err());
+        assert!(BrushTip::from_mask(4, 0, vec![]).is_err());
+        assert!(BrushTip::from_mask(MAX_TIP_SIDE + 1, 1, vec![255]).is_err());
+        // Short and oversized masks both fail the checked product.
+        assert!(BrushTip::from_mask(2, 2, vec![255; 3]).is_err());
+        assert!(BrushTip::from_mask(2, 2, vec![255; 5]).is_err());
+        // A fully transparent tip is still rejected after the length check.
+        assert!(BrushTip::from_mask(2, 2, vec![0; 4]).is_err());
+        assert!(BrushTip::from_mask(2, 2, vec![255; 4]).is_ok());
+    }
+
+    #[test]
     fn flood_fill_stays_inside_barrier() {
         let mut doc = Document::new(10, 10);
         let brush = Brush {
@@ -5165,7 +5180,10 @@ mod tests {
         let sum = |y: u32| -> u32 { (20..180).map(|x| alpha_at(&doc, x, y) as u32).sum() };
         let core_y = (0..doc.h).max_by_key(|&y| sum(y)).unwrap();
         let row: Vec<u8> = (20..180).map(|x| alpha_at(&doc, x, core_y)).collect();
-        assert!(row.iter().all(|&a| a >= 100), "chalk 6 px core breaks: {row:?}");
+        assert!(
+            row.iter().all(|&a| a >= 100),
+            "chalk 6 px core breaks: {row:?}"
+        );
         let steps = row.windows(2).filter(|p| p[0].abs_diff(p[1]) >= 40).count();
         assert!(
             steps >= 25,
@@ -5176,14 +5194,15 @@ mod tests {
     #[test]
     fn airbrush_preset_is_a_smooth_even_haze() {
         let doc = paint_straight("Airbrush", 260, 120);
-        let row = |y: u32| -> Vec<i32> {
-            (40..220).map(|x| alpha_at(&doc, x, y) as i32).collect()
-        };
+        let row = |y: u32| -> Vec<i32> { (40..220).map(|x| alpha_at(&doc, x, y) as i32).collect() };
         let center = row(60);
         let (min, max) = (*center.iter().min().unwrap(), *center.iter().max().unwrap());
         assert!(max - min <= 6, "airbrush speckles {min}..{max}");
         assert!((60..=100).contains(&max), "airbrush core alpha {max}");
         let off = *row(75).iter().max().unwrap();
-        assert!(off < max, "airbrush has no falloff: {max} on axis, {off} off");
+        assert!(
+            off < max,
+            "airbrush has no falloff: {max} on axis, {off} off"
+        );
     }
 }

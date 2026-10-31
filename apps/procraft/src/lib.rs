@@ -27,6 +27,7 @@ use procraft_engine::{
 use rfd_shim as rfd;
 
 mod canvas;
+mod crash;
 mod design;
 mod settings;
 
@@ -518,6 +519,23 @@ fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathB
         path.set_extension(ext);
     }
     path
+}
+
+/// Mobile save dialogs never cancel: `None` means the sandbox path could
+/// not be resolved (storage unmounted, no external files dir), so the tap
+/// must explain itself. Desktop `None` is a plain dialog cancel and stays
+/// quiet.
+fn note_save_declined(status: &mut String, what: &str) {
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        if let Some(reason) = rfd::last_error() {
+            *status = format!("{what} save failed: {reason}");
+        }
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = (status, what);
+    }
 }
 
 /// M33 Gallery: how many recent projects to remember (newest first).
@@ -2665,8 +2683,10 @@ impl ProCraftApp {
             let mut doc = Document::new(pw, ph);
             let brush = preview_brush(&preset, ph as f32);
             paint_preview_stroke(&mut doc, &brush, ink);
-            let img =
-                ColorImage::from_rgba_unmultiplied([pw as usize, ph as usize], &doc.layers[0].pixels.to_dense());
+            let img = ColorImage::from_rgba_unmultiplied(
+                [pw as usize, ph as usize],
+                &doc.layers[0].pixels.to_dense(),
+            );
             self.preset_textures.push(ctx.load_texture(
                 format!("brush-{idx}"),
                 img,
@@ -2720,7 +2740,11 @@ const PREVIEW_SIZE_FRAC: f32 = 0.45;
 /// Texture size for the preview strip: one texel per device pixel, so the
 /// thumbnail is copied to the screen 1:1 instead of being resampled.
 fn preview_size(scale: f32) -> (u32, u32) {
-    let s = if scale.is_finite() { scale.max(1.0) } else { 1.0 };
+    let s = if scale.is_finite() {
+        scale.max(1.0)
+    } else {
+        1.0
+    };
     (
         (PREVIEW_W * s).round().max(1.0) as u32,
         (PREVIEW_H * s).round().max(1.0) as u32,
@@ -3515,6 +3539,8 @@ impl ProCraftApp {
                                     }
                                     Err(e) => self.status = format!("Brush save failed: {e}"),
                                 }
+                            } else {
+                                note_save_declined(&mut self.status, "Brush set");
                             }
                         }
                         if ui.button("Tip PNG").clicked() {
@@ -3536,6 +3562,8 @@ impl ProCraftApp {
                                     }
                                     Err(e) => self.status = format!("Tip save failed: {e}"),
                                 }
+                            } else {
+                                note_save_declined(&mut self.status, "Brush tip");
                             }
                         }
                     });
@@ -3761,6 +3789,8 @@ impl ProCraftApp {
                                 }
                                 Err(e) => self.status = format!("Palette save failed: {e}"),
                             }
+                        } else {
+                            note_save_declined(&mut self.status, "Palette");
                         }
                     }
                 });
@@ -5370,6 +5400,8 @@ impl ProCraftApp {
                             }
                             Err(e) => self.status = format!("Save failed: {e}"),
                         }
+                    } else {
+                        note_save_declined(&mut self.status, "PNG");
                     }
                 }
                 stepped_slider(ui, &mut self.jpeg_quality, 1..=100, 1.0, "JPEG q");
@@ -5394,6 +5426,8 @@ impl ProCraftApp {
                             }
                             Err(e) => self.status = format!("Save failed: {e}"),
                         }
+                    } else {
+                        note_save_declined(&mut self.status, "JPEG");
                     }
                 }
                 if ui.button("Save TIFF").clicked() {
@@ -5413,6 +5447,8 @@ impl ProCraftApp {
                             }
                             Err(e) => self.status = format!("Save failed: {e}"),
                         }
+                    } else {
+                        note_save_declined(&mut self.status, "TIFF");
                     }
                 }
                 if ui.button("Open image").clicked() {
@@ -5475,6 +5511,8 @@ impl ProCraftApp {
                             }
                             Err(e) => self.status = format!("Project save failed: {e}"),
                         }
+                    } else {
+                        note_save_declined(&mut self.status, "Project");
                     }
                 }
                 if ui.button("Open project").clicked() {
@@ -5526,6 +5564,8 @@ impl ProCraftApp {
                             }
                             Err(e) => self.status = format!("PSD save failed: {e}"),
                         }
+                    } else {
+                        note_save_declined(&mut self.status, "PSD");
                     }
                 }
                 if ui.button("Open PSD").clicked() {
@@ -6859,6 +6899,8 @@ impl ProCraftApp {
                 },
                 Err(e) => self.status = format!("Time-lapse export failed: {e}"),
             }
+        } else {
+            note_save_declined(&mut self.status, "Time-lapse");
         }
     }
 
@@ -6902,6 +6944,8 @@ impl ProCraftApp {
                 },
                 Err(e) => self.status = format!("GIF export failed: {e}"),
             }
+        } else {
+            note_save_declined(&mut self.status, "GIF");
         }
     }
 
@@ -9862,11 +9906,10 @@ fn taper_step_with(
             job.brush.size,
         );
         let mut to_dyn = segment.to_dyn;
-        to_dyn.taper = job.brush.taper.distance_factor(
-            to_dist,
-            stroke.total_len - to_dist,
-            job.brush.size,
-        );
+        to_dyn.taper =
+            job.brush
+                .taper
+                .distance_factor(to_dist, stroke.total_len - to_dist, job.brush.size);
         let (_, lo) = doc.stroke_to_dyn(
             &job.brush,
             job.color,
@@ -10330,7 +10373,8 @@ impl eframe::App for ProCraftApp {
                     Ok(Err(e)) => self.status = format!("Autosave failed: {e}"),
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.autosave_job = Some(job);
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(200));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
                 }
@@ -11423,8 +11467,7 @@ impl eframe::App for ProCraftApp {
                 // below on the drawn page. Allocating it here with input
                 // sense left the sensor on the un-centred slot, so the
                 // page's right/bottom strips could not start a stroke.
-                let (slot, _) =
-                    ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::hover());
+                let (slot, _) = ui.allocate_exact_size(Vec2::new(w * z, h * z), Sense::hover());
                 // A page that fits floats centred on the board; a zoomed-in
                 // page keeps the viewport origin so panning still works.
                 // Pan applies to the drawn canvas and every overlay/mapping
@@ -11433,19 +11476,13 @@ impl eframe::App for ProCraftApp {
                 // one makes the GPU resample every edge on the page.
                 let rect = canvas_page_rect(slot, avail, self.view_offset);
                 let rect = egui::Rect::from_min_size(
-                    snap_canvas_origin(
-                        rect.min,
-                        z,
-                        ui.ctx().pixels_per_point(),
-                        self.view_angle,
-                    ),
+                    snap_canvas_origin(rect.min, z, ui.ctx().pixels_per_point(), self.view_angle),
                     rect.size(),
                 );
                 // Presses and drags must start on the drawn page: centring
                 // and pan move the artwork after layout, and the scroll
                 // area clips the sensor to the visible part.
-                let resp =
-                    ui.interact(rect, ui.id().with("canvas-page"), Sense::click_and_drag());
+                let resp = ui.interact(rect, ui.id().with("canvas-page"), Sense::click_and_drag());
                 // Rotation about the view center: canvas (x, y) maps through
                 // the unrotated rect, then spins into place.
                 let ang = self.view_angle;
@@ -13383,8 +13420,13 @@ impl eframe::App for ProCraftApp {
                         // opens its own coverage peak.
                         self.doc.end_stroke();
                         if self.stroke_painted {
-                            self.taper_job =
-                                taper_begin(&mut self.doc, &brush, color, &self.stroke_record, rect);
+                            self.taper_job = taper_begin(
+                                &mut self.doc,
+                                &brush,
+                                color,
+                                &self.stroke_record,
+                                rect,
+                            );
                         }
                         // A replay owns the record until it finishes (a long
                         // 8K stroke would otherwise freeze the lift frame).
@@ -13459,11 +13501,17 @@ fn build_options() -> eframe::NativeOptions {
 }
 
 fn run_with(options: eframe::NativeOptions) {
-    let _ = eframe::run_native(
+    // Before eframe: a cold-start panic must leave a trail (logcat on
+    // Android, crash_report.log on every platform).
+    crash::install();
+    let started = eframe::run_native(
         "ProCraft",
         options,
         Box::new(|cc| Ok(Box::new(ProCraftApp::new(cc)))),
     );
+    if let Err(e) = started {
+        crash::record(&format!("eframe::run_native failed: {e}"));
+    }
 }
 
 /// Desktop/iOS entry (the `[[bin]]` wrapper calls this).
@@ -13488,6 +13536,17 @@ fn android_main(app: android_activity::AndroidApp) {
 mod tests {
     use super::*;
     use procraft_engine::Taper;
+
+    #[test]
+    fn desktop_save_cancel_leaves_the_status_alone() {
+        // Desktop rfd returns None only when the user cancelled the panel;
+        // that must not be reported as a failure.
+        let mut status = "before".to_string();
+        note_save_declined(&mut status, "PNG");
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        assert_eq!(status, "before");
+        let _ = status;
+    }
 
     /// Drive a taper replay to completion the way the frame loop does.
     fn taper_replay_all(
@@ -15458,7 +15517,10 @@ mod tests {
                 TaperStep::Cancelled => panic!("replay cancelled without an edit"),
             }
         }
-        assert!(calls > 1, "zero budget stamped the whole replay in one call");
+        assert!(
+            calls > 1,
+            "zero budget stamped the whole replay in one call"
+        );
         assert_eq!(whole.layers[0].pixels, sliced.layers[0].pixels);
     }
 
@@ -15691,11 +15753,8 @@ mod tests {
                 );
                 let mut doc = Document::new(w, h);
                 paint_preview_stroke(&mut doc, &brush, Color::rgb(30, 30, 30));
-                let alpha = |x: u32, y: u32| {
-                    doc.layers[0]
-                        .pixels
-                        .get(((y * w + x) * 4 + 3) as usize)
-                };
+                let alpha =
+                    |x: u32, y: u32| doc.layers[0].pixels.get(((y * w + x) * 4 + 3) as usize);
                 assert!(
                     (0..h).any(|y| (0..w).any(|x| alpha(x, y) > 0)),
                     "{name} preview is blank"

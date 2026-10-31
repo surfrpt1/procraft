@@ -365,6 +365,9 @@ impl SymmetryMode {
     }
 }
 
+/// One baked layer: canvas-sized RGBA bytes plus an optional reveal mask.
+pub type BakedLayer = (Vec<u8>, Option<Vec<u8>>);
+
 /// One raster layer: row-major RGBA bytes plus presentation state.
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -596,9 +599,10 @@ impl LiquifyField {
     /// Write one pixel's offset.
     fn set(&mut self, x: u32, y: u32, v: [f32; 2]) {
         let key = (y / TILE) * self.tiles_x + x / TILE;
-        let tile = self.tiles.entry(key).or_insert_with(|| {
-            std::sync::Arc::new(vec![0.0f32; (TILE * TILE * 2) as usize])
-        });
+        let tile = self
+            .tiles
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(vec![0.0f32; (TILE * TILE * 2) as usize]));
         let t = std::sync::Arc::make_mut(tile);
         let o = (((y % TILE) * TILE + (x % TILE)) * 2) as usize;
         t[o] = v[0];
@@ -665,11 +669,7 @@ struct LiquifyStroke {
 /// so a fast drag warps the whole segment in this frame instead of trailing
 /// the pointer. The 64-push ceiling keeps a pathological one-frame jump
 /// from stalling the frame.
-fn liquify_steps(
-    from: (f32, f32),
-    to: (f32, f32),
-    max_step: f32,
-) -> Vec<((f32, f32), (f32, f32))> {
+fn liquify_steps(from: (f32, f32), to: (f32, f32), max_step: f32) -> Vec<((f32, f32), (f32, f32))> {
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
     let len = (dx * dx + dy * dy).sqrt();
     if len == 0.0 {
@@ -1401,8 +1401,26 @@ impl Document {
     /// Walks tiles through the stack plan: one composite per 256² tile,
     /// then tile rows are copied into canvas rows.
     pub fn flatten(&self) -> Vec<u8> {
-        let plan = self.stack_plan();
         let mut out = vec![0u8; (self.w as usize) * (self.h as usize) * 4];
+        self.fill_flat(&mut out);
+        out
+    }
+
+    /// [`Self::flatten`] with checked size and a fallible allocation: 8K
+    /// RGBA is ~132 MB, so export paths on a tablet must surface OOM as
+    /// an error instead of aborting the process.
+    pub fn try_flatten(&self) -> Result<Vec<u8>, String> {
+        let len = (self.w as usize)
+            .checked_mul(self.h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        let mut out = crate::raster::try_zeroed(len)?;
+        self.fill_flat(&mut out);
+        Ok(out)
+    }
+
+    fn fill_flat(&self, out: &mut [u8]) {
+        let plan = self.stack_plan();
         for ty in 0..self.tiles_y() {
             for tx in 0..self.tiles_x() {
                 let tile = self.composite_tile(&plan, tx, ty);
@@ -1417,7 +1435,6 @@ impl Document {
                 }
             }
         }
-        out
     }
 
     /// Composite only the inclusive region `(x0, y0)..=(x1, y1)` (clamped),
@@ -2366,17 +2383,27 @@ impl Document {
     /// (cropped to the canvas): what interchange formats store. Returns
     /// the shifted pixels plus the shifted mask (or `None` when the layer
     /// has no valid mask, matching the exporter's existing rule).
-    pub fn baked_layer(&self, index: usize) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let layer = self.layers.get(index)?;
-        let n = (self.w * self.h) as usize;
-        if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.len() != n * 4 {
-            return None;
+    pub fn baked_layer(&self, index: usize) -> Result<Option<BakedLayer>, String> {
+        let Some(layer) = self.layers.get(index) else {
+            return Ok(None);
+        };
+        let n = (self.w as usize)
+            .checked_mul(self.h as usize)
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        let n4 = n
+            .checked_mul(4)
+            .ok_or_else(|| "canvas dimensions overflow".to_string())?;
+        if layer.pixels.w() != self.w || layer.pixels.h() != self.h || layer.pixels.len() != n4 {
+            return Ok(None);
         }
-        let src = layer.pixels.to_dense();
-        let src_mask = layer.mask.as_ref().map(|m| m.to_dense());
-        let mut px = vec![0u8; n * 4];
+        let src = layer.pixels.try_to_dense()?;
+        let src_mask = match layer.mask.as_ref() {
+            Some(m) => Some(m.try_to_dense()?),
+            None => None,
+        };
+        let mut px = crate::raster::try_zeroed(n4)?;
         let mut mk: Option<Vec<u8>> = match src_mask.as_deref() {
-            Some(m) if m.len() == n => Some(vec![0u8; n]),
+            Some(m) if m.len() == n => Some(crate::raster::try_zeroed(n)?),
             _ => None,
         };
         for y in 0..self.h {
@@ -2392,7 +2419,7 @@ impl Document {
                 }
             }
         }
-        Some((px, mk))
+        Ok(Some((px, mk)))
     }
 
     /// True when `(px, py)` is inside the active selection (rectangular
@@ -3416,13 +3443,13 @@ impl Document {
         // The displacement this push gives each pixel (reverse sample offset
         // direction: content moves along `(dx, dy)`).
         let disp = |px: u32, py: u32| -> [f32; 2] {
-            let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2))
-                .sqrt()
+            let dist = (((px as f32 + 0.5 - x).powi(2) + (py as f32 + 0.5 - y).powi(2)).sqrt()
                 / radius)
                 .min(1.0);
             // Smooth falloff: full push at the center, zero at the rim.
             let f = 0.5 + 0.5 * (std::f32::consts::PI * dist).cos();
-            let in_rect = !matches!(selection, Some((a, b, c, d)) if px < a || px > c || py < b || py > d);
+            let in_rect =
+                !matches!(selection, Some((a, b, c, d)) if px < a || px > c || py < b || py > d);
             let k = if in_rect {
                 Self::sel_k(mask, w, px, py)
             } else {
@@ -3569,14 +3596,9 @@ impl Document {
 
     /// Save the composite as PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
-        image::save_buffer(
-            path,
-            &self.flatten(),
-            self.w,
-            self.h,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|e| e.to_string())
+        let flat = self.try_flatten()?;
+        image::save_buffer(path, &flat, self.w, self.h, image::ColorType::Rgba8)
+            .map_err(|e| e.to_string())
     }
 
     /// Save the composite as JPEG at `quality` (1-100, higher keeps more
@@ -3586,7 +3608,7 @@ impl Document {
         if !(1..=100).contains(&quality) {
             return Err(format!("bad JPEG quality: {quality} (want 1-100)"));
         }
-        let flat = self.flatten();
+        let flat = self.try_flatten()?;
         let mut rgb = Vec::with_capacity((self.w * self.h) as usize * 3);
         for i in 0..flat.len() / 4 {
             let o = i * 4;
@@ -3605,7 +3627,7 @@ impl Document {
     /// no layers or extras — the layered original stays in `.procraft`).
     pub fn save_tiff(&self, path: &std::path::Path) -> Result<(), String> {
         use image::ImageEncoder;
-        let flat = self.flatten();
+        let flat = self.try_flatten()?;
         let mut buf = Vec::new();
         {
             let enc = image::codecs::tiff::TiffEncoder::new(std::io::Cursor::new(&mut buf));
@@ -3683,10 +3705,7 @@ impl Document {
         Ok(out.into_inner())
     }
 
-    fn write_project(
-        &self,
-        f: &mut (impl std::io::Write + std::io::Seek),
-    ) -> Result<(), String> {
+    fn write_project(&self, f: &mut (impl std::io::Write + std::io::Seek)) -> Result<(), String> {
         f.write_all(b"PCRAFT12").map_err(|e| e.to_string())?;
         f.write_all(&self.w.to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -4481,7 +4500,11 @@ mod tests {
         doc.layers[0].pixels.set4(idx(0, 0), [5, 0, 0, 255]);
         assert!(doc.restore_checkpoint_region((0, 1, 599, 1)));
         for x in 0..600 {
-            assert_eq!(doc.layers[0].pixels.get4(idx(x, 1)), [7, 0, 0, 255], "x={x}");
+            assert_eq!(
+                doc.layers[0].pixels.get4(idx(x, 1)),
+                [7, 0, 0, 255],
+                "x={x}"
+            );
         }
         assert_eq!(doc.layers[0].pixels.get4(idx(0, 0)), [5, 0, 0, 255]);
     }
@@ -4491,7 +4514,12 @@ mod tests {
         let mut doc = Document::new(4, 2);
         doc.checkpoint();
         // Mask created after the checkpoint: it has no snapshot to copy back.
-        doc.layers[0].mask = Some(Raster::from_dense(4, 2, 1, &[10, 20, 30, 40, 50, 60, 70, 80]));
+        doc.layers[0].mask = Some(Raster::from_dense(
+            4,
+            2,
+            1,
+            &[10, 20, 30, 40, 50, 60, 70, 80],
+        ));
         assert!(doc.restore_checkpoint_region((0, 0, 3, 1)));
         assert_eq!(
             doc.layers[0].mask.as_ref().unwrap().to_dense(),
@@ -7736,10 +7764,8 @@ mod tests {
                         let d = [-dx * strength * f, -dy * strength * f];
                         let prev = field_at(&before, px as f32 + d[0], py as f32 + d[1]);
                         let o = (py * w + px) as usize;
-                        off[o][0] =
-                            (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32);
-                        off[o][1] =
-                            (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32);
+                        off[o][0] = (prev[0] + d[0]).clamp(-(px as f32), (w - 1 - px) as f32);
+                        off[o][1] = (prev[1] + d[1]).clamp(-(py as f32), (h - 1 - py) as f32);
                         touched[o] = true;
                     }
                 }
@@ -7809,7 +7835,10 @@ mod tests {
                 &bytes,
                 32,
                 32,
-                &[(20.0, 12.0, 9.0, -7.0, 14.0, 1.0), (10.0, 20.0, -8.0, 5.0, 18.0, 0.6)]
+                &[
+                    (20.0, 12.0, 9.0, -7.0, 14.0, 1.0),
+                    (10.0, 20.0, -8.0, 5.0, 18.0, 0.6)
+                ]
             )
         );
         // Corner warp: reads clamp against the canvas edge.
@@ -7862,7 +7891,9 @@ mod tests {
         // A 6 px bar across the drag line at y = 180.
         for y in 60..=300u32 {
             for x in 312..=317u32 {
-                doc.layers[0].pixels.set4(((y * w + x) * 4) as usize, [30, 144, 255, 255]);
+                doc.layers[0]
+                    .pixels
+                    .set4(((y * w + x) * 4) as usize, [30, 144, 255, 255]);
             }
         }
         // A 160 px drag at strength 0.5, fed as ~4 px pointer segments and
@@ -7932,7 +7963,9 @@ mod tests {
         use crate::brush::{Brush, Color};
         let (w, h) = (32u32, 32u32);
         let mut doc = Document::new(w, h);
-        let bytes: Vec<u8> = (0..w * h * 4).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let bytes: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
         doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
         // Paint over everything: the open stroke's snapshot is now stale,
@@ -7991,7 +8024,9 @@ mod tests {
     fn liquify_segment_matches_manual_stepping() {
         let (w, h) = (96u32, 32u32);
         let mut doc = Document::new(w, h);
-        let bytes: Vec<u8> = (0..w * h * 4).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let bytes: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
         let mut manual = doc.clone();
         let (from, to, size, strength) = ((6.0, 10.0), (84.0, 24.0), 24.0, 0.8);
@@ -8293,5 +8328,17 @@ mod tests {
         doc.active = 1;
         doc.dab(&Brush::default(), Color([1, 2, 3, 255]), 300.0, 300.0);
         assert_eq!(doc.layer_alloc_bytes(), 3 * 256 * 1024);
+    }
+
+    #[test]
+    fn fallible_export_buffers_match_the_infallible_paths() {
+        let mut doc = Document::new(5, 4);
+        doc.layers[0].pixels.set(3, 200);
+        assert_eq!(doc.try_flatten().unwrap(), doc.flatten());
+        let (baked, mask) = doc.baked_layer(0).unwrap().unwrap();
+        assert_eq!(baked.len(), 5 * 4 * 4);
+        assert_eq!(mask, None);
+        // A missing layer is Ok(None) (skip it), not an error (OOM).
+        assert!(doc.baked_layer(99).unwrap().is_none());
     }
 }
