@@ -46,7 +46,10 @@ pub use probrush::{
 };
 pub use psd::{open_psd, save_psd};
 pub use raster::{Raster, TILE};
-pub use settings::{Settings, SETTINGS_VERSION};
+pub use settings::{
+    Settings, ToolBrushSettings, DEFAULT_LIQUIFY_SIZE, DEFAULT_LIQUIFY_STRENGTH,
+    DEFAULT_SMUDGE_STRENGTH, SETTINGS_VERSION,
+};
 pub use shortcuts::{
     ActionId, ChordKey, DragActionId, KeyChord, ModSet, Shortcuts, SizeDragMode, StoredShortcuts,
     ToolId,

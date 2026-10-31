@@ -135,8 +135,9 @@ pub(crate) fn push_recent(recent: &mut Vec<String>, path: &str) {
 pub(crate) const SAVE_RETRY_SECS: f64 = 2.0;
 
 /// M49: what makes two settings snapshots differ in the discrete sense.
-/// Zoom is excluded — it coalesces through `should_flush_zoom` and gets
-/// written by its own quiet-period path.
+/// The coalesced fields (zoom and the per-tool brush dials) are excluded —
+/// they change every frame while a slider is dragged, so they wait for
+/// the quiet period in `coalesced_differ`/`should_flush_coalesced`.
 pub(crate) fn settings_differ(a: &Settings, b: &Settings) -> bool {
     a.version != b.version
         || a.theme != b.theme
@@ -147,6 +148,18 @@ pub(crate) fn settings_differ(a: &Settings, b: &Settings) -> bool {
         || a.strip_collapsed != b.strip_collapsed
         || a.strip_dock != b.strip_dock
         || a.time_lapse != b.time_lapse
+}
+
+/// M49: fields written only after the pointer goes quiet (a slider drag
+/// would otherwise rewrite settings.json every frame).
+pub(crate) fn coalesced_differ(a: &Settings, b: &Settings) -> bool {
+    a.zoom != b.zoom
+        || a.brush != b.brush
+        || a.eraser != b.eraser
+        || a.smudge != b.smudge
+        || a.liquify_size != b.liquify_size
+        || a.liquify_strength != b.liquify_strength
+        || a.smudge_strength != b.smudge_strength
 }
 
 pub(crate) fn page_presets() -> Vec<(&'static str, [u8; 3])> {

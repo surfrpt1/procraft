@@ -276,12 +276,13 @@ pub(crate) struct ProCraftApp {
     pub(crate) sel_nudge_y: i32,
     /// M49 settings: resolved settings dir (None = session-only), the
     /// last-saved snapshot (change detection), the shortcuts table, and
-    /// the zoom write coalescer (dirty flag + last-change time).
+    /// the coalesced-write gate for zoom and the brush dials (dirty flag
+    /// + last-change time).
     pub(crate) settings_dir: Option<std::path::PathBuf>,
     pub(crate) settings_snapshot: Settings,
     pub(crate) shortcuts: Shortcuts,
-    pub(crate) zoom_dirty: bool,
-    pub(crate) zoom_changed_at: f64,
+    pub(crate) coalesced_dirty: bool,
+    pub(crate) coalesced_changed_at: f64,
     /// M49 UI: shortcuts window flag, live chord-capture target, a
     /// load/corrupt note for the settings window, and the Shift+drag
     /// brush-size gesture in flight.
@@ -389,7 +390,7 @@ impl ProCraftApp {
             fill_tolerance: 32,
             fill_grow: 2,
             fill_preview: None,
-            smudge_strength: 0.5,
+            smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             filter_preview: None,
             sel_feather: 4,
             sel_grow: 4,
@@ -480,8 +481,8 @@ impl ProCraftApp {
             move_acc: (0.0, 0.0),
             mmb_last: None,
             liquify_from: None,
-            liquify_size: 128.0,
-            liquify_strength: 0.5,
+            liquify_size: DEFAULT_LIQUIFY_SIZE,
+            liquify_strength: DEFAULT_LIQUIFY_STRENGTH,
             shape_anchor: None,
             shape_current: None,
             shape_kind: ShapeKind::Rect,
@@ -520,8 +521,8 @@ impl ProCraftApp {
             settings_dir,
             settings_snapshot: Settings::default(),
             shortcuts: Shortcuts::default(),
-            zoom_dirty: false,
-            zoom_changed_at: 0.0,
+            coalesced_dirty: false,
+            coalesced_changed_at: 0.0,
             show_shortcuts: false,
             capture: None,
             settings_note: None,

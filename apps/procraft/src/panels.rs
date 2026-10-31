@@ -178,7 +178,13 @@ impl ProCraftApp {
                     ui.label("Drag to push paint around (color layers).");
                 }
                 if self.tool == Tool::Liquify {
-                    stepped_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size");
+                    stepped_slider(
+                        ui,
+                        &mut self.liquify_size,
+                        LIQUIFY_SIZE_MIN..=LIQUIFY_SIZE_MAX,
+                        1.0,
+                        "Size",
+                    );
                     stepped_slider(ui, &mut self.liquify_strength, 0.05..=1.0, 0.05, "Strength");
                     ui.label("Drag to push pixels (one undo step per stroke).");
                 }

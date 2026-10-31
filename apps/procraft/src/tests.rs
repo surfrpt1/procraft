@@ -230,6 +230,29 @@ fn settings_differ_ignores_zoom_but_catches_discrete_changes() {
     let mut b = a.clone();
     b.zoom = 2.0;
     assert!(!settings_differ(&a, &b), "zoom is coalesced elsewhere");
+    assert!(coalesced_differ(&a, &b));
+    // The per-tool brush dials also change while sliders are dragged, so
+    // they ride the same quiet-period path instead of writing per frame.
+    let mut brush = a.clone();
+    brush.brush = ToolBrushSettings {
+        size: 99.0,
+        ..brush.brush
+    };
+    assert!(!settings_differ(&a, &brush));
+    assert!(coalesced_differ(&a, &brush));
+    let mut liquify = a.clone();
+    liquify.liquify_size = 256.0;
+    liquify.liquify_strength = 0.9;
+    assert!(!settings_differ(&a, &liquify));
+    assert!(coalesced_differ(&a, &liquify));
+    let mut smudge = a.clone();
+    smudge.smudge = ToolBrushSettings {
+        softness: 0.9,
+        ..smudge.smudge
+    };
+    smudge.smudge_strength = 0.1;
+    assert!(!settings_differ(&a, &smudge));
+    assert!(coalesced_differ(&a, &smudge));
     b.recent = vec!["x.procraft".into()];
     assert!(settings_differ(&a, &b));
     let mut c = a.clone();
@@ -250,6 +273,62 @@ fn settings_differ_ignores_zoom_but_catches_discrete_changes() {
     let mut g = a.clone();
     g.time_lapse = false;
     assert!(settings_differ(&a, &g));
+    assert!(!coalesced_differ(&a, &g));
+}
+
+#[test]
+fn persisted_tool_brushes_clamp_into_the_slider_ranges() {
+    // A hand-edited file must not push NaN or out-of-range values into a
+    // tool: each value clamps, and non-finite input falls back to the
+    // fresh-brush default.
+    let fallback = ToolBrushSettings::default();
+    let mut s = Settings::default();
+    s.brush.size = f32::NAN;
+    s.brush.opacity = -1.0;
+    s.brush.softness = 2.0;
+    s.eraser.size = 5000.0;
+    s.smudge.size = 0.1;
+    let slots = ToolBrushes::from_settings(&s);
+    let mut live = Brush::default();
+    slots.load(Tool::Brush, &mut live);
+    assert_eq!(live.size, fallback.size);
+    assert_eq!(live.opacity, 0.05);
+    assert_eq!(live.softness, 1.0);
+    slots.load(Tool::Eraser, &mut live);
+    assert_eq!(live.size, BRUSH_SIZE_MAX);
+    slots.load(Tool::Smudge, &mut live);
+    assert_eq!(live.size, BRUSH_SIZE_MIN);
+}
+
+#[test]
+fn tool_brushes_survive_a_settings_round_trip() {
+    let mut slots = ToolBrushes::new(&Brush::default());
+    let mut live = Brush {
+        size: 64.0,
+        opacity: 0.75,
+        softness: 0.5,
+        ..Brush::default()
+    };
+    slots.save(Tool::Brush, &live);
+    live.size = 8.0;
+    live.opacity = 0.25;
+    live.softness = 0.0;
+    slots.save(Tool::Eraser, &live);
+    live.size = 200.0;
+    slots.save(Tool::Smudge, &live);
+
+    let mut s = Settings::default();
+    slots.write_settings(&mut s);
+    let back = ToolBrushes::from_settings(&s);
+    let mut out = Brush::default();
+    back.load(Tool::Brush, &mut out);
+    assert_eq!((out.size, out.opacity, out.softness), (64.0, 0.75, 0.5));
+    back.load(Tool::Eraser, &mut out);
+    assert_eq!((out.size, out.opacity, out.softness), (8.0, 0.25, 0.0));
+    back.load(Tool::Smudge, &mut out);
+    assert_eq!(out.size, 200.0);
+    // Values the writing side never touches stay at their defaults.
+    assert_eq!(s.liquify_size, DEFAULT_LIQUIFY_SIZE);
 }
 
 #[test]

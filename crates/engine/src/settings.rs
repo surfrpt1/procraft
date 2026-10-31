@@ -4,10 +4,41 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::brush::Brush;
 use crate::shortcuts::StoredShortcuts;
 
 /// Schema version written into every settings file.
 pub const SETTINGS_VERSION: u32 = 1;
+
+/// Defaults for the dials that have no brush slot behind them. The app
+/// seeds its live fields from these so stored and in-memory defaults agree.
+pub const DEFAULT_LIQUIFY_SIZE: f32 = 128.0;
+pub const DEFAULT_LIQUIFY_STRENGTH: f32 = 0.5;
+pub const DEFAULT_SMUDGE_STRENGTH: f32 = 0.5;
+
+/// Per-tool brush values that survive a relaunch. Mirrors the app's
+/// runtime brush slots (size/opacity/softness only; spacing, pressure,
+/// velocity, taper and the stabilizer stay shared between tools).
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolBrushSettings {
+    pub size: f32,
+    pub opacity: f32,
+    pub softness: f32,
+}
+
+impl Default for ToolBrushSettings {
+    fn default() -> Self {
+        // Stay in lockstep with a fresh brush so the first run and a
+        // missing file land on the same values.
+        let brush = Brush::default();
+        ToolBrushSettings {
+            size: brush.size,
+            opacity: brush.opacity,
+            softness: brush.softness,
+        }
+    }
+}
 
 /// Everything ProCraft persists across runs. `#[serde(default)]` makes
 /// every field optional on read (missing -> default) and unknown fields
@@ -35,6 +66,14 @@ pub struct Settings {
     /// Time-lapse recording; on by default so a new canvas stages snapshots
     /// from the first stroke.
     pub time_lapse: bool,
+    /// Per-tool brush slots (clamped by the app on load).
+    pub brush: ToolBrushSettings,
+    pub eraser: ToolBrushSettings,
+    pub smudge: ToolBrushSettings,
+    /// Liquify and Smudge dials (clamped by the app on load).
+    pub liquify_size: f32,
+    pub liquify_strength: f32,
+    pub smudge_strength: f32,
 }
 
 impl Default for Settings {
@@ -50,6 +89,12 @@ impl Default for Settings {
             strip_collapsed: false,
             strip_dock: "center".into(),
             time_lapse: true,
+            brush: ToolBrushSettings::default(),
+            eraser: ToolBrushSettings::default(),
+            smudge: ToolBrushSettings::default(),
+            liquify_size: DEFAULT_LIQUIFY_SIZE,
+            liquify_strength: DEFAULT_LIQUIFY_STRENGTH,
+            smudge_strength: DEFAULT_SMUDGE_STRENGTH,
         }
     }
 }
@@ -87,6 +132,17 @@ mod tests {
         assert_eq!(s.strip_dock, "center");
         // Time-lapse is Procreate's default: record from the first stroke.
         assert!(s.time_lapse);
+        // Tool slots follow a fresh brush; the free dials keep their old
+        // in-memory defaults.
+        let brush = Brush::default();
+        for slot in [s.brush, s.eraser, s.smudge] {
+            assert_eq!(slot.size, brush.size);
+            assert_eq!(slot.opacity, brush.opacity);
+            assert_eq!(slot.softness, brush.softness);
+        }
+        assert_eq!(s.liquify_size, 128.0);
+        assert_eq!(s.liquify_strength, 0.5);
+        assert_eq!(s.smudge_strength, 0.5);
     }
 
     #[test]
@@ -99,6 +155,19 @@ mod tests {
             strip_collapsed: true,
             strip_dock: "left".into(),
             time_lapse: false,
+            brush: ToolBrushSettings {
+                size: 64.0,
+                opacity: 0.75,
+                softness: 0.4,
+            },
+            eraser: ToolBrushSettings {
+                size: 8.0,
+                opacity: 1.0,
+                softness: 0.0,
+            },
+            liquify_size: 256.0,
+            liquify_strength: 0.9,
+            smudge_strength: 0.25,
             ..Settings::default()
         };
         let s2 = Settings::from_json(&s.to_json_pretty()).unwrap();
@@ -112,6 +181,18 @@ mod tests {
         assert_eq!(s.zoom, 1.0); // missing field -> default
         assert!(s.time_lapse); // older files keep recording
         assert!(!s.shortcuts.bindings.contains_key("undo")); // none customized
+                                                             // Files from before brush persistence start from a fresh brush.
+        assert_eq!(s.brush, ToolBrushSettings::default());
+        assert_eq!(s.liquify_size, DEFAULT_LIQUIFY_SIZE);
+        assert_eq!(s.smudge_strength, DEFAULT_SMUDGE_STRENGTH);
+        // A partially written slot keeps the defaults for its missing keys.
+        let partial = Settings::from_json(r#"{"brush":{"size":64}}"#).unwrap();
+        assert_eq!(partial.brush.size, 64.0);
+        assert_eq!(partial.brush.opacity, ToolBrushSettings::default().opacity);
+        assert_eq!(
+            partial.brush.softness,
+            ToolBrushSettings::default().softness
+        );
     }
 
     #[test]

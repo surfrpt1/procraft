@@ -280,6 +280,41 @@ pub(crate) struct ToolBrushes {
     smudge: ToolBrush,
 }
 
+/// Liquify size range shared by both panel sliders and the settings clamp.
+pub(crate) const LIQUIFY_SIZE_MIN: f32 = 8.0;
+
+pub(crate) const LIQUIFY_SIZE_MAX: f32 = 512.0;
+
+/// Clamp a persisted dial into its slider range; a non-finite value falls
+/// back to the fresh default so a hand-edited file cannot poison a tool.
+pub(crate) fn clamp_dial(v: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(lo, hi)
+    } else {
+        fallback
+    }
+}
+
+impl ToolBrush {
+    /// Adopt a persisted slot, clamping every value into its slider range.
+    fn from_settings(s: &ToolBrushSettings) -> Self {
+        let fallback = ToolBrushSettings::default();
+        ToolBrush {
+            size: clamp_dial(s.size, BRUSH_SIZE_MIN, BRUSH_SIZE_MAX, fallback.size),
+            opacity: clamp_dial(s.opacity, 0.05, 1.0, fallback.opacity),
+            softness: clamp_dial(s.softness, 0.0, 1.0, fallback.softness),
+        }
+    }
+
+    fn to_settings(self) -> ToolBrushSettings {
+        ToolBrushSettings {
+            size: self.size,
+            opacity: self.opacity,
+            softness: self.softness,
+        }
+    }
+}
+
 impl ToolBrushes {
     /// Seed every slot from the starting brush so the first switch to a
     /// paint tool lands on the values the user began with.
@@ -294,6 +329,23 @@ impl ToolBrushes {
             eraser: slot,
             smudge: slot,
         }
+    }
+
+    /// Restore persisted slots, clamped to their sliders. The caller loads
+    /// the active tool's slot into the live brush afterwards.
+    pub(crate) fn from_settings(s: &Settings) -> Self {
+        Self {
+            brush: ToolBrush::from_settings(&s.brush),
+            eraser: ToolBrush::from_settings(&s.eraser),
+            smudge: ToolBrush::from_settings(&s.smudge),
+        }
+    }
+
+    /// Write the slots into a settings snapshot.
+    pub(crate) fn write_settings(&self, s: &mut Settings) {
+        s.brush = self.brush.to_settings();
+        s.eraser = self.eraser.to_settings();
+        s.smudge = self.smudge.to_settings();
     }
 
     fn slot_mut(&mut self, tool: Tool) -> Option<&mut ToolBrush> {

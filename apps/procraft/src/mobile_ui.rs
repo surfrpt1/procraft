@@ -712,7 +712,14 @@ impl ProCraftApp {
         match control {
             QuickControl::Size => {
                 if self.tool == Tool::Liquify {
-                    quick_slider(ui, &mut self.liquify_size, 8.0..=512.0, 1.0, "Size", t);
+                    quick_slider(
+                        ui,
+                        &mut self.liquify_size,
+                        LIQUIFY_SIZE_MIN..=LIQUIFY_SIZE_MAX,
+                        1.0,
+                        "Size",
+                        t,
+                    );
                 } else {
                     quick_slider(
                         ui,

@@ -11,8 +11,9 @@ pub const MARKER_KEY: &str = "m49_seeded";
 /// File name inside the settings directory.
 pub const SETTINGS_FILE: &str = "settings.json";
 
-/// Quiet period before a coalesced zoom write is flushed (seconds).
-const ZOOM_FLUSH_SECS: f64 = 1.5;
+/// Quiet period before a coalesced write (zoom, brush dials) is flushed
+/// (seconds).
+const COALESCE_FLUSH_SECS: f64 = 1.5;
 
 /// How the app should initialize its settings this run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,9 +38,9 @@ pub fn init_action(file_exists: bool, marker_set: bool) -> Inits {
     }
 }
 
-/// Coalesced zoom write gate: dirty and quiet for the whole period.
-pub fn should_flush_zoom(dirty: bool, last_change: f64, now: f64) -> bool {
-    dirty && now - last_change >= ZOOM_FLUSH_SECS
+/// Coalesced write gate: dirty and quiet for the whole period.
+pub fn should_flush_coalesced(dirty: bool, last_change: f64, now: f64) -> bool {
+    dirty && now - last_change >= COALESCE_FLUSH_SECS
 }
 
 /// Platform settings directory (created lazily on save). Never `None`:
@@ -142,11 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn zoom_flushes_only_after_the_quiet_period() {
-        assert!(!should_flush_zoom(false, 100.0, 200.0));
-        assert!(!should_flush_zoom(true, 100.0, 101.0));
-        assert!(should_flush_zoom(true, 100.0, 101.5));
-        assert!(should_flush_zoom(true, 100.0, 130.0));
+    fn coalesced_writes_flush_only_after_the_quiet_period() {
+        assert!(!should_flush_coalesced(false, 100.0, 200.0));
+        assert!(!should_flush_coalesced(true, 100.0, 101.0));
+        assert!(should_flush_coalesced(true, 100.0, 101.5));
+        assert!(should_flush_coalesced(true, 100.0, 130.0));
     }
 
     #[test]
