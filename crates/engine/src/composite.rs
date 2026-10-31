@@ -204,7 +204,10 @@ impl Document {
                     let ty = ly as u32 / TILE;
                     (c0..=c1).any(|tx| {
                         layer.pixels.tile(tx, ty).is_some()
-                            || layer.mask.as_ref().is_some_and(|m| m.tile(tx, ty).is_some())
+                            || layer
+                                .mask
+                                .as_ref()
+                                .is_some_and(|m| m.tile(tx, ty).is_some())
                     })
                 } else {
                     true

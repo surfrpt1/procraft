@@ -47,10 +47,7 @@ pub const VIEWPORT_SIDE: u32 = 2048;
 /// hold, or a legacy document above the 8K cap (target A was sized for the
 /// cap; a 16384² texture is ~1 GiB even when the GPU nominally allows it).
 pub fn viewport_active(forced: bool, side: u32, max_texture_side: usize) -> bool {
-    forced
-        || side > VIEWPORT_SIDE
-        || side as usize > max_texture_side
-        || side > MAX_CANVAS_SIDE
+    forced || side > VIEWPORT_SIDE || side as usize > max_texture_side || side > MAX_CANVAS_SIDE
 }
 
 /// Whether a canvas-sized texture can be allocated at all: within the GPU's
@@ -742,7 +739,13 @@ impl TilePass<'_> {
         for ty in 0..self.tiles.1 {
             let band = ((ty * TILE) as f32, ((ty + 1) * TILE) as f32);
             let half = if self.filtered { self.dy * 0.5 } else { 0.0 };
-            let (ra, rb) = texel_span(self.view.y0, self.dy, self.out[1], band.0 - half, band.1 + half);
+            let (ra, rb) = texel_span(
+                self.view.y0,
+                self.dy,
+                self.out[1],
+                band.0 - half,
+                band.1 + half,
+            );
             let (ra, rb) = (ra.max(row_a), rb.min(row_b));
             if ra >= rb {
                 continue;
@@ -750,8 +753,13 @@ impl TilePass<'_> {
             for tx in 0..self.tiles.0 {
                 let band = ((tx * TILE) as f32, ((tx + 1) * TILE) as f32);
                 let half = if self.filtered { self.dx * 0.5 } else { 0.0 };
-                let (ca, cb) =
-                    texel_span(self.view.x0, self.dx, self.out[0], band.0 - half, band.1 + half);
+                let (ca, cb) = texel_span(
+                    self.view.x0,
+                    self.dx,
+                    self.out[0],
+                    band.0 - half,
+                    band.1 + half,
+                );
                 let (ca, cb) = (ca.max(c0), cb.min(c1));
                 if ca >= cb {
                     continue;
@@ -770,12 +778,14 @@ impl TilePass<'_> {
                         for col in ca..cb {
                             let x = (self.view.x0 + (col as f32 + 0.5) * self.dx)
                                 .floor()
-                                .clamp(0.0, self.max_x) as usize;
+                                .clamp(0.0, self.max_x)
+                                as usize;
                             let src = src_row + (x % tile) * 4;
                             let slot_dst = dst_row + (col - c0) * 4;
-                            if let (Some(px), Some(slot)) =
-                                (pixels.get(src..src + 4), dst.get_mut(slot_dst..slot_dst + 4))
-                            {
+                            if let (Some(px), Some(slot)) = (
+                                pixels.get(src..src + 4),
+                                dst.get_mut(slot_dst..slot_dst + 4),
+                            ) {
                                 slot.copy_from_slice(px);
                             }
                         }
@@ -881,7 +891,9 @@ fn sample_in_bands(
     let workers = if cols * len < MIN_PARALLEL_TEXELS {
         1
     } else {
-        cores.min(MAX_SAMPLE_WORKERS).min((len / MIN_BAND_ROWS).max(1))
+        cores
+            .min(MAX_SAMPLE_WORKERS)
+            .min((len / MIN_BAND_ROWS).max(1))
     };
     sample_in_bands_with(workers, img, cols, rows, sample)
 }
@@ -962,7 +974,8 @@ fn view_pixels_mip(
                 (mt_x * tile) as f32 * scale,
                 ((mt_x + 1) * tile) as f32 * scale,
             );
-            let (col_a, col_b) = texel_span(view.x0, dx, out[0], band.0 - dx * 0.5, band.1 + dx * 0.5);
+            let (col_a, col_b) =
+                texel_span(view.x0, dx, out[0], band.0 - dx * 0.5, band.1 + dx * 0.5);
             let (col_a, col_b) = (col_a.max(c0), col_b.min(c1));
             if col_a >= col_b {
                 continue;
@@ -1513,8 +1526,7 @@ mod tests {
         let tile = cache.tile(&doc, &plan, 1, 0).to_vec();
         // A rect straddling the tile seam: the upload covers only the part
         // inside tile (1,0) and the canvas (x < 300).
-        let (rgba, ox, oy, w, h) =
-            tile_image_region(&doc, &tile, 1, 0, (250, 2, 320, 900));
+        let (rgba, ox, oy, w, h) = tile_image_region(&doc, &tile, 1, 0, (250, 2, 320, 900));
         assert_eq!((ox, oy, w, h), (256, 2, 44, 3));
         assert_eq!(rgba.len(), 44 * 3 * 4);
         // The first byte is canvas (256, 2): tile-local (0, 2).
@@ -1659,10 +1671,7 @@ mod tests {
             viewport_active(false, 8192, 4096),
             "GPU cannot hold the canvas"
         );
-        assert!(
-            viewport_active(true, 1024, 16384),
-            "forced for captures"
-        );
+        assert!(viewport_active(true, 1024, 16384), "forced for captures");
         assert!(
             !viewport_active(false, 1024, 4096),
             "a small canvas still fits a 4K GPU"
@@ -1876,9 +1885,10 @@ mod tests {
         let mut doc = Document::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                doc.layers[0]
-                    .pixels
-                    .set4((y as usize * w as usize + x as usize) * 4, [x as u8, y as u8, 9, 255]);
+                doc.layers[0].pixels.set4(
+                    (y as usize * w as usize + x as usize) * 4,
+                    [x as u8, y as u8, 9, 255],
+                );
             }
         }
         let plan = doc.stack_plan();
@@ -1915,9 +1925,10 @@ mod tests {
         let mut doc = Document::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                doc.layers[0]
-                    .pixels
-                    .set4((y as usize * w as usize + x as usize) * 4, [30, 120, 200, 255]);
+                doc.layers[0].pixels.set4(
+                    (y as usize * w as usize + x as usize) * 4,
+                    [30, 120, 200, 255],
+                );
             }
         }
         let plan = doc.stack_plan();
@@ -2003,9 +2014,10 @@ mod tests {
         // re-sample only the region the app would.
         for y in 500..=560 {
             for x in 1000..=1100 {
-                doc.layers[0]
-                    .pixels
-                    .set4((y as usize * w as usize + x as usize) * 4, [20, 20, 20, 255]);
+                doc.layers[0].pixels.set4(
+                    (y as usize * w as usize + x as usize) * 4,
+                    [20, 20, 20, 255],
+                );
             }
         }
         doc.mark_full_dirty();
@@ -2095,7 +2107,11 @@ mod tests {
         cache.patch(&doc, &plan, (300, 50, 300, 50));
         let local = ((50 * TILE + (300 - TILE)) * 4) as usize;
         let tile = cache.tile(&doc, &plan, 1, 0);
-        assert_eq!(&tile[local..local + 4], &[200, 100, 50, 255], "patched tile");
+        assert_eq!(
+            &tile[local..local + 4],
+            &[200, 100, 50, 255],
+            "patched tile"
+        );
         let fresh = view_pixels(&doc, &plan, &mut cache, view, out, None);
         assert_eq!(&fresh[px..px + 4], &[200, 100, 50, 255], "patched");
     }
@@ -2116,7 +2132,11 @@ mod tests {
         for row in 0..rows {
             for col in 0..cols {
                 let o = (row * cols + col) * 4;
-                assert_eq!(&img[o..o + 4], &[row as u8, col as u8, 7, 255], "{row},{col}");
+                assert_eq!(
+                    &img[o..o + 4],
+                    &[row as u8, col as u8, 7, 255],
+                    "{row},{col}"
+                );
             }
         }
     }
@@ -2151,7 +2171,14 @@ mod tests {
         assert_eq!(full.len(), 400 * 400 * 4);
         let mut serial = Vec::with_capacity(full.len());
         for row in 0..out[1] {
-            let band = view_pixels(&doc, &plan, &mut cache, view, out, Some([0, row, out[0], row + 1]));
+            let band = view_pixels(
+                &doc,
+                &plan,
+                &mut cache,
+                view,
+                out,
+                Some([0, row, out[0], row + 1]),
+            );
             serial.extend_from_slice(&band);
         }
         assert_eq!(full, serial);
