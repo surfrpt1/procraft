@@ -275,7 +275,16 @@ impl ProCraftApp {
                     [self.doc.w as usize, self.doc.h as usize],
                     &bytes,
                 );
-                self.texture = Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                // Playback changes the shown frame several times a second:
+                // replace the image in the existing texture rather than
+                // allocating (and freeing) a new one per frame.
+                match self.texture.as_mut() {
+                    Some(handle) => handle.set(img, TextureOptions::LINEAR),
+                    None => {
+                        self.texture =
+                            Some(ctx.load_texture("canvas", img, TextureOptions::LINEAR));
+                    }
+                }
                 self.anim_shown = Some(active);
                 return;
             }

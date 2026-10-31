@@ -298,7 +298,7 @@ pub fn rasterize_frame_region(
     if ly0 > ly1 {
         return out;
     }
-    let Some((cx0, cx1, lx0, lx1)) = visible_span(x0, x1, layer.ox, doc.w) else {
+    let Some((cx0, _, lx0, lx1)) = visible_span(x0, x1, layer.ox, doc.w) else {
         return out;
     };
     let (cy0, cy1) = (
@@ -318,27 +318,84 @@ pub fn rasterize_frame_region(
         }
         None => None,
     };
+    // At full opacity with no mask the float blend is exactly integer
+    // arithmetic: `(src*a + bg*(255-a) + 127) / 255` reproduces every one of
+    // the 256^3 (src, bg, alpha) byte triplets the f32 blend can produce
+    // (exhaustively checked), and it avoids three `roundf` calls per pixel.
+    let full_opacity = op == 1.0 && mask_band.is_none();
     for (row, y) in (cy0..=cy1).enumerate() {
-        let dst_row = (y - y0) as usize * rw;
-        for x in cx0..=cx1 {
-            let i = row * band_w + (x - cx0) as usize;
-            let p = &px[i * 4..i * 4 + 4];
-            let mut a = p[3] as f32 / 255.0 * op;
-            if let Some(m) = mask_band {
-                a *= m[i] as f32 / 255.0;
-            }
-            if a <= 0.0 {
-                continue;
-            }
-            let d = (dst_row + (x - x0) as usize) * 4;
-            for ch in 0..3 {
-                out[d + ch] =
-                    (p[ch] as f32 * a + doc.background[ch] as f32 * (1.0 - a)).round() as u8;
-            }
-            out[d + 3] = 255;
+        let i = row * band_w;
+        let dst_at = (y - y0) as usize * rw + (cx0 - x0) as usize;
+        let src_row = &px[i * 4..(i + band_w) * 4];
+        let dst = &mut out[dst_at * 4..(dst_at + band_w) * 4];
+        // A row with no coverage keeps the background already written.
+        if !src_row.as_chunks::<4>().0.iter().any(|p| p[3] != 0) {
+            continue;
+        }
+        match mask_band {
+            None if full_opacity => blend_frame_opaque(dst, src_row, doc.background),
+            None => blend_frame_float(dst, src_row, op, doc.background),
+            Some(m) => blend_frame_masked(dst, src_row, &m[i..i + band_w], op, doc.background),
         }
     }
     out
+}
+
+/// Full-opacity, unmasked row blend — byte-identical to the f32 formula.
+fn blend_frame_opaque(dst: &mut [u8], src: &[u8], bg: [u8; 4]) {
+    let (bg0, bg1, bg2) = (bg[0] as u32, bg[1] as u32, bg[2] as u32);
+    let bg3 = bg[3];
+    for (d, s) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
+        let a = s[3] as u32;
+        let inv = 255 - a;
+        d[0] = ((s[0] as u32 * a + bg0 * inv + 127) / 255) as u8;
+        d[1] = ((s[1] as u32 * a + bg1 * inv + 127) / 255) as u8;
+        d[2] = ((s[2] as u32 * a + bg2 * inv + 127) / 255) as u8;
+        d[3] = if a == 0 { bg3 } else { 255 };
+    }
+}
+
+/// Layer opacity below 1 (no mask): keep the original float math.
+fn blend_frame_float(dst: &mut [u8], src: &[u8], op: f32, bg: [u8; 4]) {
+    let bgf = [bg[0] as f32, bg[1] as f32, bg[2] as f32];
+    for (d, s) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
+        let a = s[3] as f32 / 255.0 * op;
+        let ia = 1.0 - a;
+        d[0] = (s[0] as f32 * a + bgf[0] * ia).round() as u8;
+        d[1] = (s[1] as f32 * a + bgf[1] * ia).round() as u8;
+        d[2] = (s[2] as f32 * a + bgf[2] * ia).round() as u8;
+        d[3] = if a <= 0.0 { bg[3] } else { 255 };
+    }
+}
+
+/// Reveal-mask rows keep the original float math with the mask factor.
+fn blend_frame_masked(dst: &mut [u8], src: &[u8], mask: &[u8], op: f32, bg: [u8; 4]) {
+    let bgf = [bg[0] as f32, bg[1] as f32, bg[2] as f32];
+    for ((d, s), &m) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+        .zip(mask)
+    {
+        let mut a = s[3] as f32 / 255.0 * op;
+        a *= m as f32 / 255.0;
+        let ia = 1.0 - a;
+        d[0] = (s[0] as f32 * a + bgf[0] * ia).round() as u8;
+        d[1] = (s[1] as f32 * a + bgf[1] * ia).round() as u8;
+        d[2] = (s[2] as f32 * a + bgf[2] * ia).round() as u8;
+        d[3] = if a <= 0.0 { bg[3] } else { 255 };
+    }
 }
 
 /// Per-pixel reference for ragged rasters; band reads assume shared geometry.
@@ -997,5 +1054,52 @@ mod tests {
         assert!(export_timelapse(&frames, 0).is_err());
         assert!(export_timelapse(&frames, 61).is_err());
         assert!(export_timelapse(&[(vec![1u8; 5], 8u32, 8u32)], 10).is_err());
+    }
+
+    #[test]
+    fn opaque_frame_rows_match_the_per_pixel_reference() {
+        // Full opacity with no mask takes the integer blend; it must stay
+        // byte-identical to the f32 reference for every alpha value, on a
+        // non-white page, across tile seams and a moved layer.
+        let mut doc = Document::new(600, 300);
+        doc.background = [17, 34, 51, 255];
+        doc.active = 0;
+        let mut dense = Vec::with_capacity(600 * 300 * 4);
+        for y in 0..300u32 {
+            for x in 0..600u32 {
+                dense.extend_from_slice(&[x as u8, (y * 7) as u8, (x ^ y) as u8, (x % 256) as u8]);
+            }
+        }
+        doc.layers[0].pixels = crate::Raster::from_dense(600, 300, 4, &dense);
+        let want = per_pixel_frame(&doc, 0);
+        assert_eq!(rasterize_frame(&doc, 0), want, "opaque full frame");
+        let reg = rasterize_frame_region(&doc, 0, 120, 40, 480, 260);
+        assert_eq!(reg.len(), 361 * 221 * 4);
+        for (ry, y) in (40..=260u32).enumerate() {
+            for (rx, x) in (120..=480u32).enumerate() {
+                let ro = (ry * 361 + rx) * 4;
+                let fo = ((y * 600 + x) * 4) as usize;
+                assert_eq!(&reg[ro..ro + 4], &want[fo..fo + 4], "({x},{y})");
+            }
+        }
+        // A moved layer exercises the band offsets.
+        doc.translate_layer(0, -13, 9);
+        assert_eq!(rasterize_frame(&doc, 0), per_pixel_frame(&doc, 0), "moved");
+    }
+
+    #[test]
+    #[ignore = "exhaustive 16.7M blend check; run when touching the formula"]
+    fn opaque_blend_formula_is_exact() {
+        for alpha in 0..=255u32 {
+            let a = alpha as f32 / 255.0;
+            let ia = 1.0 - a;
+            for src in 0..=255u32 {
+                for bg in 0..=255u32 {
+                    let f = (src as f32 * a + bg as f32 * ia).round() as u8;
+                    let i = ((src * alpha + bg * (255 - alpha) + 127) / 255) as u8;
+                    assert_eq!(f, i, "alpha {alpha}, src {src}, bg {bg}");
+                }
+            }
+        }
     }
 }
