@@ -396,7 +396,7 @@ pub(crate) fn pull_grid(
 }
 
 /// Result of a live transform preview tick (see [`xform_preview`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum XformApply {
     /// Handles off (or nothing to map): nothing was written.
     NoOp,
@@ -406,6 +406,9 @@ pub(crate) enum XformApply {
     Restored,
     /// The pins collapsed (solve failed): the last good preview stays.
     Skipped,
+    /// The resample could not get its memory; the layer is unchanged.
+    /// Carries the reason for the status line.
+    Failed(String),
 }
 
 /// Live-preview session base: the active layer's pixels and mask as they
@@ -538,9 +541,23 @@ pub(crate) fn xform_preview(doc: &mut Document, x: &mut XformState) -> XformAppl
         layer.pixels.clone_from(&b.pixels);
         layer.mask.clone_from(&b.mask);
     }
-    match warp {
+    let applied = match warp {
         Warp::Mesh(g, cols, rows) => doc.warp_layer(active, cols, rows, &g),
         Warp::Pins(src, dst, tris) => doc.warp_layer_tris(active, &src, &dst, &tris),
+    };
+    if let Err(e) = applied {
+        // Out of memory: hand back the base so the gesture shows the
+        // pixels it started from instead of a half-applied warp. The
+        // base revision follows, so the next tick keeps the session.
+        let b = x.base.as_ref().expect("base captured above");
+        let layer = &mut doc.layers[active];
+        layer.pixels.clone_from(&b.pixels);
+        layer.mask.clone_from(&b.mask);
+        doc.mark_full_dirty();
+        if let Some(b) = x.base.as_mut() {
+            b.rev = doc.revision();
+        }
+        return XformApply::Failed(e);
     }
     if let Some(b) = x.base.as_mut() {
         b.rev = doc.revision();

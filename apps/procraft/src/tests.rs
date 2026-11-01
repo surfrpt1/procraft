@@ -1134,7 +1134,7 @@ fn xform_pull_grid_carries_content_from_to_pin() {
     let mut pins = from.clone();
     pins[4] = (6.0, 4.0);
     let grid = pull_grid(&pins, &from, 8.0, 8.0, 2, 2).expect("non-degenerate pins solve");
-    doc.warp_layer(doc.active, 2, 2, &grid);
+    doc.warp_layer(doc.active, 2, 2, &grid).unwrap();
     let o = ((4 * 8 + 6) * 4) as usize;
     assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
 }
@@ -2472,6 +2472,19 @@ fn tform_discrete_press_after_live_drag_opens_a_new_step() {
     tform_button(&mut doc, &mut t, TformOp::SetRotation(20.0));
     assert!(doc.undo());
     assert_eq!(doc.layers[0].pixels, mid);
+}
+
+#[test]
+fn tform_failure_surfaces_as_a_status_message() {
+    let failed = XformApply::Failed("out of memory for 268435456 bytes".to_string());
+    assert_eq!(
+        tform_failure_status(&failed).as_deref(),
+        Some("Transform failed: out of memory for 268435456 bytes")
+    );
+    assert_eq!(tform_failure_status(&XformApply::Applied), None);
+    assert_eq!(tform_failure_status(&XformApply::Restored), None);
+    assert_eq!(tform_failure_status(&XformApply::NoOp), None);
+    assert_eq!(tform_failure_status(&XformApply::Skipped), None);
 }
 
 #[test]

@@ -147,15 +147,16 @@ pub(crate) fn flip_buf_v(buf: &mut [u8], w: usize, h: usize, stride: usize) {
 
 /// Flip a raster in place through the dense bridge: the transform session's
 /// exact pixel permutation works on whole buffers, not tiles.
-pub(crate) fn flip_raster(r: &mut Raster, horizontal: bool) {
+pub(crate) fn flip_raster(r: &mut Raster, horizontal: bool) -> Result<(), String> {
     let (w, h, bpp) = (r.w() as usize, r.h() as usize, r.bpp());
-    let mut d = r.to_dense();
+    let mut d = r.try_to_dense()?;
     if horizontal {
         flip_buf_h(&mut d, w, h, bpp);
     } else {
         flip_buf_v(&mut d, w, h, bpp);
     }
     r.replace_dense(&d);
+    Ok(())
 }
 
 /// Apply one Transform-layer press: compose it onto the session and
@@ -218,33 +219,67 @@ pub(crate) fn tform_apply(
     }
     // Swap the pristine base in (offsets included), apply the flips as
     // exact permutations, then the scale/rotation resample over it.
+    // Everything is allocated into locals first, so a failed allocation
+    // leaves the layer showing its base pixels.
+    let (mut px, mut mask, mut ox, mut oy) = {
+        let b = t.base.as_ref().expect("base captured above");
+        (b.pixels.clone(), b.mask.clone(), b.ox, b.oy)
+    };
+    if t.flip_h {
+        if let Err(e) = flip_raster(&mut px, true) {
+            return XformApply::Failed(e);
+        }
+        if let Some(m) = mask.as_mut() {
+            if let Err(e) = flip_raster(m, true) {
+                return XformApply::Failed(e);
+            }
+        }
+        ox = -ox;
+    }
+    if t.flip_v {
+        if let Err(e) = flip_raster(&mut px, false) {
+            return XformApply::Failed(e);
+        }
+        if let Some(m) = mask.as_mut() {
+            if let Err(e) = flip_raster(m, false) {
+                return XformApply::Failed(e);
+            }
+        }
+        oy = -oy;
+    }
     {
+        let layer = &mut doc.layers[active];
+        layer.pixels = px;
+        layer.mask = mask;
+        layer.ox = ox;
+        layer.oy = oy;
+    }
+    if let Err(e) = doc.affine_layer(active, t.scale, t.degrees) {
         let b = t.base.as_ref().expect("base captured above");
         let layer = &mut doc.layers[active];
         layer.pixels.clone_from(&b.pixels);
         layer.mask.clone_from(&b.mask);
         layer.ox = b.ox;
         layer.oy = b.oy;
-        if t.flip_h {
-            flip_raster(&mut layer.pixels, true);
-            if let Some(m) = layer.mask.as_mut() {
-                flip_raster(m, true);
-            }
-            layer.ox = -layer.ox;
+        doc.mark_full_dirty();
+        if let Some(b) = t.base.as_mut() {
+            b.rev = doc.revision();
         }
-        if t.flip_v {
-            flip_raster(&mut layer.pixels, false);
-            if let Some(m) = layer.mask.as_mut() {
-                flip_raster(m, false);
-            }
-            layer.oy = -layer.oy;
-        }
+        return XformApply::Failed(e);
     }
-    doc.affine_layer(active, t.scale, t.degrees);
     if let Some(b) = t.base.as_mut() {
         b.rev = doc.revision();
     }
     XformApply::Applied
+}
+
+/// Status line for a transform that failed, for the controls that do not
+/// map their result onto their own message (sliders, scale/rotate buttons).
+pub(crate) fn tform_failure_status(r: &XformApply) -> Option<String> {
+    match r {
+        XformApply::Failed(e) => Some(format!("Transform failed: {e}")),
+        _ => None,
+    }
 }
 
 /// One discrete press: its own undo step, gesture closed afterwards.

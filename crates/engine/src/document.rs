@@ -1,7 +1,7 @@
 //! Layers, documents, compositing and undo.
 
 use crate::brush::{slot_span, slot_x};
-use crate::raster::{Raster, TILE};
+use crate::raster::{try_zeroed, Raster, TILE};
 
 /// Write one raster as a v12 tile table: `u32 count`, then per listed
 /// tile `u16 tx, u16 ty, u32 len, len bytes` of zlib-compressed raw tile
@@ -1648,12 +1648,12 @@ impl Document {
             bpp: u32,
             sx: i32,
             sy: i32,
-        ) -> Vec<u8> {
-            let mut out = vec![0u8; (new_w * new_h * bpp) as usize];
+        ) -> Result<Vec<u8>, String> {
+            let mut out = try_zeroed((new_w * new_h * bpp) as usize)?;
             let x0 = (-sx).max(0) as u32;
             let x1 = new_w.min((old_w as i32 - sx).max(0) as u32);
             if x1 <= x0 {
-                return out;
+                return Ok(out);
             }
             let n = ((x1 - x0) * bpp) as usize;
             let src_x = (x0 as i32 + sx) as u32;
@@ -1669,23 +1669,32 @@ impl Document {
                     slot.copy_from_slice(chunk);
                 }
             }
-            out
+            Ok(out)
         }
         let (old_w, old_h) = (self.w, self.h);
-        for layer in self.layers.iter_mut() {
+        // Every buffer is allocated before the canvas is touched: a crop or
+        // resize that cannot get its memory leaves the document as it was.
+        let mut next_layers = Vec::with_capacity(self.layers.len());
+        for layer in self.layers.iter() {
             let (sx, sy) = (-dx - layer.ox, -dy - layer.oy);
-            let dense = layer.pixels.to_dense();
-            let next = carry(&dense, old_w, old_h, new_w, new_h, 4, sx, sy);
-            layer.pixels = Raster::from_dense(new_w, new_h, 4, &next);
-            if let Some(m) = layer.mask.take() {
-                let md = m.to_dense();
-                layer.mask = Some(Raster::from_dense(
-                    new_w,
-                    new_h,
-                    1,
-                    &carry(&md, old_w, old_h, new_w, new_h, 1, sx, sy),
-                ));
-            }
+            let dense = layer.pixels.try_to_dense()?;
+            let px = carry(&dense, old_w, old_h, new_w, new_h, 4, sx, sy)?;
+            let mask = match layer.mask.as_ref() {
+                Some(m) => {
+                    let md = m.try_to_dense()?;
+                    Some(carry(&md, old_w, old_h, new_w, new_h, 1, sx, sy)?)
+                }
+                None => None,
+            };
+            next_layers.push((px, mask));
+        }
+        let next_selection = match self.selection_mask.as_ref() {
+            Some(sm) => Some(carry(sm, old_w, old_h, new_w, new_h, 1, -dx, -dy)?),
+            None => None,
+        };
+        for (layer, (px, mask)) in self.layers.iter_mut().zip(next_layers) {
+            layer.pixels = Raster::from_dense(new_w, new_h, 4, &px);
+            layer.mask = mask.map(|m| Raster::from_dense(new_w, new_h, 1, &m));
             layer.ox = 0;
             layer.oy = 0;
             // A text block's anchor is in canvas pixels: it rides the same
@@ -1696,8 +1705,8 @@ impl Document {
                 b.y += dy as f32;
             }
         }
-        if let Some(sm) = self.selection_mask.take() {
-            self.selection_mask = Some(carry(&sm, old_w, old_h, new_w, new_h, 1, -dx, -dy));
+        if let Some(sm) = next_selection {
+            self.selection_mask = Some(sm);
         }
         // Rect selection rides along; drops when fully outside.
         if let Some((x0, y0, x1, y1)) = self.selection {
@@ -1788,6 +1797,27 @@ impl Document {
         out
     }
 
+    /// Widen a 1-byte mask to RGBA `(v, 0, 0, 255)` for the RGBA resamplers,
+    /// allocating fallibly: a mask pass at 8K would otherwise reserve 256 MiB
+    /// with an infallible `collect`.
+    fn mask_to_rgba(md: &[u8]) -> Result<Vec<u8>, String> {
+        let mut rgba = try_zeroed(md.len() * 4)?;
+        for (i, &v) in md.iter().enumerate() {
+            rgba[i * 4] = v;
+            rgba[i * 4 + 3] = 255;
+        }
+        Ok(rgba)
+    }
+
+    /// Narrow resampled RGBA back to a 1-byte mask (first channel), fallibly.
+    fn rgba_to_mask(rgba: &[u8]) -> Result<Vec<u8>, String> {
+        let mut gray = try_zeroed(rgba.len() / 4)?;
+        for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            gray[i] = px[0];
+        }
+        Ok(gray)
+    }
+
     /// Scale then rotate (degrees clockwise) a layer about the paint's
     /// own center (opaque-pixel bbox; canvas center for empty layers),
     /// so the paint spins/grows in place instead of orbiting the canvas.
@@ -1796,25 +1826,33 @@ impl Document {
     /// call (repeated fractional transforms are inherently lossy — fewer,
     /// deliberate clicks keep paint crisp). Masks travel with their layer.
     /// Caller checkpoints for undo first.
-    pub fn affine_layer(&mut self, index: usize, scale: f32, degrees: f32) {
+    pub fn affine_layer(&mut self, index: usize, scale: f32, degrees: f32) -> Result<(), String> {
         if index >= self.layers.len() || (scale - 1.0).abs() < 1e-6 && degrees.abs() < 1e-6 {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.to_dense();
+        let src = self.layers[index].pixels.try_to_dense()?;
         // Pivot: content bbox center keeps paint in place; empty layers
         // keep the old canvas-center behavior (invisible either way).
         let center = Self::content_center(&src, w, h);
         let pivot = center.unwrap_or((w as f32 * 0.5, h as f32 * 0.5));
         let quarters = (degrees / 90.0).round();
         let exact = (scale - 1.0).abs() < 1e-6 && (degrees - quarters * 90.0).abs() < 1e-3;
-        let out = Self::affine_buffer(&src, w, h, scale, degrees, pivot.0, pivot.1, exact);
+        let out = Self::affine_buffer(&src, w, h, scale, degrees, pivot.0, pivot.1, exact)?;
+        // Mask work is allocated before the paint lands so an out-of-memory
+        // failure leaves the layer untouched.
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let md = m.try_to_dense()?;
+                let rgba = Self::mask_to_rgba(&md)?;
+                let out =
+                    Self::affine_buffer(&rgba, w, h, scale, degrees, pivot.0, pivot.1, exact)?;
+                Some(Self::rgba_to_mask(&out)?)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(m) = self.layers[index].mask.take() {
-            let md = m.to_dense();
-            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
-            let out = Self::affine_buffer(&rgba, w, h, scale, degrees, pivot.0, pivot.1, exact);
-            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        if let Some(gray) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         if center.is_none() {
@@ -1830,6 +1868,7 @@ impl Document {
         // Content path: the buffer rotates about its own center, so the
         // layer offset stays valid untouched (no rounding damage).
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Center of the opaque-pixel bbox as the mean of indices (so the
@@ -1843,11 +1882,12 @@ impl Document {
 
     /// Inclusive opaque-pixel bbox (min x, min y, max x, max y) for a
     /// layer, so on-canvas transforms can cover the drawing instead of
-    /// the whole canvas. None when the layer is empty.
+    /// the whole canvas. None when the layer is empty or cannot be
+    /// measured (an OOM fails the transform rather than aborting it).
     pub fn content_bounds(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
         let (w, h) = (self.w, self.h);
         let layer = self.layers.get(index)?;
-        Self::pixel_bounds(&layer.pixels.to_dense(), w, h)
+        Self::pixel_bounds(&layer.pixels.try_to_dense().ok()?, w, h)
     }
 
     fn pixel_bounds(pixels: &[u8], w: u32, h: u32) -> Option<(f32, f32, f32, f32)> {
@@ -1884,11 +1924,11 @@ impl Document {
         cx: f32,
         cy: f32,
         exact: bool,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, String> {
         let theta = degrees.to_radians();
         let (sin, cos) = theta.sin_cos();
         let s = scale.max(0.01);
-        let mut next = vec![0u8; (w * h * 4) as usize];
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 // Inverse map: destination -> source.
@@ -1911,7 +1951,7 @@ impl Document {
                 }
             }
         }
-        next
+        Ok(next)
     }
 
     /// Corner-pin distort (M43): remap the layer through `quad`, the
@@ -1922,32 +1962,40 @@ impl Document {
     /// valid untouched, and masks travel with their layer. Fractional
     /// pins are lossy by nature — one deliberate gesture per distort
     /// keeps paint crisp. Caller checkpoints for undo first.
-    pub fn distort_layer(&mut self, index: usize, quad: [(f32, f32); 4]) {
+    pub fn distort_layer(&mut self, index: usize, quad: [(f32, f32); 4]) -> Result<(), String> {
         if index >= self.layers.len() {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         if w < 2 || h < 2 {
-            return;
+            return Ok(());
         }
-        let src = self.layers[index].pixels.to_dense();
-        let out = Self::quad_buffer(&src, w, h, &quad);
+        let src = self.layers[index].pixels.try_to_dense()?;
+        let out = Self::quad_buffer(&src, w, h, &quad)?;
+        // Mask work lands before the paint write, so a failed allocation
+        // leaves the layer untouched.
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let md = m.try_to_dense()?;
+                let rgba = Self::mask_to_rgba(&md)?;
+                let out = Self::quad_buffer(&rgba, w, h, &quad)?;
+                Some(Self::rgba_to_mask(&out)?)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(m) = self.layers[index].mask.take() {
-            let md = m.to_dense();
-            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
-            let out = Self::quad_buffer(&rgba, w, h, &quad);
-            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        if let Some(gray) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Shared corner-pin resampler: destination (x, y) samples the
     /// bilinear blend of `quad` at (x/(w-1), y/(h-1)).
-    fn quad_buffer(src: &[u8], w: u32, h: u32, quad: &[(f32, f32); 4]) -> Vec<u8> {
+    fn quad_buffer(src: &[u8], w: u32, h: u32, quad: &[(f32, f32); 4]) -> Result<Vec<u8>, String> {
         let (w1, h1) = (w as f32 - 1.0, h as f32 - 1.0);
-        let mut next = vec![0u8; (w * h * 4) as usize];
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 let u = x as f32 / w1;
@@ -1966,7 +2014,7 @@ impl Document {
                 }
             }
         }
-        next
+        Ok(next)
     }
 
     /// Warp mesh (M44): remap the layer through a `cols` x `rows` cell
@@ -1977,28 +2025,40 @@ impl Document {
     /// pulls paint locally — distort's freeform sibling. Same canvas-space
     /// conventions as `distort_layer`: offsets untouched, masks travel.
     /// Caller checkpoints for undo first.
-    pub fn warp_layer(&mut self, index: usize, cols: u32, rows: u32, grid: &[(f32, f32)]) {
+    pub fn warp_layer(
+        &mut self,
+        index: usize,
+        cols: u32,
+        rows: u32,
+        grid: &[(f32, f32)],
+    ) -> Result<(), String> {
         if index >= self.layers.len() || cols < 1 || rows < 1 {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         if w < 2 || h < 2 {
-            return;
+            return Ok(());
         }
         if grid.len() != ((cols + 1) * (rows + 1)) as usize {
-            return;
+            return Ok(());
         }
-        let src = self.layers[index].pixels.to_dense();
-        let out = Self::warp_buffer(&src, w, h, cols, rows, grid);
+        let src = self.layers[index].pixels.try_to_dense()?;
+        let out = Self::warp_buffer(&src, w, h, cols, rows, grid)?;
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let md = m.try_to_dense()?;
+                let rgba = Self::mask_to_rgba(&md)?;
+                let out = Self::warp_buffer(&rgba, w, h, cols, rows, grid)?;
+                Some(Self::rgba_to_mask(&out)?)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(m) = self.layers[index].mask.take() {
-            let md = m.to_dense();
-            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
-            let out = Self::warp_buffer(&rgba, w, h, cols, rows, grid);
-            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        if let Some(gray) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Shared warp resampler: destination (x, y) maps into lattice space,
@@ -2010,9 +2070,9 @@ impl Document {
         cols: u32,
         rows: u32,
         grid: &[(f32, f32)],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, String> {
         let stride = (cols + 1) as usize;
-        let mut next = vec![0u8; (w * h * 4) as usize];
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 let gx = (x as f32 / w as f32 * cols as f32).clamp(0.0, cols as f32 - 1e-6);
@@ -2034,7 +2094,7 @@ impl Document {
                 }
             }
         }
-        next
+        Ok(next)
     }
 
     /// Pin warp for a triangle mesh: `src` and `dst` hold matching pin
@@ -2053,32 +2113,38 @@ impl Document {
         src: &[(f32, f32)],
         dst: &[(f32, f32)],
         tris: &[[u32; 3]],
-    ) {
+    ) -> Result<(), String> {
         if index >= self.layers.len() || src.len() != dst.len() || src.len() < 3 {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         if w < 2 || h < 2 {
-            return;
+            return Ok(());
         }
         let n = src.len() as u32;
         if tris.is_empty() || tris.iter().any(|t| t.iter().any(|&i| i >= n)) {
-            return;
+            return Ok(());
         }
         if src == dst {
-            return;
+            return Ok(());
         }
-        let pixels = self.layers[index].pixels.to_dense();
-        let out = Self::tri_buffer(&pixels, w, h, src, dst, tris);
+        let pixels = self.layers[index].pixels.try_to_dense()?;
+        let out = Self::tri_buffer(&pixels, w, h, src, dst, tris)?;
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let md = m.try_to_dense()?;
+                let rgba = Self::mask_to_rgba(&md)?;
+                let out = Self::tri_buffer(&rgba, w, h, src, dst, tris)?;
+                Some(Self::rgba_to_mask(&out)?)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(m) = self.layers[index].mask.take() {
-            let md = m.to_dense();
-            let rgba: Vec<u8> = md.iter().flat_map(|&v| [v, 0, 0, 255]).collect();
-            let out = Self::tri_buffer(&rgba, w, h, src, dst, tris);
-            let gray: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        if let Some(gray) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
         }
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Shared pin-warp resampler: rasterize each destination triangle,
@@ -2092,8 +2158,8 @@ impl Document {
         src: &[(f32, f32)],
         dst: &[(f32, f32)],
         tris: &[[u32; 3]],
-    ) -> Vec<u8> {
-        let mut next = vec![0u8; (w * h * 4) as usize];
+    ) -> Result<Vec<u8>, String> {
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for t in tris {
             let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
             let (ax, ay) = dst[i0];
@@ -2131,18 +2197,18 @@ impl Document {
                 }
             }
         }
-        next
+        Ok(next)
     }
 
     /// Mirror a layer left-right in place. Masks travel with their layer.
     /// Caller checkpoints for undo first.
-    pub fn flip_layer_horizontal(&mut self, index: usize) {
+    pub fn flip_layer_horizontal(&mut self, index: usize) -> Result<(), String> {
         if index >= self.layers.len() {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.to_dense();
-        let mut next = vec![0u8; (w * h * 4) as usize];
+        let src = self.layers[index].pixels.try_to_dense()?;
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 let s = ((y * w + (w - 1 - x)) * 4) as usize;
@@ -2150,32 +2216,39 @@ impl Document {
                 next[d..d + 4].copy_from_slice(&src[s..s + 4]);
             }
         }
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let m = m.try_to_dense()?;
+                let mut nm = try_zeroed((w * h) as usize)?;
+                for y in 0..h {
+                    for x in 0..w {
+                        nm[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
+                    }
+                }
+                Some(nm)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].ox = -self.layers[index].ox;
-        if let Some(m) = self.layers[index].mask.take() {
-            let m = m.to_dense();
-            let mut nm = vec![0u8; (w * h) as usize];
-            for y in 0..h {
-                for x in 0..w {
-                    nm[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
-                }
-            }
+        if let Some(nm) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
         }
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Flip a layer top-bottom in place. Masks travel with their layer.
     /// Caller checkpoints for undo first.
-    pub fn flip_layer_vertical(&mut self, index: usize) {
+    pub fn flip_layer_vertical(&mut self, index: usize) -> Result<(), String> {
         if index >= self.layers.len() {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.to_dense();
-        let mut next = vec![0u8; (w * h * 4) as usize];
+        let src = self.layers[index].pixels.try_to_dense()?;
+        let mut next = try_zeroed((w * h * 4) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 let s = (((h - 1 - y) * w + x) * 4) as usize;
@@ -2183,21 +2256,28 @@ impl Document {
                 next[d..d + 4].copy_from_slice(&src[s..s + 4]);
             }
         }
+        let mask = match self.layers[index].mask.as_ref() {
+            Some(m) => {
+                let m = m.try_to_dense()?;
+                let mut nm = try_zeroed((w * h) as usize)?;
+                for y in 0..h {
+                    for x in 0..w {
+                        nm[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
+                    }
+                }
+                Some(nm)
+            }
+            None => None,
+        };
         self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].oy = -self.layers[index].oy;
-        if let Some(m) = self.layers[index].mask.take() {
-            let m = m.to_dense();
-            let mut nm = vec![0u8; (w * h) as usize];
-            for y in 0..h {
-                for x in 0..w {
-                    nm[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
-                }
-            }
+        if let Some(nm) = mask {
             self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
         }
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Copy the active layer's sibling: insert a clone right above `index`
@@ -2219,26 +2299,30 @@ impl Document {
     /// the destination layer's own content (its mask included).
     /// Returns false on the bottom layer or a bad index.
     /// Caller checkpoints for undo first.
-    pub fn merge_down(&mut self, index: usize) -> bool {
+    pub fn merge_down(&mut self, index: usize) -> Result<bool, String> {
         if index == 0 || index >= self.layers.len() {
-            return false;
+            return Ok(false);
         }
         let src = self.layers[index].clone();
-        let src_px = src.pixels.to_dense();
-        let src_mask = src.mask.as_ref().map(|m| m.to_dense());
+        let src_px = src.pixels.try_to_dense()?;
+        let src_mask = match src.mask.as_ref() {
+            Some(m) => Some(m.try_to_dense()?),
+            None => None,
+        };
         let sa_base = if self.is_layer_shown(index) {
             src.opacity.clamp(0.0, 1.0)
         } else {
             0.0
         };
         let (w, h) = (self.w, self.h);
-        // The composite bakes the destination's rendered text: the result is
-        // a plain pixel layer, never editable text (a text source above
-        // vanishes with `src`). Pixels already match, so only the block drops.
-        self.layers[index - 1].text = None;
-        let dst = &mut self.layers[index - 1];
-        let mut dst_px = dst.pixels.to_dense();
-        let dst_mask = dst.mask.as_ref().map(|m| m.to_dense());
+        // Every buffer is allocated before the document changes, so a
+        // failed merge leaves both layers exactly as they were.
+        let dst = &self.layers[index - 1];
+        let mut dst_px = dst.pixels.try_to_dense()?;
+        let dst_mask = match dst.mask.as_ref() {
+            Some(m) => Some(m.try_to_dense()?),
+            None => None,
+        };
         let (dox, doy) = (dst.ox, dst.oy);
         for y in 0..h {
             for x in 0..w {
@@ -2290,11 +2374,15 @@ impl Document {
                 }
             }
         }
-        dst.pixels.replace_dense(&dst_px);
+        // The composite bakes the destination's rendered text: the result is
+        // a plain pixel layer, never editable text (a text source above
+        // vanishes with `src`). Pixels already match, so only the block drops.
+        self.layers[index - 1].text = None;
+        self.layers[index - 1].pixels.replace_dense(&dst_px);
         self.layers.remove(index);
         self.active = index - 1;
         self.mark_full_dirty();
-        true
+        Ok(true)
     }
 
     /// Drop text layer `index`'s vector source, leaving its rendered pixels
@@ -6337,7 +6425,7 @@ mod tests {
         // Mask hides the right pixel of the top layer.
         doc.layers[1].mask.as_mut().unwrap().set(1, 0);
         doc.layers[1].clip = true;
-        assert!(doc.merge_down(1));
+        assert!(doc.merge_down(1).unwrap());
         // Left: red over blue = red. Right: top hidden by mask AND outside
         // the blue content, so it stays transparent.
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
@@ -6353,12 +6441,12 @@ mod tests {
         // With offsets, mask data doesn't move; offset changes instead.
         assert_eq!(doc.layers[0].ox, 1);
         assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(0), 0);
-        doc.flip_layer_horizontal(0);
+        doc.flip_layer_horizontal(0).unwrap();
         // 4-pixel wide: horizontal flip mirrors mask indices 0<->3, 1<->2.
         assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(3), 0);
         assert_eq!(doc.layers[0].ox, -1);
         // Affine keeps dimensions and mask presence.
-        doc.affine_layer(0, 1.0, 90.0);
+        doc.affine_layer(0, 1.0, 90.0).unwrap();
         assert!(doc.layers[0].mask.is_some());
         assert_eq!(doc.layers[0].mask.as_ref().unwrap().len(), 4);
     }
@@ -6543,11 +6631,11 @@ mod tests {
     fn flip_horizontal_mirrors_pixels() {
         let mut doc = Document::new(4, 1);
         doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
-        doc.flip_layer_horizontal(0);
+        doc.flip_layer_horizontal(0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(12), [255, 0, 0, 255]);
         assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 0, 0]);
         // Double flip restores.
-        doc.flip_layer_horizontal(0);
+        doc.flip_layer_horizontal(0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
@@ -6555,9 +6643,9 @@ mod tests {
     fn flip_vertical_mirrors_pixels() {
         let mut doc = Document::new(1, 4);
         doc.layers[0].pixels.set4(0, [0, 255, 0, 255]);
-        doc.flip_layer_vertical(0);
+        doc.flip_layer_vertical(0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(12), [0, 255, 0, 255]);
-        doc.flip_layer_vertical(0);
+        doc.flip_layer_vertical(0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [0, 255, 0, 255]);
     }
 
@@ -6659,7 +6747,7 @@ mod tests {
         doc.add_layer("top".to_string());
         doc.layers[1].pixels.set4(0, [255, 0, 0, 255]);
         doc.layers[1].ox = 1;
-        assert!(doc.merge_down(1));
+        assert!(doc.merge_down(1).unwrap());
         // Red baked at canvas 1 (buffer 1), blue kept at canvas 0.
         assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 255, 255]);
         assert_eq!(doc.layers[0].pixels.get4(4), [255, 0, 0, 255]);
@@ -6671,9 +6759,9 @@ mod tests {
         let mut doc = Document::new(8, 8);
         doc.layers[0].ox = 3;
         doc.layers[0].oy = -2;
-        doc.flip_layer_horizontal(0);
+        doc.flip_layer_horizontal(0).unwrap();
         assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (-3, -2));
-        doc.flip_layer_vertical(0);
+        doc.flip_layer_vertical(0).unwrap();
         assert_eq!((doc.layers[0].ox, doc.layers[0].oy), (-3, 2));
     }
 
@@ -6759,10 +6847,10 @@ mod tests {
         let mut doc = Document::new(8, 8);
         doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
-        doc.affine_layer(0, 1.0, 0.0);
+        doc.affine_layer(0, 1.0, 0.0).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
         // 2x zoom of solid color stays solid.
-        doc.affine_layer(0, 2.0, 0.0);
+        doc.affine_layer(0, 2.0, 0.0).unwrap();
         assert!(doc.layers[0]
             .pixels
             .to_dense()
@@ -6804,7 +6892,7 @@ mod tests {
         let before = opaque_bbox_center(&doc);
         assert!((before.0 - 16.0).abs() < 1.0 && (before.1 - 16.0).abs() < 1.0);
         let painted = doc.layers[0].pixels.clone();
-        doc.affine_layer(0, 1.0, 15.0);
+        doc.affine_layer(0, 1.0, 15.0).unwrap();
         // Rotation applied (corners moved) but the paint stayed put.
         assert_ne!(doc.layers[0].pixels, painted);
         let after = opaque_bbox_center(&doc);
@@ -6813,7 +6901,7 @@ mod tests {
             "before={before:?} after={after:?}"
         );
         // Scale grows about the same center.
-        doc.affine_layer(0, 1.25, 0.0);
+        doc.affine_layer(0, 1.25, 0.0).unwrap();
         let grown = opaque_bbox_center(&doc);
         assert!(
             (grown.0 - before.0).abs() <= 3.0 && (grown.1 - before.1).abs() <= 3.0,
@@ -6839,7 +6927,7 @@ mod tests {
         }
         let before = doc.layers[0].pixels.clone();
         let count: usize = before.to_dense().chunks(4).filter(|p| p[3] != 0).count();
-        doc.affine_layer(0, 1.0, 90.0);
+        doc.affine_layer(0, 1.0, 90.0).unwrap();
         assert_eq!(
             doc.layers[0]
                 .pixels
@@ -6851,7 +6939,7 @@ mod tests {
         );
         // Four quarter-turns return every byte exactly.
         for _ in 0..3 {
-            doc.affine_layer(0, 1.0, 90.0);
+            doc.affine_layer(0, 1.0, 90.0).unwrap();
         }
         assert_eq!(doc.layers[0].pixels, before);
     }
@@ -6861,7 +6949,8 @@ mod tests {
         let mut doc = Document::new(8, 8);
         doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
-        doc.distort_layer(0, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        doc.distort_layer(0, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)])
+            .unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -6875,12 +6964,14 @@ mod tests {
         let mut m = vec![0u8; 64];
         m[0] = 255;
         doc.layers[0].mask = Some(px_mask(&doc, &(m)));
-        doc.distort_layer(0, [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        doc.distort_layer(0, [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)])
+            .unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [0, 0, 0, 0]);
         assert_eq!(doc.layers[0].mask.as_ref().unwrap().get(0), 0);
         // Bad index is a silent no-op, never a panic.
         let before = doc.layers[0].pixels.clone();
-        doc.distort_layer(9, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)]);
+        doc.distort_layer(9, [(0.0, 0.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)])
+            .unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -6888,7 +6979,8 @@ mod tests {
     fn distort_degenerate_canvas_is_noop() {
         let mut doc = Document::new(1, 1);
         doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
-        doc.distort_layer(0, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        doc.distort_layer(0, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
+            .unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
@@ -6908,7 +7000,7 @@ mod tests {
         doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let grid = identity_lattice(8.0, 8.0, 2, 2);
-        doc.warp_layer(0, 2, 2, &grid);
+        doc.warp_layer(0, 2, 2, &grid).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -6925,7 +7017,7 @@ mod tests {
         let mut grid = identity_lattice(8.0, 8.0, 2, 2);
         // Row-major (row 1, col 1) of the 3-wide lattice.
         grid[4] = (0.0, 0.0);
-        doc.warp_layer(0, 2, 2, &grid);
+        doc.warp_layer(0, 2, 2, &grid).unwrap();
         let o = ((4 * 8 + 4) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get4(o), [255, 0, 0, 255]);
         assert_eq!(
@@ -6938,7 +7030,7 @@ mod tests {
         );
         // Bad grid (wrong point count) is a silent no-op.
         let before = doc.layers[0].pixels.clone();
-        doc.warp_layer(0, 2, 2, &[(0.0, 0.0)]);
+        doc.warp_layer(0, 2, 2, &[(0.0, 0.0)]).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -6946,7 +7038,8 @@ mod tests {
     fn warp_degenerate_canvas_is_noop() {
         let mut doc = Document::new(1, 1);
         doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
-        doc.warp_layer(0, 1, 1, &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        doc.warp_layer(0, 1, 1, &[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
+            .unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
@@ -6968,7 +7061,7 @@ mod tests {
         doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
-        doc.warp_layer_tris(0, &src, &src, &TRI_FAN);
+        doc.warp_layer_tris(0, &src, &src, &TRI_FAN).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -6985,7 +7078,7 @@ mod tests {
         doc.layers[0].mask = Some(px_mask(&doc, &(m)));
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
-        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
+        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN).unwrap();
         let d = ((2 * 8 + 2) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get4(d), [255, 0, 0, 255]);
         assert_eq!(
@@ -7008,7 +7101,7 @@ mod tests {
         doc.layers[0].pixels.set4(0, [255, 0, 0, 255]);
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
         let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
-        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN);
+        doc.warp_layer_tris(0, &src, &dst, &TRI_FAN).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
@@ -7018,13 +7111,13 @@ mod tests {
         doc.layers[0].pixels.fill(100);
         let before = doc.layers[0].pixels.clone();
         let src = tri_pins(8.0, 8.0, (4.0, 4.0));
-        doc.warp_layer_tris(9, &src, &src, &TRI_FAN);
-        doc.warp_layer_tris(0, &src, &src[..3], &TRI_FAN);
-        doc.warp_layer_tris(0, &src, &src, &[[0, 1, 99]]);
-        doc.warp_layer_tris(0, &src, &src, &[]);
+        doc.warp_layer_tris(9, &src, &src, &TRI_FAN).unwrap();
+        doc.warp_layer_tris(0, &src, &src[..3], &TRI_FAN).unwrap();
+        doc.warp_layer_tris(0, &src, &src, &[[0, 1, 99]]).unwrap();
+        doc.warp_layer_tris(0, &src, &src, &[]).unwrap();
         let mut flat = Document::new(1, 1);
         flat.layers[0].pixels.set4(0, [255, 0, 0, 255]);
-        flat.warp_layer_tris(0, &src, &src, &TRI_FAN);
+        flat.warp_layer_tris(0, &src, &src, &TRI_FAN).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
         assert_eq!(flat.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
@@ -7041,6 +7134,83 @@ mod tests {
             .set(((5 * 8 + 6) * 4 + 3) as usize, 255);
         assert_eq!(doc.content_bounds(0), Some((2.0, 3.0, 6.0, 5.0)));
         assert_eq!(doc.content_bounds(9), None);
+    }
+
+    /// A document with paint, a mask, an offset and a layer above it, so
+    /// every transform has real work and real buffers to allocate.
+    fn oom_doc() -> Document {
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].pixels.set4(0, [10, 20, 30, 255]);
+        doc.layers[0]
+            .pixels
+            .set4(((7 * 8 + 7) * 4) as usize, [40, 50, 60, 255]);
+        doc.add_mask(0);
+        doc.layers[0].mask.as_mut().unwrap().set(0, 0);
+        doc.layers[0].ox = 2;
+        doc.layers[0].oy = 1;
+        doc.add_layer("top".to_string());
+        doc.layers[1].pixels.set4(0, [1, 2, 3, 255]);
+        doc.active = 0;
+        doc
+    }
+
+    type Snapshot = (
+        Vec<Vec<u8>>,
+        Vec<Option<Vec<u8>>>,
+        Vec<(i32, i32)>,
+        u32,
+        u32,
+    );
+
+    fn snapshot(doc: &Document) -> Snapshot {
+        (
+            doc.layers.iter().map(|l| l.pixels.to_dense()).collect(),
+            doc.layers
+                .iter()
+                .map(|l| l.mask.as_ref().map(|m| m.to_dense()))
+                .collect(),
+            doc.layers.iter().map(|l| (l.ox, l.oy)).collect(),
+            doc.w,
+            doc.h,
+        )
+    }
+
+    /// Make every fallible buffer allocation of `op` fail in turn: each
+    /// failure must come back as an error with the document untouched, so
+    /// a tablet that runs out of memory mid-gesture keeps its pixels.
+    fn assert_oom_is_atomic(mut op: impl FnMut(&mut Document) -> Result<(), String>) {
+        use crate::raster::with_failed_alloc;
+        let mut failures = 0;
+        for nth in 0..12 {
+            let mut doc = oom_doc();
+            let before = snapshot(&doc);
+            match with_failed_alloc(nth, || op(&mut doc)) {
+                Err(e) => {
+                    assert!(e.contains("out of memory"), "nth {nth}: {e}");
+                    assert_eq!(snapshot(&doc), before, "nth {nth} left the doc changed");
+                    failures += 1;
+                }
+                Ok(()) => break,
+            }
+        }
+        assert!(failures > 0, "the op took no fallible allocation");
+    }
+
+    #[test]
+    fn transform_allocation_failures_leave_the_document_untouched() {
+        assert_oom_is_atomic(|d| d.affine_layer(0, 1.5, 30.0));
+        assert_oom_is_atomic(|d| {
+            d.distort_layer(0, [(4.0, 4.0), (7.0, 0.0), (7.0, 7.0), (0.0, 7.0)])
+        });
+        let grid = identity_lattice(8.0, 8.0, 2, 2);
+        assert_oom_is_atomic(|d| d.warp_layer(0, 2, 2, &grid));
+        let src = tri_pins(8.0, 8.0, (4.0, 4.0));
+        let dst = tri_pins(8.0, 8.0, (2.0, 2.0));
+        assert_oom_is_atomic(|d| d.warp_layer_tris(0, &src, &dst, &TRI_FAN));
+        assert_oom_is_atomic(|d| d.flip_layer_horizontal(0));
+        assert_oom_is_atomic(|d| d.flip_layer_vertical(0));
+        assert_oom_is_atomic(|d| d.merge_down(1).map(|_| ()));
+        assert_oom_is_atomic(|d| d.rehome_canvas(6, 6, 1, 1));
     }
 
     #[test]
@@ -7322,18 +7492,18 @@ mod tests {
         doc.layers[0].pixels = px_rgba(&doc, &[0, 0, 255, 255, 0, 0, 255, 255]);
         doc.add_layer("top".to_string());
         doc.layers[1].pixels = px_rgba(&doc, &[255, 0, 0, 255, 0, 0, 0, 0]);
-        assert!(doc.merge_down(1));
+        assert!(doc.merge_down(1).unwrap());
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.active, 0);
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
         assert_eq!(doc.layers[0].pixels.get4(4), [0, 0, 255, 255]);
         // Bottom layer refuses.
-        assert!(!doc.merge_down(0));
+        assert!(!doc.merge_down(0).unwrap());
         // Invisible top contributes nothing but still merges away.
         doc.add_layer("ghost".to_string());
         doc.layers[1].visible = false;
         doc.layers[1].pixels = px_rgba(&doc, &[0, 255, 0, 255, 0, 255, 0, 255]);
-        assert!(doc.merge_down(1));
+        assert!(doc.merge_down(1).unwrap());
         assert_eq!(doc.layers[0].pixels.get4(0), [255, 0, 0, 255]);
     }
 
@@ -8629,7 +8799,7 @@ mod tests {
         };
         let (idx, ..) = doc.add_text_layer("T", block).unwrap();
         doc.add_layer("Layer over".into()); // becomes index idx+1
-        assert!(doc.merge_down(idx + 1));
+        assert!(doc.merge_down(idx + 1).unwrap());
         // The baked result must not pretend to still be editable text.
         assert!(!doc.layers[idx].is_text());
     }

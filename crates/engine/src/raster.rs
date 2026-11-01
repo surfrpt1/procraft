@@ -19,11 +19,43 @@ const MAX_SIDE: u32 = 16384;
 /// aborts the process on OOM, which is the wrong answer for a big export
 /// on a tablet where the app can still show an error.
 pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, String> {
+    #[cfg(test)]
+    if fail_next_allocation() {
+        return Err("out of memory (injected test failure)".to_string());
+    }
     let mut buf = Vec::new();
     buf.try_reserve_exact(len)
         .map_err(|e| format!("out of memory for {len} bytes: {e}"))?;
     buf.resize(len, 0);
     Ok(buf)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: the n-th fallible allocation from now
+    /// fails (0 = the next one), so out-of-memory paths can be exercised
+    /// without actually exhausting the machine.
+    static FAIL_ALLOC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_next_allocation() -> bool {
+    FAIL_ALLOC.with(|c| {
+        let Some(n) = c.get() else {
+            return false;
+        };
+        c.set(Some(n.saturating_sub(1)));
+        n == 0
+    })
+}
+
+/// Run `f` with its `nth` fallible allocation (0-based) failing.
+#[cfg(test)]
+pub(crate) fn with_failed_alloc<T>(nth: usize, f: impl FnOnce() -> T) -> T {
+    FAIL_ALLOC.with(|c| c.set(Some(nth)));
+    let out = f();
+    FAIL_ALLOC.with(|c| c.set(None));
+    out
 }
 
 #[derive(Clone)]

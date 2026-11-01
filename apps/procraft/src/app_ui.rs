@@ -1923,11 +1923,17 @@ impl eframe::App for ProCraftApp {
                                 let (shift, alt) =
                                     ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
                                 self.xform.drag_by_mod(dx, dy, shift, alt);
-                                if !self.text_paint_blocked()
-                                    && xform_preview(&mut self.doc, &mut self.xform)
-                                        == XformApply::Skipped
-                                {
-                                    self.status = "Pins overlap — transform skipped.".to_string();
+                                if !self.text_paint_blocked() {
+                                    match xform_preview(&mut self.doc, &mut self.xform) {
+                                        XformApply::Skipped => {
+                                            self.status =
+                                                "Pins overlap — transform skipped.".to_string();
+                                        }
+                                        XformApply::Failed(e) => {
+                                            self.status = format!("Transform failed: {e}");
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             } else if let Some((start, _)) = self.xform.marquee {
                                 self.xform.marquee = Some((start, (x, y)));
@@ -1947,6 +1953,7 @@ impl eframe::App for ProCraftApp {
                                         "Pins overlap — transform skipped.".to_string()
                                     }
                                     XformApply::Restored => "Transform reset.".to_string(),
+                                    XformApply::Failed(e) => format!("Transform failed: {e}"),
                                     XformApply::Applied => match self.xform.mode {
                                         XformMode::Mesh => "Mesh warp applied.".to_string(),
                                         _ => "Transform applied.".to_string(),

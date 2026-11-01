@@ -1035,9 +1035,13 @@ impl ProCraftApp {
             .clicked()
         {
             let active = self.doc.active;
-            if self.doc.merge_down(active) {
-                self.ghost_dirty = true;
-                self.status = "Merged down.".to_string();
+            match self.doc.merge_down(active) {
+                Ok(true) => {
+                    self.ghost_dirty = true;
+                    self.status = "Merged down.".to_string();
+                }
+                Ok(false) => {}
+                Err(e) => self.status = format!("Merge failed: {e}"),
             }
         }
         let can_raster = self
@@ -1710,12 +1714,15 @@ impl ProCraftApp {
                             .text("Size"),
                         );
                         if size.changed() {
-                            tform_apply(
+                            let r = tform_apply(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::SetScale(scale_pct),
                                 true,
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                         if size.drag_stopped() || (size.changed() && !size.dragged()) {
                             self.tform_press.end_gesture();
@@ -1728,12 +1735,15 @@ impl ProCraftApp {
                                 .text("Angle"),
                         );
                         if turn.changed() {
-                            tform_apply(
+                            let r = tform_apply(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::SetRotation(angle),
                                 true,
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                         if turn.drag_stopped() || (turn.changed() && !turn.dragged()) {
                             self.tform_press.end_gesture();
@@ -1745,18 +1755,24 @@ impl ProCraftApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Scale +").clicked() && !self.text_paint_blocked() {
-                            tform_button(
+                            let r = tform_button(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::Scale(1.25),
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                         if ui.button("Scale −").clicked() && !self.text_paint_blocked() {
-                            tform_button(
+                            let r = tform_button(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::Scale(1.0 / 1.25),
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1769,11 +1785,14 @@ impl ProCraftApp {
                             .clicked()
                             && !self.text_paint_blocked()
                         {
-                            tform_button(
+                            let r = tform_button(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::Rotate(-15.0),
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                         if ui
                             .button(if self.has_symbols {
@@ -1784,11 +1803,14 @@ impl ProCraftApp {
                             .clicked()
                             && !self.text_paint_blocked()
                         {
-                            tform_button(
+                            let r = tform_button(
                                 &mut self.doc,
                                 &mut self.tform_press,
                                 TformOp::Rotate(15.0),
                             );
+                            if let Some(msg) = tform_failure_status(&r) {
+                                self.status = msg;
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1801,6 +1823,7 @@ impl ProCraftApp {
                                 XformApply::Restored => {
                                     "Layer flip reset (back to the session start).".to_string()
                                 }
+                                XformApply::Failed(e) => format!("Transform failed: {e}"),
                                 _ => "Layer flipped horizontally.".to_string(),
                             };
                         }
@@ -1813,6 +1836,7 @@ impl ProCraftApp {
                                 XformApply::Restored => {
                                     "Layer flip reset (back to the session start).".to_string()
                                 }
+                                XformApply::Failed(e) => format!("Transform failed: {e}"),
                                 _ => "Layer flipped vertically.".to_string(),
                             };
                         }
