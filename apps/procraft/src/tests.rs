@@ -441,8 +441,12 @@ fn tool_ring_size_uses_the_tools_own_size() {
 fn bar_layout_splits_at_phone_width() {
     assert_eq!(bar_layout(320.0, true), BarLayout::Narrow);
     assert_eq!(bar_layout(599.0, true), BarLayout::Narrow);
+    // The tablet islands need ~708 pt, so narrower touch screens keep the
+    // scrolling phone strip instead of drawing two colliding islands.
+    assert_eq!(bar_layout(TABLET_MIN_W - 1.0, true), BarLayout::Narrow);
+    assert_eq!(bar_layout(TABLET_MIN_W, true), BarLayout::Tablet);
     assert_eq!(bar_layout(360.0, false), BarLayout::Narrow);
-    assert_eq!(bar_layout(600.0, true), BarLayout::Tablet);
+    assert_eq!(bar_layout(744.0, true), BarLayout::Tablet);
     assert_eq!(bar_layout(820.0, true), BarLayout::Tablet);
     assert_eq!(bar_layout(844.0, true), BarLayout::Tablet);
     assert_eq!(bar_layout(600.0, false), BarLayout::Wide);
@@ -578,6 +582,48 @@ fn capsule_width_nearly_fills_phones_and_caps_on_tablets() {
 fn islands_are_one_control_row_plus_frame_margin() {
     assert_eq!(mobile_island_height(44.0), 56.0);
     assert_eq!(mobile_island_height(36.0), 48.0);
+}
+
+#[test]
+fn tablet_top_islands_fit_the_narrowest_portrait_tablet() {
+    // The two islands are anchored to opposite sides; if their controls
+    // need more than the viewport they overlap (iPad mini portrait is
+    // 744 pt). Measure with the real font, exactly like the pills do.
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(Default::default(), |_| {});
+    out.textures_delta.clear();
+    let t = design::tokens(Theme::Dark, BarLayout::Tablet);
+    let measure = |label: &str| {
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::proportional(t.type_body),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        })
+    };
+    let (left, right) = mobile_ui::tablet_island_widths(&t, measure);
+    let need = left + right + 2.0 * 12.0;
+    assert!(
+        need + t.gap <= TABLET_MIN_W,
+        "islands need {need} pt, no room for a gap at the {TABLET_MIN_W} pt threshold"
+    );
+    assert!(
+        need + t.gap <= 744.0,
+        "iPad mini portrait (744 pt) cannot fit the islands: {need} pt"
+    );
+}
+
+#[test]
+fn stylus_force_is_calibrated_toward_a_normal_press() {
+    // Pencil force is a fraction of ~4 N, so a normal drawing press must
+    // lift into the usable range; the endpoints stay exact.
+    assert_eq!(calibrate_force(0.0), 0.0);
+    assert_eq!(calibrate_force(1.0), 1.0);
+    assert!((calibrate_force(0.25) - 0.5).abs() < 0.001);
+    assert!(calibrate_force(0.3) > 0.5 && calibrate_force(0.3) < 0.6);
 }
 
 #[test]

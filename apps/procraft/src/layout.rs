@@ -365,8 +365,16 @@ pub(crate) fn brush_ring_radius(size: f32, zoom: f32) -> f32 {
 
 pub(crate) const WIDE_BAR_W: f32 = 600.0;
 
+/// Touch devices below this width take the phone strip instead of the two
+/// floating top islands: at the tablet padding the islands need ~728 pt
+/// counting the side pads and the gap between them, and the strip scrolls
+/// instead of colliding. iPad mini portrait (744 pt) is the narrowest
+/// tablet that keeps the islands.
+pub(crate) const TABLET_MIN_W: f32 = 736.0;
+
 pub(crate) fn bar_layout(width: f32, mobile: bool) -> BarLayout {
-    if width < WIDE_BAR_W {
+    let narrow_below = if mobile { TABLET_MIN_W } else { WIDE_BAR_W };
+    if width < narrow_below {
         BarLayout::Narrow
     } else if mobile {
         BarLayout::Tablet

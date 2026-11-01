@@ -4,6 +4,34 @@ use crate::*;
 /// close it before the tap landed. An outside tap still dismisses.
 const CLOSE_OUT: egui::PopupCloseBehavior = egui::PopupCloseBehavior::CloseOnClickOutside;
 
+/// Inner margin around a floating island's control row.
+pub(crate) const ISLAND_PAD: f32 = 6.0;
+
+/// Width the two tablet top islands need for their controls. `measure`
+/// returns the text width of a label; the fit test supplies the real font.
+/// Keep in step with the controls drawn in `mobile_chrome`: the islands are
+/// anchored to opposite sides, so anything wider than the viewport makes
+/// them overlap.
+#[cfg(test)]
+pub(crate) fn tablet_island_widths(
+    t: &design::Tokens,
+    measure: impl Fn(&str) -> f32,
+) -> (f32, f32) {
+    const LEFT: [&str; 4] = ["Gallery", "File", "Reference", "Clear"];
+    const RIGHT: [&str; 3] = ["Tools", "Layers", "View"];
+    let pill = |label: &str| design::pill_width(t, measure(label));
+    let frame = 2.0 * ISLAND_PAD;
+    let left = frame + LEFT.iter().map(|l| pill(l)).sum::<f32>() + t.gap * (LEFT.len() - 1) as f32;
+    // Right island: Undo, Redo, the colour dot and the theme toggle are
+    // square controls; Tools, Layers and View are text pills.
+    let squares = 4.0 * t.control_h;
+    let right = frame
+        + squares
+        + RIGHT.iter().map(|l| pill(l)).sum::<f32>()
+        + t.gap * (RIGHT.len() + 4 - 1) as f32;
+    (left, right)
+}
+
 impl ProCraftApp {
     /// Top safe inset for the mobile shell: the status bar/notch strip the
     /// canvas must not paint under. Read per frame (rotations change it);
@@ -309,7 +337,7 @@ impl ProCraftApp {
                 .corner_radius(egui::CornerRadius::same(
                     ((t.control_h + 12.0) * 0.5).round() as u8,
                 ))
-                .inner_margin(egui::Margin::from(egui::vec2(6.0, 6.0)))
+                .inner_margin(egui::Margin::from(egui::vec2(ISLAND_PAD, ISLAND_PAD)))
         };
         let drawer_frame = || {
             egui::Frame::NONE

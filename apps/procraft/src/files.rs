@@ -40,6 +40,18 @@ pub(crate) fn android_import_list(kind: PendingOpen) -> (Vec<std::path::PathBuf>
     (out, None)
 }
 
+/// Apple Pencil reports force relative to its maximum (about 4 N), so a
+/// normal drawing press lands in the lower half of 0..1, while a finger
+/// reports no force at all and is painted at full pressure. This gamma lifts
+/// the stylus range so the same hand pressure draws a solid, full-size
+/// stroke instead of a thin, washed-out one.
+pub(crate) const STYLUS_PRESSURE_GAMMA: f32 = 0.5;
+
+/// Apply [`STYLUS_PRESSURE_GAMMA`] to a 0..=1 force sample.
+pub(crate) fn calibrate_force(force: f32) -> f32 {
+    force.clamp(0.0, 1.0).powf(STYLUS_PRESSURE_GAMMA)
+}
+
 /// Latest Apple Pencil / touch pressure (0.0..=1.0) seen in this frame's
 /// input events, if the backend forwarded any. egui 0.36 exposes pressure
 /// only on `Event::Touch.force` — desktop mice always yield `None`, and
@@ -56,7 +68,7 @@ pub(crate) fn latest_touch_force(ctx: &egui::Context) -> Option<f32> {
                     continue;
                 }
                 if let Some(v) = f {
-                    force = Some(v.clamp(0.0, 1.0));
+                    force = Some(calibrate_force(*v));
                 }
             }
         }

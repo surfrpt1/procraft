@@ -198,11 +198,17 @@ fn ramp(dist: f32, amount: f32, span: f32) -> f32 {
 
 // serde defaults for the fields added in M14: old `.pcbrush` files without
 // these keys load with the same values as `Brush::default()`.
+//
+// Pressure answers gently by default: an Apple Pencil reports a fraction of
+// its maximum force, so a strong default response turned a normal drawing
+// press into a thread of watered-down ink while finger strokes (no force
+// sensor, always full pressure) stayed solid. Keeping most of the nominal
+// size and opacity at mid pressure is what makes the stroke match the ring.
 fn def_pressure_size() -> f32 {
-    0.7
+    0.45
 }
 fn def_pressure_opacity() -> f32 {
-    0.6
+    0.15
 }
 // Speed dynamics are off by default, like Procreate: with a mouse speed is
 // the only input, and reacting to it turns every stroke into a thread with
@@ -864,10 +870,17 @@ impl Document {
                 if d > 1.0 + 0.5 / radius {
                     continue;
                 }
-                let falloff = if edge <= 0.0 || d <= 1.0 - edge {
+                // Sample the profile at the pixel's nearest point, not its
+                // centre. A pixel whose centre sits just outside a small
+                // dab is still partly covered; reading the soft falloff at
+                // the centre rounded every 1-2 px dab to zero, so a Pencil
+                // at light pressure painted nothing. `coverage` below is
+                // what accounts for the overlap.
+                let df = (d - 0.5 / radius).max(0.0);
+                let falloff = if edge <= 0.0 || df <= 1.0 - edge {
                     1.0
                 } else {
-                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
+                    (1.0 - (df - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
                 let coverage = ((1.0 - d) * radius + 0.5).clamp(0.0, 1.0);
                 let mut a = (falloff * coverage * strength * Document::sel_k(sel_mask, w, px, py))
@@ -1132,14 +1145,18 @@ impl Document {
                 if d > 1.0 + 0.5 / radius {
                     continue;
                 }
+                // Nearest-point profile sample (see the mask dab): small
+                // dabs must not be erased by a falloff their covered pixel
+                // centres never reach.
+                let df = (d - 0.5 / radius).max(0.0);
                 let falloff = if edge <= 0.0 {
                     // A hard disc is all core; the coverage term below is
                     // what gives it an edge.
                     1.0
-                } else if d <= 1.0 - edge {
+                } else if df <= 1.0 - edge {
                     1.0
                 } else {
-                    (1.0 - (d - (1.0 - edge)) / edge).clamp(0.0, 1.0)
+                    (1.0 - (df - (1.0 - edge)) / edge).clamp(0.0, 1.0)
                 };
                 // Analytic coverage across the last pixel of the rim: a hard
                 // disc keeps its edge but stops stair-stepping.
@@ -2028,8 +2045,8 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 spacing: 0.1,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.8,
-                pressure_opacity: 0.7,
+                pressure_size: 0.5,
+                pressure_opacity: 0.2,
                 velocity_size: 0.5,
                 velocity_opacity: 0.4,
                 velocity_size_curve: None,
@@ -2074,8 +2091,8 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 spacing: 0.1,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.9,
-                pressure_opacity: 0.8,
+                pressure_size: 0.55,
+                pressure_opacity: 0.2,
                 velocity_size: 0.4,
                 velocity_opacity: 0.3,
                 velocity_size_curve: None,
@@ -2120,8 +2137,8 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 spacing: 0.12,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.7,
-                pressure_opacity: 0.6,
+                pressure_size: 0.45,
+                pressure_opacity: 0.15,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
@@ -2160,8 +2177,8 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 spacing: 0.06,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.4,
-                pressure_opacity: 0.5,
+                pressure_size: 0.3,
+                pressure_opacity: 0.12,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
@@ -2201,7 +2218,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 eraser: false,
                 tip: None,
                 pressure_size: 0.2,
-                pressure_opacity: 1.0,
+                pressure_opacity: 0.5,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
@@ -2240,8 +2257,8 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 spacing: 0.1,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.6,
-                pressure_opacity: 0.6,
+                pressure_size: 0.4,
+                pressure_opacity: 0.2,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
@@ -5368,7 +5385,7 @@ mod tests {
         // Pre-M39 library JSON has no blend/wet/dual keys: same defaults.
         // Every present key mirrors Brush::default(), so the assertion stays
         // about the absent ones.
-        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.7,"pressure_opacity":0.6,"velocity_size":0.0,"velocity_opacity":0.0,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
+        let old = r#"{"size":24.0,"opacity":1.0,"softness":0.2,"spacing":0.15,"eraser":false,"tip":null,"pressure_size":0.45,"pressure_opacity":0.15,"velocity_size":0.0,"velocity_opacity":0.0,"grain":0.0,"grain_scale":1.0,"roundness":1.0,"angle_follow":false,"scatter":0.0,"stabilizer":0.35}"#;
         let brush: Brush = serde_json::from_str(old).unwrap();
         assert_eq!(brush, Brush::default());
     }
@@ -5423,6 +5440,69 @@ mod tests {
                 a > 0 && a < 200
             })
             .count()
+    }
+
+    /// One straight stroke at `pressure`, in the given ink.
+    fn paint_straight_pressure(
+        brush: &Brush,
+        color: Color,
+        pressure: f32,
+        w: u32,
+        h: u32,
+    ) -> Document {
+        let mut doc = Document::new(w, h);
+        let d = DabDynamics {
+            pressure,
+            ..Default::default()
+        };
+        let y = h as f32 / 2.0;
+        let (x0, x1) = (8.0, w as f32 - 8.0);
+        doc.stroke_to_dyn(brush, color, None, d, (x0, y), d, 0.0);
+        doc.stroke_to_dyn(brush, color, Some((x0, y)), d, (x1, y), d, 0.0);
+        doc.end_stroke();
+        doc
+    }
+
+    #[test]
+    fn sub_pixel_dabs_still_ink_the_page() {
+        // A 1.2 px dab puts every pixel centre outside its geometric disc.
+        // Reading the soft falloff at the centre rounded the whole dab to
+        // zero, which is why a 3 px Pencil at drawing pressure painted
+        // nothing at all while a 3 px brush at full pressure did.
+        let brush = Brush {
+            size: 1.2,
+            softness: 0.2,
+            spacing: 0.1,
+            pressure_size: 0.0,
+            pressure_opacity: 0.0,
+            ..Default::default()
+        };
+        let doc = paint_straight_pressure(&brush, Color::rgb(255, 0, 0), 1.0, 48, 24);
+        let painted = (0..doc.h)
+            .flat_map(|y| (0..doc.w).map(move |x| (x, y)))
+            .any(|(x, y)| alpha_at(&doc, x, y) > 0);
+        assert!(painted, "a sub-pixel dab painted nothing");
+    }
+
+    #[test]
+    fn pencil_preset_marks_the_page_at_drawing_pressure() {
+        let doc =
+            paint_straight_pressure(&preset_brush("Pencil"), Color::rgb(255, 0, 0), 0.3, 160, 60);
+        let core = (0..doc.h).map(|y| alpha_at(&doc, 80, y)).max().unwrap();
+        assert!(core >= 120, "pencil too faint at 0.3 pressure: {core}");
+    }
+
+    #[test]
+    fn default_brush_keeps_the_picked_colour_at_drawing_pressure() {
+        // The user picks 255 red and expects red. The old response washed a
+        // normal press out to (255, 107, 107).
+        let doc = paint_straight_pressure(&Brush::default(), Color::rgb(255, 0, 0), 0.3, 160, 80);
+        let px = doc.flatten_region(80, 40, 80, 40);
+        assert_eq!(px[0], 255, "red lost its red channel: {px:?}");
+        assert!(
+            px[1] <= 32 && px[2] <= 32,
+            "light pressure washed the colour out: {px:?}"
+        );
     }
 
     #[test]
