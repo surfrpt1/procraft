@@ -41,9 +41,21 @@ pub fn pan_offset(
     ah: f32,
 ) -> (f32, f32) {
     (
-        (offset.0 + delta.0).clamp(-cw + 60.0, aw - 60.0),
-        (offset.1 + delta.1).clamp(-ch + 60.0, ah - 60.0),
+        safe_clamp(offset.0 + delta.0, -cw + 60.0, aw - 60.0),
+        safe_clamp(offset.1 + delta.1, -ch + 60.0, ah - 60.0),
     )
+}
+
+/// `f32::clamp` panics when `lo > hi`, which happens whenever the
+/// viewport is narrower than the 120px canvas margin (first layout frame,
+/// split-screen, tiny windows). Ordering the bounds keeps the canvas
+/// between them instead of crashing; non-finite offsets recenter.
+#[inline]
+fn safe_clamp(val: f32, bound_a: f32, bound_b: f32) -> f32 {
+    if !val.is_finite() {
+        return 0.0;
+    }
+    val.clamp(bound_a.min(bound_b), bound_a.max(bound_b))
 }
 
 #[cfg(test)]
@@ -95,6 +107,44 @@ mod tests {
         assert_eq!(
             pan_offset((0.0, 0.0), (-5.0, -5.0), 100.0, 100.0, 1000.0, 800.0),
             (-5.0, -5.0)
+        );
+    }
+
+    #[test]
+    fn pan_offset_survives_viewports_narrower_than_the_margin() {
+        // Inverted bounds (-cw + 60 > aw - 60) used to panic inside
+        // f32::clamp: a 50px canvas in a 40px view, and a zero-size view
+        // on the first layout frame.
+        assert_eq!(
+            pan_offset((0.0, 0.0), (10.0, -10.0), 50.0, 50.0, 40.0, 40.0),
+            (10.0, -10.0)
+        );
+        assert_eq!(
+            pan_offset((0.0, 0.0), (10.0, -10.0), 50.0, 50.0, 0.0, 0.0),
+            (10.0, -10.0)
+        );
+        assert_eq!(
+            pan_offset((0.0, 0.0), (0.0, 0.0), 0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn pan_offset_recenters_on_non_finite_input() {
+        assert_eq!(
+            pan_offset((f32::NAN, 0.0), (10.0, 10.0), 800.0, 600.0, 1000.0, 800.0),
+            (0.0, 10.0)
+        );
+        assert_eq!(
+            pan_offset(
+                (0.0, 0.0),
+                (f32::INFINITY, f32::NEG_INFINITY),
+                800.0,
+                600.0,
+                1000.0,
+                800.0
+            ),
+            (0.0, 0.0)
         );
     }
 }

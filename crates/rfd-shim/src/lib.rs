@@ -14,6 +14,28 @@
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+use std::sync::Mutex;
+
+/// Why the last dialog call produced no path. Mobile saves have no cancel
+/// button in this shim, so `None` always means the sandbox path could not
+/// be resolved and the app should show this reason instead of silence.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn set_error(reason: Option<String>) {
+    if let Ok(mut slot) = LAST_ERROR.lock() {
+        *slot = reason;
+    }
+}
+
+/// Reason the last [`FileDialog`] call returned `None`, cleared by the
+/// next successful call. `None` means a plain user cancel.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn last_error() -> Option<String> {
+    LAST_ERROR.lock().ok().and_then(|slot| slot.clone())
+}
 
 /// Builder matching the `rfd::FileDialog` calls in `apps/procraft`.
 #[derive(Clone, Debug, Default)]
@@ -58,11 +80,25 @@ impl FileDialog {
     pub fn save_file(self) -> Option<PathBuf> {
         #[cfg(target_os = "ios")]
         {
-            ios_bridge::documents_path(&unique_stem())
+            let path = ios_bridge::documents_path(&unique_stem());
+            set_error(
+                path.is_none()
+                    .then(|| "the app Documents folder is unavailable".to_string()),
+            );
+            path
         }
         #[cfg(target_os = "android")]
         {
-            let dir = android_bridge::external_files_dir().ok()?;
+            let dir = match android_bridge::external_files_dir() {
+                Ok(dir) => dir,
+                Err(reason) => {
+                    set_error(Some(format!(
+                        "{reason} (app storage: Android/data/com.surfrpt1.procraft/files/)"
+                    )));
+                    return None;
+                }
+            };
+            set_error(None);
             let stem = unique_stem();
             let name = match self.filters.first() {
                 Some(ext) => format!("{stem}.{ext}"),

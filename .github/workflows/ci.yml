@@ -20,13 +20,18 @@ jobs:
         run: cargo test -p procraft-engine
       - name: Check formatting
         run: cargo fmt --check
+      - name: Add Android targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
+      # rfd-shim is excluded from the workspace, so the step above never
+      # lints it; the mobile builds do compile it. Lint it explicitly.
+      - name: Clippy rfd-shim (excluded crate)
+        run: cargo clippy --manifest-path crates/rfd-shim/Cargo.toml --target aarch64-linux-android --all-targets -- -D warnings
       - name: Build app
         run: cargo build -p procraft
       - name: Check Android targets (no NDK link needed)
         run: |
-          rustup target add aarch64-linux-android x86_64-linux-android
           cargo check -p procraft --target aarch64-linux-android
           cargo check -p procraft --target x86_64-linux-android
 

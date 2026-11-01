@@ -50,6 +50,7 @@ fn render_smoke(brush: &Brush) -> usize {
     );
     doc.layers[0]
         .pixels
+        .to_dense()
         .as_chunks::<4>()
         .0
         .iter()
