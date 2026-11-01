@@ -259,6 +259,8 @@ impl eframe::App for ProCraftApp {
             }
         }
 
+        self.poll_reference_load(ui.ctx());
+
         // iOS asynchronous opens: the picker was presented at tap time;
         // each frame checks whether it resolved.
         #[cfg(target_os = "ios")]
@@ -470,7 +472,6 @@ impl eframe::App for ProCraftApp {
             let mut remove_idx: Option<usize> = None;
             let mut clear_all = false;
             let sheet = self.mobile_modal_frame(ui.ctx());
-            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-gallery");
             fitted_modal(
                 egui::Window::new("Gallery")
                     .open(&mut open)
@@ -579,7 +580,7 @@ impl eframe::App for ProCraftApp {
                     }
                 });
             });
-            self.gallery_open = open && !scrim;
+            self.gallery_open = open;
             if create {
                 let (w, h) = (self.gallery_new_w, self.gallery_new_h);
                 self.new_canvas(w, h);
@@ -649,57 +650,29 @@ impl eframe::App for ProCraftApp {
             let mut open = self.ref_open;
             let mut load = false;
             let mut clear = false;
-            let sheet = self.mobile_modal_frame(ui.ctx());
-            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-reference");
-            fitted_modal(
-                egui::Window::new("Reference")
-                    .open(&mut open)
-                    .resizable(true)
-                    .collapsible(false)
-                    .min_width(200.0),
-                sheet.as_ref(),
-            )
-            .show(ui.ctx(), |ui| {
-                modal_scroll(ui, sheet.as_ref(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_sized([70.0, 28.0], egui::Button::new("Load…"))
-                            .clicked()
-                        {
-                            load = true;
-                        }
-                        if self.ref_image.is_some()
-                            && ui
-                                .add_sized([70.0, 28.0], egui::Button::new("Clear"))
-                                .clicked()
-                        {
-                            clear = true;
-                        }
+            if mobile_shell() {
+                self.reference_card(ui.ctx(), &mut load, &mut clear);
+            } else {
+                let sheet = self.mobile_modal_frame(ui.ctx());
+                fitted_modal(
+                    egui::Window::new("Reference")
+                        .open(&mut open)
+                        .resizable(true)
+                        .collapsible(false)
+                        .min_width(200.0),
+                    sheet.as_ref(),
+                )
+                .show(ui.ctx(), |ui| {
+                    modal_scroll(ui, sheet.as_ref(), |ui| {
+                        self.reference_body(ui, &mut load, &mut clear, 320.0);
                     });
-                    if let (Some(tex), Some((_, w, h))) =
-                        (self.ref_tex.as_ref(), self.ref_image.as_ref())
-                    {
-                        // Fit the pin inside 320px, then zoom (slider).
-                        let fit_px = (320.0 / (*w).max(*h).max(1) as f32).min(1.0);
-                        let z = fit_px * self.ref_scale;
-                        // The mobile frame is narrower than the 640px pin:
-                        // cap the image to the dialog instead of clipping it.
-                        let cap = sheet
-                            .as_ref()
-                            .map_or(640.0, |s| (s.fit.x - 56.0).min(s.fit.y - 160.0).max(120.0));
-                        let dw = (*w as f32 * z).clamp(32.0, cap);
-                        let dh = (*h as f32 * z).clamp(32.0, cap);
-                        ui.image((tex.id(), egui::Vec2::new(dw, dh)));
-                        stepped_slider(ui, &mut self.ref_scale, 0.25..=2.0, 0.25, "Zoom");
-                    } else {
-                        ui.label("Pin an image to paint from — nothing here yet.");
-                    }
                 });
-            });
-            self.ref_open = open && !scrim;
+                self.ref_open = open;
+            }
             if clear {
                 self.ref_image = None;
                 self.ref_tex = None;
+                self.ref_job = None;
                 self.status = "Reference cleared.".to_string();
             }
             if load {
@@ -711,14 +684,7 @@ impl eframe::App for ProCraftApp {
                     )
                     .pick_file()
                 {
-                    let from = format!("{}", path.display());
-                    match image::open(&path).map(|i| i.to_rgba8()) {
-                        Ok(img) => {
-                            let (w, h) = (img.width(), img.height());
-                            self.set_reference(img.into_raw(), w, h, &from);
-                        }
-                        Err(e) => self.status = format!("Reference load failed: {e}"),
-                    }
+                    self.start_reference_load(path);
                 }
                 #[cfg(target_os = "ios")]
                 {
@@ -742,7 +708,6 @@ impl eframe::App for ProCraftApp {
         if self.recovery_offer {
             let mut open = self.recovery_offer;
             let sheet = self.mobile_modal_frame(ui.ctx());
-            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-recovery");
             fitted_modal(
                 egui::Window::new("Unsaved work found")
                     .open(&mut open)
@@ -786,7 +751,7 @@ impl eframe::App for ProCraftApp {
             });
             // The X button snoozes (file kept, offered again next launch);
             // Recover/Discard already dismissed above and must stick.
-            if !open || scrim {
+            if !open {
                 self.recovery_offer = false;
             }
         }
@@ -797,7 +762,6 @@ impl eframe::App for ProCraftApp {
         if self.show_about {
             let mut open = self.show_about;
             let sheet = self.mobile_modal_frame(ui.ctx());
-            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-about");
             fitted_modal(
                 egui::Window::new("About ProCraft")
                     .open(&mut open)
@@ -823,7 +787,7 @@ impl eframe::App for ProCraftApp {
                     ui.label("Original code, MIT licensed.");
                 });
             });
-            self.show_about = open && !scrim;
+            self.show_about = open;
         }
 
         // M49: shortcuts editor window.
@@ -836,7 +800,6 @@ impl eframe::App for ProCraftApp {
         if self.text_open {
             let mut open = self.text_open;
             let sheet = self.mobile_modal_frame(ui.ctx());
-            let scrim = self.mobile_scrim(ui.ctx(), "mobile-scrim-text");
             fitted_modal(
                 egui::Window::new("Text")
                     .open(&mut open)
@@ -1080,7 +1043,7 @@ impl eframe::App for ProCraftApp {
             // A button inside the dialog may have set `text_open = false`
             // (Render/Done/Cancel); the window ✕ flips `open`. Honor both —
             // and any close clears the edit session.
-            self.text_open = self.text_open && open && !scrim;
+            self.text_open = self.text_open && open;
             if !self.text_open {
                 self.editing_text = None;
                 self.editing_loaded = None;
@@ -1181,8 +1144,38 @@ impl eframe::App for ProCraftApp {
             // Viewport rect for press-origin tests (Hand grabs anywhere
             // in it, including paper margins outside the canvas rect).
             let view_rect = ui.available_rect_before_wrap();
-            if self.zoom <= 0.0 {
+            // Rotation (or split view) changes the canvas area while the
+            // layout still describes the old one. The page keeps its
+            // landscape zoom and pan, so it sits off-centre and part of the
+            // screen stops being canvas; egui also hit-tests a frame against
+            // the previous pass's widget rects, so a press on stale geometry
+            // starts nothing. Re-fit a page the user was seeing whole,
+            // re-clamp a panned one, and repaint on the new layout.
+            let mut refit = false;
+            let canvas_resized = self.last_canvas_size != avail;
+            if canvas_resized {
+                let old = self.last_canvas_size;
+                self.last_canvas_size = avail;
+                if old != egui::Vec2::ZERO {
+                    refit = self.zoom <= board_fit_zoom(w, h, old) * 1.01;
+                    if !refit {
+                        let (cw, ch) = (w * self.zoom, h * self.zoom);
+                        let (ox, oy) = pan_offset(
+                            (self.view_offset.x, self.view_offset.y),
+                            (0.0, 0.0),
+                            cw,
+                            ch,
+                            avail.x,
+                            avail.y,
+                        );
+                        self.view_offset = egui::Vec2::new(ox, oy);
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            if self.zoom <= 0.0 || refit {
                 self.zoom = board_fit_zoom(w, h, avail);
+                self.view_offset = egui::Vec2::ZERO;
             }
             // Pinch-to-zoom (iOS touch; Ctrl+wheel on desktop): no-op when
             // the backend reports no gesture.
@@ -1264,6 +1257,15 @@ impl eframe::App for ProCraftApp {
             // an inline chain reindents the whole ~950-line body.)
             let canvas_scroll = egui::ScrollArea::both()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+            // The scroll area keeps its own invisible offset (touch drags on
+            // the board move it). Carried into the new orientation it leaves
+            // the page shifted off the usable area, so a layout change drops
+            // it and lets the re-fit above place the page.
+            let canvas_scroll = if canvas_resized {
+                canvas_scroll.scroll_offset(egui::Vec2::ZERO)
+            } else {
+                canvas_scroll
+            };
             // PC wheel conventions: plain wheel pans vertically, shift+wheel
             // pans horizontally, ctrl+wheel zooms (via zoom_delta below).
             // The backend passes wheel ticks through untouched, so shift

@@ -1,5 +1,9 @@
 use crate::*;
 
+/// Longest side kept for a pinned reference. The pin is never painted as
+/// canvas content, so a phone photo is shrunk before it reaches the UI.
+pub(crate) const REFERENCE_MAX_SIDE: u32 = 1024;
+
 impl ProCraftApp {
     /// Best-effort delete of the autosave recovery file (after an explicit
     /// save, load, or clean exit — anything that makes it stale). Drops any
@@ -176,9 +180,8 @@ impl ProCraftApp {
             self.status = format!("Reference load failed: empty image ({from}).");
             return;
         }
-        const MAX_SIDE: u32 = 1024;
-        let (bytes, tw, th) = if w.max(h) > MAX_SIDE {
-            gallery_thumb(&pixels, w, h, MAX_SIDE)
+        let (bytes, tw, th) = if w.max(h) > REFERENCE_MAX_SIDE {
+            gallery_thumb(&pixels, w, h, REFERENCE_MAX_SIDE)
         } else {
             (pixels, w, h)
         };
@@ -190,6 +193,47 @@ impl ProCraftApp {
         self.ref_tex = None;
         self.ref_open = true;
         self.status = format!("Reference pinned ({from}).");
+    }
+
+    /// M34 Reference: decode a picked file off the UI thread. A photo
+    /// decodes to hundreds of MB at full resolution before the pin shrinks
+    /// it, which stalled the whole app for seconds on iPad; the worker does
+    /// decode + shrink and returns only the small buffer.
+    pub(crate) fn start_reference_load(&mut self, path: std::path::PathBuf) {
+        let from = format!("{}", path.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = from.clone();
+        std::thread::spawn(move || {
+            let result = decode_reference(&path).map(|(bytes, w, h)| (bytes, w, h, name));
+            // The receiver is dropped when a newer pick replaces this one.
+            let _ = tx.send(result);
+        });
+        self.ref_job = Some(rx);
+        self.status = format!("Loading reference {from}…");
+    }
+
+    /// Poll the reference decoder; cheap when nothing is in flight.
+    pub(crate) fn poll_reference_load(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ref_job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((bytes, w, h, from))) => {
+                self.ref_job = None;
+                self.set_reference(bytes, w, h, &from);
+            }
+            Ok(Err(e)) => {
+                self.ref_job = None;
+                self.status = format!("Reference load failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ref_job = None;
+                self.status = "Reference load failed: decoder stopped.".to_string();
+            }
+        }
     }
 
     /// M34 Reference: upload the companion texture on demand (load/replace
@@ -219,5 +263,57 @@ impl ProCraftApp {
         } else {
             false
         }
+    }
+}
+
+/// Decode a reference image and shrink it to [`REFERENCE_MAX_SIDE`] while
+/// still on the worker thread: `resize_exact` builds the small buffer in the
+/// file's own pixel format, so the full-resolution RGBA copy never exists.
+fn decode_reference(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let img = image::open(path).map_err(|e| e.to_string())?;
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let img = if w.max(h) > REFERENCE_MAX_SIDE {
+        let scale = REFERENCE_MAX_SIDE as f32 / w.max(h) as f32;
+        img.resize_exact(
+            ((w as f32 * scale).round() as u32).max(1),
+            ((h as f32 * scale).round() as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let (tw, th) = (rgba.width(), rgba.height());
+    Ok((rgba.into_raw(), tw, th))
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn decode_reference_shrinks_to_the_cap() {
+        let path = std::env::temp_dir().join("procraft_ref_decode_test.png");
+        let img = image::RgbImage::from_fn(2048, 64, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 7])
+        });
+        img.save(&path).expect("write test image");
+        let (bytes, w, h) = decode_reference(&path).expect("decode");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((w, h), (REFERENCE_MAX_SIDE, REFERENCE_MAX_SIDE / 32));
+        assert_eq!(bytes.len(), (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn decode_reference_keeps_small_images_whole() {
+        let path = std::env::temp_dir().join("procraft_ref_small_test.png");
+        let img = image::RgbImage::from_fn(40, 20, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 7])
+        });
+        img.save(&path).expect("write test image");
+        let (bytes, w, h) = decode_reference(&path).expect("decode");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((w, h), (40, 20));
+        assert_eq!(bytes.len(), 40 * 20 * 4);
     }
 }

@@ -3,6 +3,11 @@ use crate::*;
 /// M35 Selection upgrades: saved snapshot (canvas dims, rect, mask).
 pub(crate) type SavedSelection = ((u32, u32), Option<(u32, u32, u32, u32)>, Option<Vec<u8>>);
 
+/// A decoded reference image on its way back from the worker: RGBA bytes,
+/// width, height, and the source path (for the status line).
+pub(crate) type ReferenceImage = Result<(Vec<u8>, u32, u32, String), String>;
+pub(crate) type ReferenceJob = std::sync::mpsc::Receiver<ReferenceImage>;
+
 pub(crate) struct ProCraftApp {
     pub(crate) doc: Document,
     pub(crate) brush: Brush,
@@ -253,6 +258,10 @@ pub(crate) struct ProCraftApp {
     pub(crate) editing_text: Option<usize>,
     pub(crate) editing_loaded: Option<(String, f32, f32)>,
     pub(crate) zoom: f32,
+    /// Canvas area seen on the last frame. A change means the layout was
+    /// built for another screen (rotation, split view): the page is re-fitted
+    /// or its pan re-clamped so no drawing area is left behind.
+    pub(crate) last_canvas_size: egui::Vec2,
     pub(crate) status: String,
     /// M33 Gallery: recent project paths (newest first, max 10),
     /// the browser window flag, cached per-path thumbnails, the key
@@ -269,6 +278,14 @@ pub(crate) struct ProCraftApp {
     pub(crate) ref_image: Option<(Vec<u8>, u32, u32)>,
     pub(crate) ref_tex: Option<TextureHandle>,
     pub(crate) ref_scale: f32,
+    /// Reference decode in flight: a worker thread decodes and shrinks the
+    /// picked file, then sends the small RGBA buffer back for the UI thread
+    /// to pin. Decoding a photo on the UI thread stalled the frame.
+    pub(crate) ref_job: Option<ReferenceJob>,
+    /// Touch-shell reference card: where the user parked it (screen px,
+    /// top-left) and how big they made it. `None` = default placement.
+    pub(crate) ref_pos: Option<egui::Pos2>,
+    pub(crate) ref_size: Option<egui::Vec2>,
     /// M35 Selection upgrades: saved snapshot ((w,h), rect, mask) plus
     /// the nudge steppers. Session-only; Load refuses size mismatches.
     pub(crate) saved_sel: Option<SavedSelection>,
@@ -502,6 +519,7 @@ impl ProCraftApp {
             editing_text: None,
             editing_loaded: None,
             zoom: 1.0,
+            last_canvas_size: egui::Vec2::ZERO,
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
                     .to_string(),
@@ -515,6 +533,9 @@ impl ProCraftApp {
             ref_image: None,
             ref_tex: None,
             ref_scale: 1.0,
+            ref_job: None,
+            ref_pos: None,
+            ref_size: None,
             saved_sel: None,
             sel_nudge_x: 0,
             sel_nudge_y: 0,

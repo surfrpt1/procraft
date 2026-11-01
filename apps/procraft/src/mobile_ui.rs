@@ -65,24 +65,205 @@ impl ProCraftApp {
         Some(MobileModal { fit, anchor, frame })
     }
 
-    /// Dim layer under a mobile sheet. Tapping it dismisses; it swallows
-    /// canvas taps while a sheet is up. No-op on the desktop shell.
-    pub(crate) fn mobile_scrim(&mut self, ctx: &egui::Context, id: &str) -> bool {
-        if !mobile_shell() {
-            return false;
+    /// Reference controls: Load/Clear, the pinned image and its zoom. Shared
+    /// by the desktop window and the touch card; `cap` is the widest the pin
+    /// may draw, so it follows the card when the user resizes it.
+    pub(crate) fn reference_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        load: &mut bool,
+        clear: &mut bool,
+        cap: f32,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_sized([70.0, 28.0], egui::Button::new("Load…"))
+                .clicked()
+            {
+                *load = true;
+            }
+            if self.ref_image.is_some()
+                && ui
+                    .add_sized([70.0, 28.0], egui::Button::new("Clear"))
+                    .clicked()
+            {
+                *clear = true;
+            }
+        });
+        // Cloned out of `self` so the zoom slider can borrow it mutably.
+        let tex = self.ref_tex.clone();
+        let dims = self.ref_image.as_ref().map(|(_, w, h)| (*w, *h));
+        if let (Some(tex), Some((w, h))) = (tex, dims) {
+            let span = cap.clamp(48.0, 640.0);
+            let fit_px = (span / w.max(h).max(1) as f32).min(1.0);
+            let z = fit_px * self.ref_scale;
+            ui.image((tex.id(), egui::Vec2::new(w as f32 * z, h as f32 * z)));
+            stepped_slider(ui, &mut self.ref_scale, 0.25..=2.0, 0.25, "Zoom");
+        } else {
+            ui.label("Pin an image to paint from — nothing here yet.");
         }
+    }
+
+    /// Touch-shell Reference: a free-floating card. The header drags it, the
+    /// bottom-right grip resizes it, and only its own rect blocks input, so
+    /// the canvas keeps taking strokes around it (unlike a modal sheet,
+    /// which anchors in place and owns the whole screen).
+    pub(crate) fn reference_card(
+        &mut self,
+        ctx: &egui::Context,
+        load: &mut bool,
+        clear: &mut bool,
+    ) {
         let vp = ctx.viewport_rect();
-        let mut clicked = false;
-        egui::Area::new(egui::Id::new(id))
+        let safe_top = self.status_inset_top();
+        let safe_bottom = safe_bottom(true);
+        let pad = 12.0;
+        let margin = 8.0;
+        let t = design::tokens(
+            self.theme,
+            effective_layout(
+                vp.width(),
+                cfg!(any(target_os = "ios", target_os = "android")),
+            ),
+        );
+        let header_h = (t.control_h + 4.0).max(34.0);
+        let grip = 34.0;
+        let max = egui::vec2(
+            (vp.width() - 2.0 * pad).max(160.0),
+            (vp.height() - safe_top - safe_bottom - 2.0 * pad).max(140.0),
+        );
+        let min = egui::vec2(200.0_f32.min(max.x), 170.0_f32.min(max.y));
+        let default = egui::vec2(
+            (vp.width() * 0.52).clamp(min.x, 440.0).min(max.x),
+            (vp.height() * 0.38).clamp(min.y, 380.0).min(max.y),
+        );
+        let mut size = self.ref_size.unwrap_or(default);
+        size = egui::vec2(size.x.clamp(min.x, max.x), size.y.clamp(min.y, max.y));
+        let lo = egui::pos2(vp.min.x + pad, vp.min.y + safe_top + pad);
+        let hi = |size: egui::Vec2| {
+            egui::pos2(
+                (vp.max.x - pad - size.x).max(lo.x),
+                (vp.max.y - safe_bottom - pad - size.y).max(lo.y),
+            )
+        };
+        let mut pos = self.ref_pos.unwrap_or_else(|| {
+            let hi = hi(size);
+            egui::pos2(
+                (vp.center().x - size.x * 0.5).clamp(lo.x, hi.x),
+                (vp.center().y - size.y * 0.5).clamp(lo.y, hi.y),
+            )
+        });
+        {
+            let hi = hi(size);
+            pos = egui::pos2(pos.x.clamp(lo.x, hi.x), pos.y.clamp(lo.y, hi.y));
+        }
+        let mut close = false;
+        egui::Area::new(egui::Id::new("mobile-reference"))
             .order(egui::Order::Middle)
-            .fixed_pos(vp.min)
+            .constrain(false)
+            .fixed_pos(pos)
             .show(ctx, |ui| {
-                let (rect, resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(110));
-                clicked = resp.clicked();
+                let card = egui::Rect::from_min_size(pos, size);
+                // Registered before the content: later widgets win ties, so
+                // taps on the card's empty space land here instead of on the
+                // canvas behind it. The margin absorbs the drop shadow, which
+                // reads as part of the card but sits outside its rect.
+                ui.interact(
+                    card.expand(margin),
+                    ui.id().with("block"),
+                    egui::Sense::click_and_drag(),
+                );
+                egui::Frame::NONE
+                    .fill(t.surface_1)
+                    .stroke(egui::Stroke::new(1.0, t.stroke))
+                    .corner_radius(egui::CornerRadius::same(t.radius_card))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    })
+                    .inner_margin(egui::Margin::from(egui::vec2(margin, margin)))
+                    .show(ui, |ui| {
+                        let inner = (size.x - 2.0 * margin).max(80.0);
+                        ui.set_width(inner);
+                        ui.set_height((size.y - 2.0 * margin).max(60.0));
+                        // Selecting text mid-header-drag highlights the title and
+                        // steals the press from the move sensor.
+                        ui.style_mut().interaction.selectable_labels = false;
+                        // Header: drag anywhere on it to move the card.
+                        let hrect =
+                            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(inner, header_h));
+                        let hdrag = ui.interact(hrect, ui.id().with("drag"), egui::Sense::drag());
+                        if hdrag.dragged() {
+                            pos += hdrag.drag_delta();
+                        }
+                        ui.allocate_exact_size(hrect.size(), egui::Sense::hover());
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(hrect), |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.strong("Reference");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_sized(
+                                                [grip, header_h.min(grip)],
+                                                egui::Button::new(
+                                                    egui::RichText::new("✕").size(16.0),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            close = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                        let body_h = (size.y - 2.0 * margin - header_h).max(60.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(body_h)
+                            .show(ui, |ui| {
+                                ui.set_width(inner);
+                                self.reference_body(
+                                    ui,
+                                    load,
+                                    clear,
+                                    (inner - grip * 0.5).max(120.0),
+                                );
+                            });
+                        // Resize grip, last so it wins the corner hit test.
+                        let g = egui::Rect::from_min_size(
+                            egui::pos2(card.max.x - margin - grip, card.max.y - margin - grip),
+                            egui::vec2(grip, grip),
+                        );
+                        let gresp = ui.interact(g, ui.id().with("resize"), egui::Sense::drag());
+                        if gresp.dragged() {
+                            size += gresp.drag_delta();
+                        }
+                        let stroke = egui::Stroke::new(1.5, t.stroke);
+                        let painter = ui.painter();
+                        for i in 0..3 {
+                            let o = 9.0 + i as f32 * 6.0;
+                            painter.line_segment(
+                                [
+                                    egui::pos2(g.max.x - o, g.max.y - 5.0),
+                                    egui::pos2(g.max.x - 5.0, g.max.y - o),
+                                ],
+                                stroke,
+                            );
+                        }
+                    });
             });
-        clicked
+        size = egui::vec2(size.x.clamp(min.x, max.x), size.y.clamp(min.y, max.y));
+        let hi = hi(size);
+        pos = egui::pos2(pos.x.clamp(lo.x, hi.x), pos.y.clamp(lo.y, hi.y));
+        self.ref_pos = Some(pos);
+        self.ref_size = Some(size);
+        if close {
+            self.ref_open = false;
+        }
     }
 
     /// Mobile chrome: floating clusters over a full-screen canvas, with the

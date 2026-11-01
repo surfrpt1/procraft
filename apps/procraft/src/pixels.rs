@@ -460,13 +460,9 @@ impl ProCraftApp {
                 Err(e) => self.status = format!("GIF import failed: {e}"),
             },
             // M34 Reference: pin the image beside the canvas (not a layer).
-            PendingOpen::Reference => match image::open(&path).map(|i| i.to_rgba8()) {
-                Ok(img) => {
-                    let (w, h) = (img.width(), img.height());
-                    self.set_reference(img.into_raw(), w, h, &format!("{}", path.display()));
-                }
-                Err(e) => self.status = format!("Reference load failed: {e}"),
-            },
+            // Decoded on a worker so the frame after the picker dismisses
+            // is not blocked by a full-resolution decode.
+            PendingOpen::Reference => self.start_reference_load(path),
             // M38 Typography: validate an imported face, keep its bytes.
             PendingOpen::Font => match std::fs::read(&path) {
                 Ok(bytes) => {

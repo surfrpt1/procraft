@@ -158,7 +158,6 @@ impl ProCraftApp {
     pub(crate) fn shortcuts_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_shortcuts;
         let sheet = self.mobile_modal_frame(ctx);
-        let scrim = self.mobile_scrim(ctx, "mobile-scrim-shortcuts");
         fitted_modal(
             egui::Window::new("Shortcuts")
                 .open(&mut open)
@@ -263,6 +262,6 @@ impl ProCraftApp {
                 self.status = "Shortcuts reset to defaults.".to_string();
             }
         });
-        self.show_shortcuts = open && !scrim;
+        self.show_shortcuts = open;
     }
 }
