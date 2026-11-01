@@ -388,13 +388,10 @@ impl eframe::App for ProCraftApp {
                 // keeps inside taps alive while an outside tap still dismisses;
                 // momentary action buttons call ui.close() themselves. Desktop
                 // keeps egui's default CloseOnClick.
-                let menu_config = || {
-                    let close = if layout == BarLayout::Wide {
-                        egui::PopupCloseBehavior::CloseOnClick
-                    } else {
-                        egui::PopupCloseBehavior::CloseOnClickOutside
-                    };
-                    egui::containers::menu::MenuConfig::new().close_behavior(close)
+                let menu_close = if layout == BarLayout::Wide {
+                    egui::PopupCloseBehavior::CloseOnClick
+                } else {
+                    egui::PopupCloseBehavior::CloseOnClickOutside
                 };
                 ui.horizontal_wrapped(|ui| {
                     // Desktop row budget: one row, always. The pills get their
@@ -412,11 +409,9 @@ impl eframe::App for ProCraftApp {
                     if self.pill(ui, "Reference") {
                         self.ref_open = !self.ref_open;
                     }
-                    egui::containers::menu::MenuButton::new("File")
-                        .config(menu_config())
-                        .ui(ui, |ui| {
-                            self.file_menu_ui(ui, layout, &bar_t, None);
-                        });
+                    self.pill_menu(ui, "File", menu_close, |app, ui| {
+                        app.file_menu_ui(ui, layout, &bar_t, None);
+                    });
                     if self.pill(ui, "Undo") && self.doc.undo() {
                         self.status = "Undone.".to_string();
                     }
@@ -436,14 +431,12 @@ impl eframe::App for ProCraftApp {
                         if design::theme_toggle(ui, &bar_t, &mut self.theme) {
                             self.status = format!("{} theme.", self.theme.name());
                         }
-                        egui::containers::menu::MenuButton::new("View")
-                            .config(menu_config())
-                            .ui(ui, |ui| {
-                                if layout == BarLayout::Tablet {
-                                    ui.spacing_mut().interact_size.y = bar_t.control_h;
-                                }
-                                self.view_controls(ui, true);
-                            });
+                        self.pill_menu(ui, "View", menu_close, |app, ui| {
+                            if layout == BarLayout::Tablet {
+                                ui.spacing_mut().interact_size.y = bar_t.control_h;
+                            }
+                            app.view_controls(ui, true);
+                        });
                     } else {
                         self.view_controls(ui, false);
                     }
@@ -1250,6 +1243,11 @@ impl eframe::App for ProCraftApp {
                 }
             }
             let z = self.zoom;
+            // Page rotation about the canvas center. Read once so the
+            // scroll reset and the sensor below agree on the angle.
+            let ang = self.view_angle;
+            let angle_changed = (ang - self.last_view_angle).abs() > f32::EPSILON;
+            self.last_view_angle = ang;
             // No scrollbar visuals over the artwork (v13 iPad: a full-width
             // bar flashed across the painting on every tap at overflow).
             // Touch pans via view_offset; desktop wheel keeps scrolling
@@ -1259,9 +1257,9 @@ impl eframe::App for ProCraftApp {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
             // The scroll area keeps its own invisible offset (touch drags on
             // the board move it). Carried into the new orientation it leaves
-            // the page shifted off the usable area, so a layout change drops
-            // it and lets the re-fit above place the page.
-            let canvas_scroll = if canvas_resized {
+            // the page shifted off the usable area, so a layout change or a
+            // rotation drops it and lets the re-fit above place the page.
+            let canvas_scroll = if canvas_resized || angle_changed {
                 canvas_scroll.scroll_offset(egui::Vec2::ZERO)
             } else {
                 canvas_scroll
@@ -1294,14 +1292,22 @@ impl eframe::App for ProCraftApp {
                     snap_canvas_origin(rect.min, z, ui.ctx().pixels_per_point(), self.view_angle),
                     rect.size(),
                 );
-                // Presses and drags must start on the drawn page: centring
-                // and pan move the artwork after layout, and the scroll
-                // area clips the sensor to the visible part.
-                let resp = ui.interact(rect, ui.id().with("canvas-page"), Sense::click_and_drag());
                 // Rotation about the view center: canvas (x, y) maps through
                 // the unrotated rect, then spins into place.
-                let ang = self.view_angle;
                 let cc = rect.center();
+                // Presses and drags must start on the drawn page: centring
+                // and pan move the artwork after layout, and the scroll
+                // area clips the sensor to the visible part. Drawn rotated,
+                // the sensor follows the drawn quad - the axis-aligned page
+                // no longer covers what the user can see (at 90° the
+                // visible lobes fell on the board and started nothing).
+                let page = egui::Rect::from_points(&[
+                    rot_pt(rect.left_top(), cc, ang),
+                    rot_pt(rect.right_top(), cc, ang),
+                    rot_pt(rect.right_bottom(), cc, ang),
+                    rot_pt(rect.left_bottom(), cc, ang),
+                ]);
+                let resp = ui.interact(page, ui.id().with("canvas-page"), Sense::click_and_drag());
                 // Board dots first: the page texture covers anything the
                 // grid's radius grazes along its edge. The scroll-area
                 // painter clips to the page viewport, so widen the clip to

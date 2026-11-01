@@ -1,5 +1,9 @@
 use crate::*;
 
+/// Mobile popups keep inside taps alive: a stepper or slider in a menu used to
+/// close it before the tap landed. An outside tap still dismisses.
+const CLOSE_OUT: egui::PopupCloseBehavior = egui::PopupCloseBehavior::CloseOnClickOutside;
+
 impl ProCraftApp {
     /// Top safe inset for the mobile shell: the status bar/notch strip the
     /// canvas must not paint under. Read per frame (rotations change it);
@@ -173,88 +177,106 @@ impl ProCraftApp {
                     ui.id().with("block"),
                     egui::Sense::click_and_drag(),
                 );
-                egui::Frame::NONE
-                    .fill(t.surface_1)
-                    .stroke(egui::Stroke::new(1.0, t.stroke))
-                    .corner_radius(egui::CornerRadius::same(t.radius_card))
-                    .shadow(egui::epaint::Shadow {
+                // The panel is painted at exactly `card` instead of being
+                // sized by a `Frame`: a pinned image wider than the card used
+                // to grow the painted panel past it, stranding the ✕ and the
+                // resize grip inside the corner they belong to.
+                ui.allocate_rect(card, egui::Sense::hover());
+                let radius = egui::CornerRadius::same(t.radius_card);
+                let painter = ui.painter();
+                painter.add(
+                    egui::epaint::Shadow {
                         offset: [0, 8],
                         blur: 24,
                         spread: 0,
                         color: egui::Color32::from_black_alpha(90),
-                    })
-                    .inner_margin(egui::Margin::from(egui::vec2(margin, margin)))
-                    .show(ui, |ui| {
-                        let inner = (size.x - 2.0 * margin).max(80.0);
-                        ui.set_width(inner);
-                        ui.set_height((size.y - 2.0 * margin).max(60.0));
-                        // Selecting text mid-header-drag highlights the title and
-                        // steals the press from the move sensor.
-                        ui.style_mut().interaction.selectable_labels = false;
-                        // Header: drag anywhere on it to move the card.
-                        let hrect =
-                            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(inner, header_h));
-                        let hdrag = ui.interact(hrect, ui.id().with("drag"), egui::Sense::drag());
-                        if hdrag.dragged() {
-                            pos += hdrag.drag_delta();
-                        }
-                        ui.allocate_exact_size(hrect.size(), egui::Sense::hover());
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(hrect), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.strong("Reference");
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add_sized(
-                                                [grip, header_h.min(grip)],
-                                                egui::Button::new(
-                                                    egui::RichText::new("✕").size(16.0),
-                                                )
+                    }
+                    .as_shape(card, radius),
+                );
+                painter.rect(
+                    card,
+                    radius,
+                    t.surface_1,
+                    egui::Stroke::new(1.0, t.stroke),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = egui::Rect::from_min_max(
+                    card.min + egui::Vec2::splat(margin),
+                    card.max - egui::Vec2::splat(margin),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                    ui.set_clip_rect(card);
+                    // Selecting text mid-header-drag highlights the title and
+                    // steals the press from the move sensor.
+                    ui.style_mut().interaction.selectable_labels = false;
+                    // Header: drag anywhere on it to move the card.
+                    let hrect =
+                        egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), header_h));
+                    let hdrag = ui.interact(hrect, ui.id().with("drag"), egui::Sense::drag());
+                    if hdrag.dragged() {
+                        pos += hdrag.drag_delta();
+                    }
+                    ui.allocate_exact_size(hrect.size(), egui::Sense::hover());
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(hrect), |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.strong("Reference");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_sized(
+                                            [grip, header_h.min(grip)],
+                                            egui::Button::new(egui::RichText::new("✕").size(16.0))
                                                 .frame(false),
-                                            )
-                                            .clicked()
-                                        {
-                                            close = true;
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                        let body_h = (size.y - 2.0 * margin - header_h).max(60.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(body_h)
-                            .show(ui, |ui| {
-                                ui.set_width(inner);
-                                self.reference_body(
-                                    ui,
-                                    load,
-                                    clear,
-                                    (inner - grip * 0.5).max(120.0),
-                                );
-                            });
-                        // Resize grip, last so it wins the corner hit test.
-                        let g = egui::Rect::from_min_size(
-                            egui::pos2(card.max.x - margin - grip, card.max.y - margin - grip),
-                            egui::vec2(grip, grip),
-                        );
-                        let gresp = ui.interact(g, ui.id().with("resize"), egui::Sense::drag());
-                        if gresp.dragged() {
-                            size += gresp.drag_delta();
-                        }
-                        let stroke = egui::Stroke::new(1.5, t.stroke);
-                        let painter = ui.painter();
-                        for i in 0..3 {
-                            let o = 9.0 + i as f32 * 6.0;
-                            painter.line_segment(
-                                [
-                                    egui::pos2(g.max.x - o, g.max.y - 5.0),
-                                    egui::pos2(g.max.x - 5.0, g.max.y - o),
-                                ],
-                                stroke,
+                                        )
+                                        .clicked()
+                                    {
+                                        close = true;
+                                    }
+                                },
                             );
-                        }
+                        });
                     });
+                    let body_h = (inner.height() - header_h).max(60.0);
+                    // Both axes: the zoom slider can grow the pin past the
+                    // card, and the card must scroll it rather than stretch.
+                    // The rail itself is hidden so the card's right edge stays
+                    // clean; scrolling still works by touch/wheel.
+                    egui::ScrollArea::both()
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .max_height(body_h)
+                        .max_width(inner.width())
+                        .show(ui, |ui| {
+                            ui.set_width(inner.width());
+                            self.reference_body(
+                                ui,
+                                load,
+                                clear,
+                                (inner.width() - grip * 0.5).max(120.0),
+                            );
+                        });
+                    // Resize grip, last so it wins the corner hit test.
+                    let g = egui::Rect::from_min_size(
+                        egui::pos2(inner.max.x - grip, inner.max.y - grip),
+                        egui::vec2(grip, grip),
+                    );
+                    let gresp = ui.interact(g, ui.id().with("resize"), egui::Sense::drag());
+                    if gresp.dragged() {
+                        size += gresp.drag_delta();
+                    }
+                    let stroke = egui::Stroke::new(1.5, t.stroke);
+                    let painter = ui.painter();
+                    for i in 0..3 {
+                        let o = 9.0 + i as f32 * 6.0;
+                        painter.line_segment(
+                            [
+                                egui::pos2(g.max.x - o, g.max.y - 5.0),
+                                egui::pos2(g.max.x - 5.0, g.max.y - o),
+                            ],
+                            stroke,
+                        );
+                    }
+                });
             });
         size = egui::vec2(size.x.clamp(min.x, max.x), size.y.clamp(min.y, max.y));
         let hi = hi(size);
@@ -419,16 +441,10 @@ impl ProCraftApp {
                             if self.pill(ui, "Gallery") {
                                 self.gallery_open = !self.gallery_open;
                             }
-                            egui::containers::menu::MenuButton::new("File")
-                                .config(
-                                    egui::containers::menu::MenuConfig::new().close_behavior(
-                                        egui::PopupCloseBehavior::CloseOnClickOutside,
-                                    ),
-                                )
-                                .ui(ui, |ui| {
-                                    ui.spacing_mut().interact_size.y = t.control_h;
-                                    self.file_menu_ui(ui, class, &t, Some(menu_room));
-                                });
+                            self.pill_menu(ui, "File", CLOSE_OUT, |app, ui| {
+                                ui.spacing_mut().interact_size.y = t.control_h;
+                                app.file_menu_ui(ui, class, &t, Some(menu_room));
+                            });
                             if self.pill(ui, "Reference") {
                                 self.ref_open = !self.ref_open;
                             }
@@ -478,16 +494,10 @@ impl ProCraftApp {
                             if design::theme_toggle(ui, &t, &mut self.theme) {
                                 self.status = format!("{} theme.", self.theme.name());
                             }
-                            egui::containers::menu::MenuButton::new("View")
-                                .config(
-                                    egui::containers::menu::MenuConfig::new().close_behavior(
-                                        egui::PopupCloseBehavior::CloseOnClickOutside,
-                                    ),
-                                )
-                                .ui(ui, |ui| {
-                                    ui.spacing_mut().interact_size.y = t.control_h;
-                                    self.view_controls(ui, true);
-                                });
+                            self.pill_menu(ui, "View", CLOSE_OUT, |app, ui| {
+                                ui.spacing_mut().interact_size.y = t.control_h;
+                                app.view_controls(ui, true);
+                            });
                         });
                     });
                 });
@@ -566,10 +576,10 @@ impl ProCraftApp {
                                     )
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(t.gap, t.gap);
+                                            ui.spacing_mut().item_spacing =
+                                                egui::vec2(t.gap, t.gap);
                                             for tool in PHONE_STRIP_TOOLS {
-                                                let face =
-                                                    strip_tool_face(tool, self.has_symbols);
+                                                let face = strip_tool_face(tool, self.has_symbols);
                                                 if self.toggle_pill(ui, face, self.tool == tool) {
                                                     self.choose_tool(tool);
                                                 }
@@ -618,88 +628,55 @@ impl ProCraftApp {
                                             if self.pill(ui, "Gallery") {
                                                 self.gallery_open = !self.gallery_open;
                                             }
-                                            egui::containers::menu::MenuButton::new("File")
-                                                .config(
-                                                    egui::containers::menu::MenuConfig::new()
-                                                        .close_behavior(
-                                                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                                                        ),
-                                                )
-                                                .ui(ui, |ui| {
-                                                    ui.spacing_mut().interact_size.y = t.control_h;
-                                                    self.file_menu_ui(
-                                                        ui,
-                                                        class,
-                                                        &t,
-                                                        Some(menu_room),
-                                                    );
-                                                });
+                                            self.pill_menu(ui, "File", CLOSE_OUT, |app, ui| {
+                                                ui.spacing_mut().interact_size.y = t.control_h;
+                                                app.file_menu_ui(ui, class, &t, Some(menu_room));
+                                            });
                                             if self.pill(ui, "Reference") {
                                                 self.ref_open = !self.ref_open;
                                             }
-                                            egui::containers::menu::MenuButton::new("More")
-                                                .config(
-                                                    egui::containers::menu::MenuConfig::new()
-                                                        .close_behavior(
-                                                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                                                        ),
-                                                )
-                                                .ui(ui, |ui| {
-                                                    ui.spacing_mut().interact_size.y = t.control_h;
-                                                    let armed =
-                                                        self.xform.mode != XformMode::Off;
-                                                    if ui
-                                                        .button(if armed {
-                                                            "Finish transform"
-                                                        } else {
-                                                            "Transform"
-                                                        })
-                                                        .clicked()
-                                                    {
-                                                        if armed {
-                                                            // Disarm keeps the
-                                                            // applied warp and
-                                                            // hides the handles.
-                                                            self.xform.arm(
-                                                                XformMode::Off,
-                                                                &self.doc,
-                                                            );
-                                                            self.status =
-                                                                "Transform finished.".to_string();
-                                                        } else {
-                                                            self.xform.arm(
-                                                                XformMode::Free,
-                                                                &self.doc,
-                                                            );
-                                                            self.status = xform_mode_status(
-                                                                XformMode::Free,
-                                                            )
-                                                            .to_string();
-                                                        }
-                                                        ui.close();
+                                            self.pill_menu(ui, "More", CLOSE_OUT, |app, ui| {
+                                                ui.spacing_mut().interact_size.y = t.control_h;
+                                                let armed = app.xform.mode != XformMode::Off;
+                                                if ui
+                                                    .button(if armed {
+                                                        "Finish transform"
+                                                    } else {
+                                                        "Transform"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    if armed {
+                                                        // Disarm keeps the
+                                                        // applied warp and
+                                                        // hides the handles.
+                                                        app.xform.arm(XformMode::Off, &app.doc);
+                                                        app.status =
+                                                            "Transform finished.".to_string();
+                                                    } else {
+                                                        app.xform.arm(XformMode::Free, &app.doc);
+                                                        app.status =
+                                                            xform_mode_status(XformMode::Free)
+                                                                .to_string();
                                                     }
-                                                    if ui.button("Clear layer").clicked() {
-                                                        self.clear_layer();
-                                                        ui.close();
-                                                    }
-                                                    if ui
-                                                        .button(format!(
-                                                            "Theme: {}",
-                                                            self.theme.name()
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        self.theme =
-                                                            design::next_theme(self.theme);
-                                                        self.status = format!(
-                                                            "{} theme.",
-                                                            self.theme.name()
-                                                        );
-                                                        ui.close();
-                                                    }
-                                                    ui.separator();
-                                                    self.view_controls(ui, true);
-                                                });
+                                                    ui.close();
+                                                }
+                                                if ui.button("Clear layer").clicked() {
+                                                    app.clear_layer();
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .button(format!("Theme: {}", app.theme.name()))
+                                                    .clicked()
+                                                {
+                                                    app.theme = design::next_theme(app.theme);
+                                                    app.status =
+                                                        format!("{} theme.", app.theme.name());
+                                                    ui.close();
+                                                }
+                                                ui.separator();
+                                                app.view_controls(ui, true);
+                                            });
                                         });
                                     });
                                 if design::icon_button(ui, &t, design::Icon::ChevronDown, hit)

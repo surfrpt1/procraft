@@ -12,10 +12,13 @@ impl ProCraftApp {
         )
     }
 
-    /// A plain action button in the B2 visual language. Menu triggers stay
-    /// stock `MenuButton`s on purpose; anything that is just "click me" is a
-    /// pill.
+    /// A plain action button in the B2 visual language.
     pub(crate) fn pill(&self, ui: &mut egui::Ui, label: &str) -> bool {
+        self.pill_response(ui, label).clicked()
+    }
+
+    /// The same pill, handing back its response so a popup can hang off it.
+    pub(crate) fn pill_response(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
         let t = self.tokens(ui);
         design::pill_button(
             ui,
@@ -28,7 +31,23 @@ impl ProCraftApp {
                 enabled: true,
             },
         )
-        .clicked()
+    }
+
+    /// A pill that opens a menu. Every top-bar control is a pill, including
+    /// the menu triggers; the popup itself is egui's stock menu popup, so
+    /// click-outside and `ui.close()` behave exactly as before.
+    pub(crate) fn pill_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        close: egui::PopupCloseBehavior,
+        content: impl FnOnce(&mut ProCraftApp, &mut egui::Ui),
+    ) {
+        let resp = self.pill_response(ui, label);
+        egui::Popup::menu(&resp)
+            .close_behavior(close)
+            .info(egui::UiStackInfo::new(egui::UiKind::Menu))
+            .show(|ui| content(self, ui));
     }
 
     /// Current paint colour as a tappable dot. On mobile it doubles as the

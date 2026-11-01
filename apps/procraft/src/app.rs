@@ -262,6 +262,9 @@ pub(crate) struct ProCraftApp {
     /// built for another screen (rotation, split view): the page is re-fitted
     /// or its pan re-clamped so no drawing area is left behind.
     pub(crate) last_canvas_size: egui::Vec2,
+    /// Page rotation seen on the last frame. A change drops the scroll
+    /// area's own offset, which is measured against the old orientation.
+    pub(crate) last_view_angle: f32,
     pub(crate) status: String,
     /// M33 Gallery: recent project paths (newest first, max 10),
     /// the browser window flag, cached per-path thumbnails, the key
@@ -520,6 +523,7 @@ impl ProCraftApp {
             editing_loaded: None,
             zoom: 1.0,
             last_canvas_size: egui::Vec2::ZERO,
+            last_view_angle: 0.0,
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
                     .to_string(),
