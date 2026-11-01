@@ -216,26 +216,6 @@ impl ProCraftApp {
             MobileDrawer::None
         };
 
-        if shown != MobileDrawer::None {
-            egui::Area::new(egui::Id::new("mobile-scrim"))
-                .order(egui::Order::Middle)
-                .fixed_pos(vp.min)
-                .interactable(drawer_open)
-                .show(ctx, |ui| {
-                    let (rect, resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        egui::Color32::from_black_alpha((110.0 * draw_slide) as u8),
-                    );
-                    if drawer_open && resp.clicked() {
-                        self.drawer = MobileDrawer::None;
-                        self.show_tools = false;
-                        self.show_layers = false;
-                    }
-                });
-        }
-
         if !phone {
             // The File popup hangs off a top island, so it must stop before
             // the options capsule (or the bottom inset when there is none).
@@ -583,52 +563,86 @@ impl ProCraftApp {
                 )
             };
             let slide = drawer_slide_distance(draw_slide, w, pad);
-            let pos = if tools {
-                egui::pos2(vp.left() + pad - slide, top)
+            let panel = if tools {
+                egui::Rect::from_min_size(
+                    egui::pos2(vp.left() + pad - slide, top),
+                    egui::vec2(w, h),
+                )
             } else {
-                egui::pos2(vp.right() - pad - w + slide, top)
+                egui::Rect::from_min_size(
+                    egui::pos2(vp.right() - pad - w + slide, top),
+                    egui::vec2(w, h),
+                )
             };
+            let mut dismiss = false;
             egui::Area::new(egui::Id::new(if tools {
                 "mobile-drawer-tools"
             } else {
                 "mobile-drawer-layers"
             }))
-            // One tier below popups: pressing a button in the drawer raises
-            // the area to the top of its own order, which would otherwise put
-            // the drawer over a menu opened from it. Menus are Foreground.
+            // One tier below popups, so a ComboBox or menu opened from the
+            // panel still draws over it.
             .order(egui::Order::Middle)
             // Areas are clamped into the viewport by default, which pins the
-            // closed drawer to the edge and kills the slide. Let it sit off
-            // screen; the viewport clip still trims it.
+            // closed drawer to the edge and kills the slide. Unclamped, the
+            // area covers the whole viewport instead: dim and panel live in
+            // one area, so no press can lift the dim over the panel. A split
+            // scrim area could not hold that: egui raises whichever same-order
+            // area is pressed, and the raise sticks, greying the drawer out.
             .constrain(false)
-            .fixed_pos(pos)
+            .fixed_pos(vp.min)
             .interactable(drawer_open)
             .show(ctx, |ui| {
-                // The panel covers its own gaps (margins, card spacing) so a
-                // drag or tap between cards can never reach the canvas.
-                let block = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h));
-                ui.interact(
-                    block,
-                    egui::Id::new("mobile-drawer-block"),
-                    egui::Sense::click_and_drag(),
+                let (dim, dim_resp) = ui.allocate_exact_size(vp.size(), egui::Sense::click());
+                ui.painter().rect_filled(
+                    dim,
+                    0.0,
+                    egui::Color32::from_black_alpha((110.0 * draw_slide) as u8),
                 );
-                ui.allocate_ui_with_layout(
-                    egui::vec2(w, h),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        drawer_frame().show(ui, |ui| {
-                            ui.set_width(w - 2.0 * 6.0);
-                            if tools {
-                                self.tools_panel_body(ui, h < 400.0);
-                            } else {
-                                self.layers_panel_body(ui);
-                            }
-                        });
-                    },
-                );
+                if drawer_open && dim_resp.clicked() {
+                    dismiss = true;
+                }
+                // The panel is laid out at its slide position, after the dim,
+                // so it always paints above it. Its widgets are added after
+                // the dim too, so they win every hit test inside its rect.
+                ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+                    // The panel covers its own gaps (margins, card spacing) so
+                    // a drag or tap between cards can never reach the canvas.
+                    let block = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, h));
+                    ui.interact(
+                        block,
+                        egui::Id::new("mobile-drawer-block"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(w, h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            drawer_frame().show(ui, |ui| {
+                                ui.set_width(w - 2.0 * 6.0);
+                                if tools {
+                                    self.tools_panel_body(ui, h < 400.0);
+                                } else {
+                                    self.layers_panel_body(ui);
+                                }
+                            });
+                        },
+                    );
+                });
             });
-            // The panel bodies own their close arrows; honor them.
-            if drawer_open && ((tools && !self.show_tools) || (!tools && !self.show_layers)) {
+            if dismiss {
+                self.drawer = MobileDrawer::None;
+                self.show_tools = false;
+                self.show_layers = false;
+            }
+            // The panel bodies own their close arrows; honor them. Only for
+            // the drawer this frame actually drew: a top-island tap swaps
+            // `self.drawer` after the panel was chosen, and the old flags would
+            // otherwise read as a close arrow and swing both drawers shut.
+            if drawer_open
+                && self.drawer == shown
+                && ((tools && !self.show_tools) || (!tools && !self.show_layers))
+            {
                 self.drawer = MobileDrawer::None;
             }
         }
