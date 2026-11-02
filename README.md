@@ -32,6 +32,34 @@ Android files live in the app's external folder
 in-app Import browser reads it, and saves land there, then appear in
 Photos after a media scan.
 
+## Large pages, memory and GPUs
+
+Pages are capped at 8192 px per side. Layers are stored in 256 px tiles
+allocated only where you paint, so an empty page costs nothing.
+
+| Page | Pixels | One fully painted layer | Renderer |
+|---|---|---|---|
+| 1080p | 1920 × 1080 | ~8 MB | whole-page texture |
+| 4K | 4096 × 4096 | ~64 MB | viewport renderer |
+| 8K | 8192 × 8192 | ~256 MB | viewport renderer |
+
+- Pages above 2048 px, and any page bigger than the GPU's texture limit,
+  draw through the viewport renderer: only the visible rectangle is
+  composited and uploaded, so 4K/8K never hold a 64/256 MB canvas texture
+  in VRAM. At fit zoom below 75% the same path draws a box-filtered view.
+- Composite tiles use a 96 MB cache on phones/tablets and 320 MB on
+  desktop; the Layers panel shows live layer memory.
+- Undo keeps up to 32 steps and at most 256 MB per stack. Pages where a
+  step costs more (4K/8K) get fewer steps; a normal stroke only stores
+  the tiles it touched. A full 8K layer edit is the one-step worst case.
+- Whole-canvas operations (filters, transforms, resize, flatten, export)
+  still process every pixel and can need hundreds of MB of scratch at 8K.
+  When memory runs out they report it and leave the document untouched.
+- Low-RAM phones/tablets and old integrated GPUs are comfortable at 1080p
+  and 4K; 8K is for machines with several GB of free RAM. On Android the
+  app falls back to the GLES renderer when wgpu cannot start.
+- GIF import is capped at 4096 px per side.
+
 ## Status: milestone 50 + v0.11.0 extras
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
