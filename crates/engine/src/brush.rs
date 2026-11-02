@@ -2133,11 +2133,11 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             Brush {
                 size: 24.0,
                 opacity: 1.0,
-                softness: 0.1,
+                softness: 0.15,
                 spacing: 0.1,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.6,
+                pressure_size: 0.7,
                 pressure_opacity: 0.12,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
@@ -2165,25 +2165,19 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 shape_count_jitter: 0.0,
                 pressure_curve: None,
                 pressure_opacity_curve: None,
-                taper: Taper {
-                    start: 0.15,
-                    end: 0.25,
-                    size: 0.6,
-                    shape: 1.0,
-                    ..Taper::NONE
-                },
+                taper: Taper::NONE,
             },
         ),
         (
             "Marker",
             Brush {
                 size: 28.0,
-                opacity: 0.7,
-                softness: 0.03,
-                spacing: 0.05,
+                opacity: 0.85,
+                softness: 0.1,
+                spacing: 0.06,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.12,
+                pressure_size: 0.2,
                 pressure_opacity: 0.12,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
@@ -2218,18 +2212,18 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
             "Airbrush",
             Brush {
                 size: 64.0,
-                opacity: 0.25,
+                opacity: 0.85,
                 softness: 1.0,
-                spacing: 0.03,
+                spacing: 0.05,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.1,
-                pressure_opacity: 0.6,
+                pressure_size: 0.3,
+                pressure_opacity: 0.9,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.0,
+                grain: 0.1,
                 grain_scale: 1.5,
                 grain_tip: None,
                 grain_angle: 0.0,
@@ -2257,20 +2251,20 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
         (
             "Chalk",
             Brush {
-                size: 22.0,
+                size: 18.0,
                 opacity: 1.0,
-                softness: 0.4,
-                spacing: 0.08,
+                softness: 0.7,
+                spacing: 0.15,
                 eraser: false,
                 tip: None,
-                pressure_size: 0.35,
-                pressure_opacity: 0.3,
+                pressure_size: 0.6,
+                pressure_opacity: 0.6,
                 velocity_size: 0.0,
                 velocity_opacity: 0.0,
                 velocity_size_curve: None,
                 velocity_opacity_curve: None,
-                grain: 0.52,
-                grain_scale: 1.1,
+                grain: 0.55,
+                grain_scale: 0.7,
                 grain_tip: None,
                 grain_angle: 0.0,
                 roundness: 1.0,
@@ -2279,7 +2273,7 @@ pub fn presets() -> Vec<(&'static str, Brush)> {
                 opacity_jitter: 0.0,
                 angle: 0.0,
                 angle_follow: false,
-                scatter: 0.1,
+                scatter: 0.12,
                 stabilizer: 0.2,
                 blend: super::document::BlendMode::Normal,
                 wet_edge: 0.0,
@@ -5559,13 +5553,26 @@ mod tests {
     }
 
     #[test]
+    fn round_preset_keeps_round_caps() {
+        // A taper made the nib enter in a wedge and lift at 40% of its
+        // width: a hard round brush ends in the round cap of its last dab.
+        let round = presets()
+            .into_iter()
+            .find(|(name, _)| *name == "Round")
+            .map(|(_, b)| b)
+            .expect("Round preset");
+        assert_eq!(round.taper.start, 0.0, "Round enters in a wedge");
+        assert_eq!(round.taper.end, 0.0, "Round lifts in a clipped cap");
+    }
+
+    #[test]
     fn marker_preset_lays_a_hard_chisel_band() {
         let doc = paint_straight("Marker", 240, 80);
         let width = (0..80).filter(|&y| alpha_at(&doc, 120, y) > 0).count();
         assert!((14..=24).contains(&width), "marker width {width} px");
         let core = alpha_at(&doc, 120, 40);
         assert!(
-            (150..=200).contains(&core),
+            (200..=230).contains(&core),
             "marker ink should stay translucent, core alpha {core}"
         );
         // A hard nib keeps full ink at 80% of its half-width; a soft one has
@@ -5627,13 +5634,14 @@ mod tests {
     }
 
     #[test]
-    fn airbrush_preset_is_a_smooth_even_haze() {
+    fn airbrush_preset_lays_a_dense_soft_haze() {
         let doc = paint_straight("Airbrush", 260, 120);
         let row = |y: u32| -> Vec<i32> { (40..220).map(|x| alpha_at(&doc, x, y) as i32).collect() };
         let center = row(60);
         let (min, max) = (*center.iter().min().unwrap(), *center.iter().max().unwrap());
-        assert!(max - min <= 6, "airbrush speckles {min}..{max}");
-        assert!((60..=100).contains(&max), "airbrush core alpha {max}");
+        // Fine spray tooth is fine; banding is not.
+        assert!(max - min <= 40, "airbrush bands {min}..{max}");
+        assert!((185..=220).contains(&max), "airbrush core alpha {max}");
         let off = *row(75).iter().max().unwrap();
         assert!(
             off < max,
