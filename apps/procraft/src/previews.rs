@@ -116,7 +116,13 @@ pub(crate) fn preview_brush(brush: &Brush, strip_h: f32) -> Brush {
         eraser: false,
         ..brush.clone()
     };
-    b.size = b.size.min(strip_h * PREVIEW_SIZE_FRAC).max(1.0);
+    // Scattered dabs land up to `scatter * size` off the path, so shrink the
+    // preview stroke to keep those dabs inside the strip too.
+    let scatter = b.scatter.max(0.0);
+    b.size = b
+        .size
+        .min(strip_h * PREVIEW_SIZE_FRAC / (1.0 + 2.0 * scatter))
+        .max(1.0);
     b
 }
 
