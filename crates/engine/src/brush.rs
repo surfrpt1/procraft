@@ -3609,7 +3609,7 @@ mod tests {
         use crate::document::Document;
         let mut doc = Document::new(20, 20);
         doc.selection = Some((5, 5, 14, 14));
-        assert!(doc.feather_selection(3));
+        assert!(doc.feather_selection(3).unwrap());
         let ramp = doc.selection_mask.clone().unwrap()[(4 * 20 + 10) as usize];
         assert!(ramp > 0 && ramp < 255, "{ramp}");
         // Solid 2x2 stamp tip through the ramp paints partially.

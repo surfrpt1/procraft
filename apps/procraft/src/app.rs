@@ -265,6 +265,11 @@ pub(crate) struct ProCraftApp {
     /// Page rotation seen on the last frame. A change drops the scroll
     /// area's own offset, which is measured against the old orientation.
     pub(crate) last_view_angle: f32,
+    /// True only for the first frame: the dock scroll areas draw at offset
+    /// zero so a saved ScrollArea offset (eframe persists the whole egui
+    /// memory) cannot reopen a panel halfway down. In-session scrolling is
+    /// untouched once the frame has run.
+    pub(crate) launch_scroll_reset: bool,
     pub(crate) status: String,
     /// M33 Gallery: recent project paths (newest first, max 10),
     /// the browser window flag, cached per-path thumbnails, the key
@@ -524,6 +529,7 @@ impl ProCraftApp {
             zoom: 1.0,
             last_canvas_size: egui::Vec2::ZERO,
             last_view_angle: 0.0,
+            launch_scroll_reset: true,
             status:
                 "Drag on the canvas to paint. Ctrl+Z undoes, Ctrl+Y redoes, Esc clears selection."
                     .to_string(),

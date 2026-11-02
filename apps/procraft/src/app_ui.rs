@@ -2226,18 +2226,19 @@ impl eframe::App for ProCraftApp {
                         if self.lasso_points.len() >= 3 {
                             let pts = self.lasso_points.clone();
                             match self.doc.set_lasso(&pts) {
-                                Some(_) => {
+                                Ok(Some(_)) => {
                                     self.lasso_poly = pts;
                                     self.status = format!(
                                         "Lasso: {} px selected.",
                                         self.doc.selection_pixel_count()
                                     );
                                 }
-                                None => {
+                                Ok(None) => {
                                     self.doc.clear_selection();
                                     self.lasso_poly.clear();
                                     self.status = "Lasso too small.".to_string();
                                 }
+                                Err(e) => self.status = e,
                             }
                         } else {
                             self.doc.clear_selection();
@@ -3286,5 +3287,9 @@ impl eframe::App for ProCraftApp {
         if shell == Shell::Mobile {
             self.mobile_chrome(ui.ctx(), class);
         }
+
+        // Both docks were laid out once; from here on scroll positions are
+        // the user's (and eframe's to persist).
+        self.launch_scroll_reset = false;
     }
 }

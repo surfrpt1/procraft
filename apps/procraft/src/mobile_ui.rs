@@ -992,11 +992,13 @@ impl ProCraftApp {
                     .add_enabled(has_selection, egui::Button::new("Apply"))
                     .clicked()
                 {
-                    if self.doc.feather_selection(self.sel_feather) {
-                        self.status =
-                            format!("Feathered ({} px).", self.doc.selection_pixel_count());
-                    } else {
-                        self.status = "No selection to feather.".to_string();
+                    match self.doc.feather_selection(self.sel_feather) {
+                        Ok(true) => {
+                            self.status =
+                                format!("Feathered ({} px).", self.doc.selection_pixel_count());
+                        }
+                        Ok(false) => self.status = "No selection to feather.".to_string(),
+                        Err(e) => self.status = e,
                     }
                     self.sel_edges_dirty = true;
                 }
@@ -1007,10 +1009,13 @@ impl ProCraftApp {
                     .add_enabled(has_selection, egui::Button::new("Apply"))
                     .clicked()
                 {
-                    if self.doc.grow_selection(self.sel_grow) {
-                        self.status = format!("Grown ({} px).", self.doc.selection_pixel_count());
-                    } else {
-                        self.status = "No selection to grow.".to_string();
+                    match self.doc.grow_selection(self.sel_grow) {
+                        Ok(true) => {
+                            self.status =
+                                format!("Grown ({} px).", self.doc.selection_pixel_count());
+                        }
+                        Ok(false) => self.status = "No selection to grow.".to_string(),
+                        Err(e) => self.status = e,
                     }
                     self.sel_edges_dirty = true;
                 }
@@ -1021,11 +1026,15 @@ impl ProCraftApp {
                     .add_enabled(has_selection, egui::Button::new("Select"))
                     .clicked()
                 {
-                    if self.doc.select_opaque(self.sel_opaque_t) {
-                        self.status =
-                            format!("Opaque selected ({} px).", self.doc.selection_pixel_count());
-                    } else {
-                        self.status = "Layer is empty.".to_string();
+                    match self.doc.select_opaque(self.sel_opaque_t) {
+                        Ok(true) => {
+                            self.status = format!(
+                                "Opaque selected ({} px).",
+                                self.doc.selection_pixel_count()
+                            );
+                        }
+                        Ok(false) => self.status = "Layer is empty.".to_string(),
+                        Err(e) => self.status = e,
                     }
                     self.sel_edges_dirty = true;
                 }
@@ -1039,13 +1048,19 @@ impl ProCraftApp {
                     )
                     .clicked()
                 {
-                    self.doc.checkpoint();
                     let brush = self.base_brush();
                     let color = self.current_color();
-                    if self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
-                        self.status = "Outlined.".to_string();
-                    } else {
-                        self.status = "No selection to outline.".to_string();
+                    self.doc.checkpoint();
+                    match self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
+                        Ok(true) => self.status = "Outlined.".to_string(),
+                        Ok(false) => {
+                            self.doc.discard_last_checkpoint();
+                            self.status = "No selection to outline.".to_string();
+                        }
+                        Err(e) => {
+                            self.doc.discard_last_checkpoint();
+                            self.status = e;
+                        }
                     }
                 }
             }
@@ -1054,11 +1069,13 @@ impl ProCraftApp {
                     .add_enabled(has_selection, egui::Button::new("Invert"))
                     .clicked()
                 {
-                    if self.doc.invert_selection() {
-                        self.status =
-                            format!("Inverted ({} px).", self.doc.selection_pixel_count());
-                    } else {
-                        self.status = "No selection to invert.".to_string();
+                    match self.doc.invert_selection() {
+                        Ok(true) => {
+                            self.status =
+                                format!("Inverted ({} px).", self.doc.selection_pixel_count());
+                        }
+                        Ok(false) => self.status = "No selection to invert.".to_string(),
+                        Err(e) => self.status = e,
                     }
                     self.sel_edges_dirty = true;
                 }
@@ -1079,11 +1096,13 @@ impl ProCraftApp {
                     .add_enabled(has_selection, egui::Button::new("Smooth"))
                     .clicked()
                 {
-                    if self.doc.smooth_selection() {
-                        self.status =
-                            format!("Smoothed ({} px).", self.doc.selection_pixel_count());
-                    } else {
-                        self.status = "No selection to smooth.".to_string();
+                    match self.doc.smooth_selection() {
+                        Ok(true) => {
+                            self.status =
+                                format!("Smoothed ({} px).", self.doc.selection_pixel_count());
+                        }
+                        Ok(false) => self.status = "No selection to smooth.".to_string(),
+                        Err(e) => self.status = e,
                     }
                     self.sel_edges_dirty = true;
                 }

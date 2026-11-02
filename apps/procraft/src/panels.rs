@@ -1,5 +1,15 @@
 use crate::*;
 
+/// Smallest name column worth rendering before the row's trailing controls
+/// squeeze it out; a truncated name still identifies the layer.
+const LAYER_NAME_MIN_WIDTH: f32 = 48.0;
+
+/// Width for a layer name in the row: whatever is left after the trailing
+/// del/Out/T-M-C controls, floored so a cramped dock still shows a name.
+pub(crate) fn layer_name_width(available: f32, reserved: f32) -> f32 {
+    (available - reserved).max(LAYER_NAME_MIN_WIDTH)
+}
+
 impl ProCraftApp {
     /// Zoom/rotate/About cluster shared by the wide bar (inline) and the
     /// narrow/tablet bar (inside a View menu). `in_menu` dismisses the popup
@@ -89,7 +99,11 @@ impl ProCraftApp {
 
     /// Tools panel body shared by the desktop dock and the mobile drawer.
     pub(crate) fn tools_panel_body(&mut self, ui: &mut egui::Ui, compact: bool) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let mut scroll = egui::ScrollArea::vertical();
+        if self.launch_scroll_reset {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             let t = self.tokens(ui);
             let mut close_tools = false;
             design::section_card_actions(
@@ -293,56 +307,87 @@ impl ProCraftApp {
                     }
                     stepped_slider(ui, &mut self.sel_feather, 0..=32, 1.0, "Feather px");
                     if ui.button("Apply feather").clicked() {
-                        if self.doc.feather_selection(self.sel_feather) {
-                            self.status = format!("Feathered ({} px).", self.doc.selection_pixel_count());
-                        } else {
-                            self.status = "No selection to feather.".to_string();
+                        match self.doc.feather_selection(self.sel_feather) {
+                            Ok(true) => {
+                                self.status = format!(
+                                    "Feathered ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                            Ok(false) => self.status = "No selection to feather.".to_string(),
+                            Err(e) => self.status = e,
                         }
                         self.sel_edges_dirty = true;
                     }
                     stepped_slider(ui, &mut self.sel_grow, -32..=32, 1.0, "Grow px");
                     if ui.button("Apply grow").clicked() {
-                        if self.doc.grow_selection(self.sel_grow) {
-                            self.status = format!("Grown ({} px).", self.doc.selection_pixel_count());
-                        } else {
-                            self.status = "No selection to grow.".to_string();
+                        match self.doc.grow_selection(self.sel_grow) {
+                            Ok(true) => {
+                                self.status = format!(
+                                    "Grown ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                            Ok(false) => self.status = "No selection to grow.".to_string(),
+                            Err(e) => self.status = e,
                         }
                         self.sel_edges_dirty = true;
                     }
                     if ui.button("Smooth").clicked() {
-                        if self.doc.smooth_selection() {
-                            self.status = format!("Smoothed ({} px).", self.doc.selection_pixel_count());
-                        } else {
-                            self.status = "No selection to smooth.".to_string();
+                        match self.doc.smooth_selection() {
+                            Ok(true) => {
+                                self.status = format!(
+                                    "Smoothed ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                            Ok(false) => self.status = "No selection to smooth.".to_string(),
+                            Err(e) => self.status = e,
                         }
                         self.sel_edges_dirty = true;
                     }
                     if ui.button("Invert").clicked() {
-                        if self.doc.invert_selection() {
-                            self.status = format!("Inverted ({} px).", self.doc.selection_pixel_count());
-                        } else {
-                            self.status = "No selection to invert.".to_string();
+                        match self.doc.invert_selection() {
+                            Ok(true) => {
+                                self.status = format!(
+                                    "Inverted ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                            Ok(false) => self.status = "No selection to invert.".to_string(),
+                            Err(e) => self.status = e,
                         }
                         self.sel_edges_dirty = true;
                     }
                     stepped_slider(ui, &mut self.sel_opaque_t, 0..=255, 1.0, "Opacity >");
                     if ui.button("Select opaque").clicked() {
-                        if self.doc.select_opaque(self.sel_opaque_t) {
-                            self.status = format!("Opaque selected ({} px).", self.doc.selection_pixel_count());
-                        } else {
-                            self.status = "Layer is empty.".to_string();
+                        match self.doc.select_opaque(self.sel_opaque_t) {
+                            Ok(true) => {
+                                self.status = format!(
+                                    "Opaque selected ({} px).",
+                                    self.doc.selection_pixel_count()
+                                );
+                            }
+                            Ok(false) => self.status = "Layer is empty.".to_string(),
+                            Err(e) => self.status = e,
                         }
                         self.sel_edges_dirty = true;
                     }
                     stepped_slider(ui, &mut self.sel_stroke_w, 1..=16, 1.0, "Outline px");
                     if ui.button("Paint outline").clicked() && !self.text_paint_blocked() {
-                        self.doc.checkpoint();
                         let brush = self.base_brush();
                         let color = self.current_color();
-                        if self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
-                            self.status = "Outlined.".to_string();
-                        } else {
-                            self.status = "No selection to outline.".to_string();
+                        self.doc.checkpoint();
+                        match self.doc.stroke_selection(&brush, color, self.sel_stroke_w) {
+                            Ok(true) => self.status = "Outlined.".to_string(),
+                            Ok(false) => {
+                                self.doc.discard_last_checkpoint();
+                                self.status = "No selection to outline.".to_string();
+                            }
+                            Err(e) => {
+                                self.doc.discard_last_checkpoint();
+                                self.status = e;
+                            }
                         }
                     }
                     // M35 Selection upgrades: save/load slot (session-only;
@@ -397,29 +442,33 @@ impl ProCraftApp {
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Apply nudge").clicked() {
                             let (dx, dy) = (self.sel_nudge_x, self.sel_nudge_y);
-                            if self.doc.translate_selection(dx, dy) {
-                                self.status = format!(
-                                    "Nudged ({dx},{dy}, {} px).",
-                                    self.doc.selection_pixel_count()
-                                );
-                            } else {
-                                self.status = "Nudge cleared the selection.".to_string();
+                            match self.doc.translate_selection(dx, dy) {
+                                Ok(true) => {
+                                    self.status = format!(
+                                        "Nudged ({dx},{dy}, {} px).",
+                                        self.doc.selection_pixel_count()
+                                    );
+                                }
+                                Ok(false) => {
+                                    self.status = "Nudge cleared the selection.".to_string();
+                                }
+                                Err(e) => self.status = e,
                             }
                             self.sel_edges_dirty = true;
                         }
                     if ui.button(if self.has_symbols { "⇄ Flip H" } else { "Flip H" }).clicked() {
-                            if self.doc.flip_selection_h() {
-                                self.status = "Flipped horizontal.".to_string();
-                            } else {
-                                self.status = "No selection to flip.".to_string();
+                            match self.doc.flip_selection_h() {
+                                Ok(true) => self.status = "Flipped horizontal.".to_string(),
+                                Ok(false) => self.status = "No selection to flip.".to_string(),
+                                Err(e) => self.status = e,
                             }
                             self.sel_edges_dirty = true;
                         }
                     if ui.button(if self.has_symbols { "⇅ Flip V" } else { "Flip V" }).clicked() {
-                            if self.doc.flip_selection_v() {
-                                self.status = "Flipped vertical.".to_string();
-                            } else {
-                                self.status = "No selection to flip.".to_string();
+                            match self.doc.flip_selection_v() {
+                                Ok(true) => self.status = "Flipped vertical.".to_string(),
+                                Ok(false) => self.status = "No selection to flip.".to_string(),
+                                Err(e) => self.status = e,
                             }
                             self.sel_edges_dirty = true;
                         }
@@ -1255,7 +1304,11 @@ impl ProCraftApp {
     }
 
     pub(crate) fn layers_panel_body(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let mut scroll = egui::ScrollArea::vertical();
+        if self.launch_scroll_reset {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             // Indexes are the only layer identity, so a count change (add,
             // duplicate, merge, delete, undo) invalidates the stored
             // selection; fall back to the active layer.
@@ -1342,12 +1395,35 @@ impl ProCraftApp {
                                 touched = true;
                             }
                             let selected = self.layer_selection.contains(&i);
-                            if Some(i) == self.renaming {
+                            let gap = ui.spacing().item_spacing.x;
+                            let renaming_row = Some(i) == self.renaming;
+                            let name_w = {
+                                let mut trailing = gap + 44.0; // del
+                                if renaming_row {
+                                    trailing += 2.0 * (gap + 44.0); // OK / X
+                                }
+                                if layer.group.is_some() {
+                                    trailing += gap + 44.0; // Out
+                                }
+                                for present in [layer.is_text(), layer.mask.is_some(), layer.clip] {
+                                    if present {
+                                        trailing += gap + 12.0; // T / M / C
+                                    }
+                                }
+                                layer_name_width(ui.available_width(), trailing)
+                            };
+                            if renaming_row {
                                 // Double-clicked: edit the name in a staged buffer so
                                 // Cancel can discard it. Commits via Save, Enter, or
                                 // focus loss (touch keyboards often send neither, so
                                 // the buttons are the reliable path on iPad).
-                                let resp = ui.text_edit_singleline(&mut self.renaming_text);
+                                // The editor takes only the reserved name column
+                                // (OK/X are in `trailing` above), so the row never
+                                // asks the resizable dock to grow wider.
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.renaming_text)
+                                        .desired_width(name_w),
+                                );
                                 if !resp.has_focus() {
                                     resp.request_focus();
                                 }
@@ -1382,10 +1458,15 @@ impl ProCraftApp {
                                     self.renaming_text.clear();
                                 }
                             } else {
-                                let resp =
-                                    ui.selectable_label(selected, &layer.name).on_hover_text(
-                                        "Ctrl/Shift-click or long-press to select several layers",
-                                    );
+                                let resp = ui
+                                    .add_sized(
+                                        [name_w, ui.spacing().interact_size.y],
+                                        egui::Button::selectable(selected, &layer.name).truncate(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}\nCtrl/Shift-click or long-press to select several layers",
+                                        layer.name
+                                    ));
                                 let long = resp.long_touched();
                                 let mods = ui.ctx().input(|inp| inp.modifiers);
                                 if resp.clicked() {
@@ -2028,55 +2109,65 @@ impl ProCraftApp {
                     );
                     if (self.filt_brightness, self.filt_contrast) != tone_before {
                         let (b, c) = (self.filt_brightness, self.filt_contrast);
-                        self.filter_scrub(0, move |doc, layer| {
-                            doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
-                        });
-                        self.status = "Previewing tone — Apply to keep.".to_string();
+                        match self.filter_scrub(0, move |doc, layer| {
+                            doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0)
+                        }) {
+                            Ok(()) => self.status = "Previewing tone — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply tone").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 0) {
                             let (b, c) = (self.filt_brightness, self.filt_contrast);
-                            self.doc.checkpoint();
-                            self.doc.adjust_tone(
-                                self.doc.active,
-                                (b as f32 * 2.55).round() as i32,
-                                c / 100.0,
-                            );
+                            self.apply_filter_once(move |doc| {
+                                doc.adjust_tone(
+                                    doc.active,
+                                    (b as f32 * 2.55).round() as i32,
+                                    c / 100.0,
+                                )
+                            })
                         } else {
                             // Throttled-stale preview (or a fresh one): stamp the
                             // latest values over the scrub snapshot — same undo step.
                             let (b, c) = (self.filt_brightness, self.filt_contrast);
                             self.restamp_preview(move |doc, layer| {
-                                doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0);
-                            });
-                        }
+                                doc.adjust_tone(layer, (b as f32 * 2.55).round() as i32, c / 100.0)
+                            })
+                        };
                         self.filter_preview = None;
-                        self.status = "Tone applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Tone applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     let blur_before = self.filt_blur;
                     stepped_slider_label_end(ui, &mut self.filt_blur, 0..=25, 1.0, "Blur");
                     if self.filt_blur != blur_before {
                         let r = self.filt_blur.max(0) as u32;
-                        self.filter_scrub(1, move |doc, layer| {
-                            doc.blur_layer(layer, r);
-                        });
-                        self.status = "Previewing blur — Apply to keep.".to_string();
+                        match self.filter_scrub(1, move |doc, layer| doc.blur_layer(layer, r)) {
+                            Ok(()) => self.status = "Previewing blur — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply blur").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
-                            self.doc.checkpoint();
-                            self.doc
-                                .blur_layer(self.doc.active, self.filt_blur.max(0) as u32);
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 1) {
+                            let r = self.filt_blur.max(0) as u32;
+                            self.apply_filter_once(move |doc| doc.blur_layer(doc.active, r))
                         } else {
                             let r = self.filt_blur.max(0) as u32;
-                            self.restamp_preview(move |doc, layer| {
-                                doc.blur_layer(layer, r);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.blur_layer(layer, r))
+                        };
                         self.filter_preview = None;
-                        self.status = "Blur applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Blur applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     let sharp_before = self.filt_sharpen;
                     stepped_slider_label_end(
@@ -2088,25 +2179,27 @@ impl ProCraftApp {
                     );
                     if self.filt_sharpen != sharp_before {
                         let s = self.filt_sharpen / 100.0;
-                        self.filter_scrub(2, move |doc, layer| {
-                            doc.sharpen_layer(layer, s);
-                        });
-                        self.status = "Previewing sharpen — Apply to keep.".to_string();
+                        match self.filter_scrub(2, move |doc, layer| doc.sharpen_layer(layer, s)) {
+                            Ok(()) => self.status = "Previewing sharpen — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply sharpen").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
-                            self.doc.checkpoint();
-                            self.doc
-                                .sharpen_layer(self.doc.active, self.filt_sharpen / 100.0);
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 2) {
+                            let s = self.filt_sharpen / 100.0;
+                            self.apply_filter_once(move |doc| doc.sharpen_layer(doc.active, s))
                         } else {
                             let s = self.filt_sharpen / 100.0;
-                            self.restamp_preview(move |doc, layer| {
-                                doc.sharpen_layer(layer, s);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.sharpen_layer(layer, s))
+                        };
                         self.filter_preview = None;
-                        self.status = "Sharpen applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Sharpen applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     // M36 Levels: black/white points + mid gamma, same live
                     // preview + Apply rhythm as tone (preview kind 3).
@@ -2148,33 +2241,30 @@ impl ProCraftApp {
                             self.filt_levels_high,
                         );
                         let lut = levels_lut(s, g, h);
-                        self.filter_scrub(3, move |doc, layer| {
-                            doc.apply_lut(layer, &lut);
-                        });
-                        self.status = "Previewing levels — Apply to keep.".to_string();
+                        match self.filter_scrub(3, move |doc, layer| doc.apply_lut(layer, &lut)) {
+                            Ok(()) => self.status = "Previewing levels — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply levels").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
-                            let lut = levels_lut(
-                                self.filt_levels_shadow,
-                                self.filt_levels_gamma / 100.0,
-                                self.filt_levels_high,
-                            );
-                            self.doc.checkpoint();
-                            self.doc.apply_lut(self.doc.active, &lut);
+                        let lut = levels_lut(
+                            self.filt_levels_shadow,
+                            self.filt_levels_gamma / 100.0,
+                            self.filt_levels_high,
+                        );
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 3) {
+                            self.apply_filter_once(move |doc| doc.apply_lut(doc.active, &lut))
                         } else {
-                            let lut = levels_lut(
-                                self.filt_levels_shadow,
-                                self.filt_levels_gamma / 100.0,
-                                self.filt_levels_high,
-                            );
-                            self.restamp_preview(move |doc, layer| {
-                                doc.apply_lut(layer, &lut);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.apply_lut(layer, &lut))
+                        };
                         self.filter_preview = None;
-                        self.status = "Levels applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Levels applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     // M36 Curves (parametric shadows/mids/highlights through a
                     // pinned-endpoint LUT; preview kind 4).
@@ -2216,33 +2306,30 @@ impl ProCraftApp {
                             self.filt_curve_high,
                         );
                         let lut = curves_lut(s, m, h);
-                        self.filter_scrub(4, move |doc, layer| {
-                            doc.apply_lut(layer, &lut);
-                        });
-                        self.status = "Previewing curves — Apply to keep.".to_string();
+                        match self.filter_scrub(4, move |doc, layer| doc.apply_lut(layer, &lut)) {
+                            Ok(()) => self.status = "Previewing curves — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply curves").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
-                            let lut = curves_lut(
-                                self.filt_curve_shadow,
-                                self.filt_curve_mid,
-                                self.filt_curve_high,
-                            );
-                            self.doc.checkpoint();
-                            self.doc.apply_lut(self.doc.active, &lut);
+                        let lut = curves_lut(
+                            self.filt_curve_shadow,
+                            self.filt_curve_mid,
+                            self.filt_curve_high,
+                        );
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 4) {
+                            self.apply_filter_once(move |doc| doc.apply_lut(doc.active, &lut))
                         } else {
-                            let lut = curves_lut(
-                                self.filt_curve_shadow,
-                                self.filt_curve_mid,
-                                self.filt_curve_high,
-                            );
-                            self.restamp_preview(move |doc, layer| {
-                                doc.apply_lut(layer, &lut);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.apply_lut(layer, &lut))
+                        };
                         self.filter_preview = None;
-                        self.status = "Curves applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Curves applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     // M37 HSL: hue spin + saturation scale + lightness shift
                     // (preview kind 5). Grays only answer to lightness.
@@ -2256,34 +2343,30 @@ impl ProCraftApp {
                             self.filt_sat / 100.0,
                             self.filt_light as f32 / 100.0,
                         );
-                        self.filter_scrub(5, move |doc, layer| {
-                            doc.adjust_hsl(layer, h, s, l);
-                        });
-                        self.status = "Previewing HSL — Apply to keep.".to_string();
+                        match self.filter_scrub(5, move |doc, layer| doc.adjust_hsl(layer, h, s, l)) {
+                            Ok(()) => self.status = "Previewing HSL — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply HSL").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
-                            self.doc.checkpoint();
-                            let active = self.doc.active;
-                            self.doc.adjust_hsl(
-                                active,
-                                self.filt_hue,
-                                self.filt_sat / 100.0,
-                                self.filt_light as f32 / 100.0,
-                            );
+                        let (h, s, l) = (
+                            self.filt_hue,
+                            self.filt_sat / 100.0,
+                            self.filt_light as f32 / 100.0,
+                        );
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 5) {
+                            self.apply_filter_once(move |doc| doc.adjust_hsl(doc.active, h, s, l))
                         } else {
-                            let (h, s, l) = (
-                                self.filt_hue,
-                                self.filt_sat / 100.0,
-                                self.filt_light as f32 / 100.0,
-                            );
-                            self.restamp_preview(move |doc, layer| {
-                                doc.adjust_hsl(layer, h, s, l);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.adjust_hsl(layer, h, s, l))
+                        };
                         self.filter_preview = None;
-                        self.status = "HSL applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "HSL applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     // M37 Color balance: − toward cyan/magenta/yellow, + toward
                     // red/green/blue (preview kind 6).
@@ -2309,33 +2392,36 @@ impl ProCraftApp {
                             (self.filt_bal_g as f32 * 2.55).round() as i32,
                             (self.filt_bal_b as f32 * 2.55).round() as i32,
                         );
-                        self.filter_scrub(6, move |doc, layer| {
-                            doc.color_balance(layer, r, g, b);
-                        });
-                        self.status = "Previewing balance — Apply to keep.".to_string();
+                        match self
+                            .filter_scrub(6, move |doc, layer| doc.color_balance(layer, r, g, b))
+                        {
+                            Ok(()) => self.status = "Previewing balance — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply balance").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
-                            let (r, g, b) = (
-                                (self.filt_bal_r as f32 * 2.55).round() as i32,
-                                (self.filt_bal_g as f32 * 2.55).round() as i32,
-                                (self.filt_bal_b as f32 * 2.55).round() as i32,
-                            );
-                            self.doc.checkpoint();
-                            self.doc.color_balance(self.doc.active, r, g, b);
+                        let (r, g, b) = (
+                            (self.filt_bal_r as f32 * 2.55).round() as i32,
+                            (self.filt_bal_g as f32 * 2.55).round() as i32,
+                            (self.filt_bal_b as f32 * 2.55).round() as i32,
+                        );
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 6) {
+                            self.apply_filter_once(move |doc| {
+                                doc.color_balance(doc.active, r, g, b)
+                            })
                         } else {
-                            let (r, g, b) = (
-                                (self.filt_bal_r as f32 * 2.55).round() as i32,
-                                (self.filt_bal_g as f32 * 2.55).round() as i32,
-                                (self.filt_bal_b as f32 * 2.55).round() as i32,
-                            );
                             self.restamp_preview(move |doc, layer| {
-                                doc.color_balance(layer, r, g, b);
-                            });
-                        }
+                                doc.color_balance(layer, r, g, b)
+                            })
+                        };
                         self.filter_preview = None;
-                        self.status = "Balance applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Balance applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                     // M37 Recolor (colorize) toward the current paint color at
                     // strength (preview kind 7). White stays white by definition.
@@ -2353,29 +2439,26 @@ impl ProCraftApp {
                     );
                     if self.filt_recolor_strength != recolor_before {
                         let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                        self.filter_scrub(7, move |doc, layer| {
-                            doc.colorize(layer, target, s);
-                        });
-                        self.status = "Previewing recolor — Apply to keep.".to_string();
+                        match self.filter_scrub(7, move |doc, layer| doc.colorize(layer, target, s)) {
+                            Ok(()) => self.status = "Previewing recolor — Apply to keep.".to_string(),
+                            Err(e) => self.status = e,
+                        }
                     }
                     if ui.button("Apply recolor").clicked() && !self.text_paint_blocked() {
-                        if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
-                            self.doc.checkpoint();
-                            let active = self.doc.active;
-                            self.doc.colorize(
-                                active,
-                                self.color,
-                                self.filt_recolor_strength / 100.0,
-                            );
+                        let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
+                        let result = if self.filter_preview.as_ref().is_none_or(|fp| fp.kind != 7) {
+                            self.apply_filter_once(move |doc| doc.colorize(doc.active, target, s))
                         } else {
-                            let (target, s) = (self.color, self.filt_recolor_strength / 100.0);
-                            self.restamp_preview(move |doc, layer| {
-                                doc.colorize(layer, target, s);
-                            });
-                        }
+                            self.restamp_preview(move |doc, layer| doc.colorize(layer, target, s))
+                        };
                         self.filter_preview = None;
-                        self.status = "Recolor applied.".to_string();
-                        self.capture_timelapse();
+                        match result {
+                            Ok(()) => {
+                                self.status = "Recolor applied.".to_string();
+                                self.capture_timelapse();
+                            }
+                            Err(e) => self.status = e,
+                        }
                     }
                 });
             });

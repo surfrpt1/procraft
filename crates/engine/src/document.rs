@@ -1,7 +1,7 @@
 //! Layers, documents, compositing and undo.
 
 use crate::brush::{slot_span, slot_x};
-use crate::raster::{try_zeroed, Raster, TILE};
+use crate::raster::{try_copy, try_vec, try_zeroed, Raster, TILE};
 
 /// Write one raster as a v12 tile table: `u32 count`, then per listed
 /// tile `u16 tx, u16 ty, u32 len, len bytes` of zlib-compressed raw tile
@@ -1214,6 +1214,15 @@ impl Document {
         }
     }
 
+    /// Drop the newest checkpoint without restoring it: a failed operation
+    /// that allocated before writing (filters, selection buffers) must not
+    /// leave an empty undo step behind.
+    pub fn discard_last_checkpoint(&mut self) {
+        if let Some(entry) = self.undo.pop() {
+            self.undo_bytes -= entry.byte_size();
+        }
+    }
+
     /// Push onto the undo stack, evicting oldest-first while over either cap.
     /// The newest step is always kept, even if it alone exceeds the budget.
     fn push_undo(&mut self, entry: UndoEntry) {
@@ -1682,19 +1691,21 @@ impl Document {
             let mask = match layer.mask.as_ref() {
                 Some(m) => {
                     let md = m.try_to_dense()?;
-                    Some(carry(&md, old_w, old_h, new_w, new_h, 1, sx, sy)?)
+                    let carried = carry(&md, old_w, old_h, new_w, new_h, 1, sx, sy)?;
+                    Some(Raster::try_from_dense(new_w, new_h, 1, &carried)?)
                 }
                 None => None,
             };
-            next_layers.push((px, mask));
+            let pixels = Raster::try_from_dense(new_w, new_h, 4, &px)?;
+            next_layers.push((pixels, mask));
         }
         let next_selection = match self.selection_mask.as_ref() {
             Some(sm) => Some(carry(sm, old_w, old_h, new_w, new_h, 1, -dx, -dy)?),
             None => None,
         };
-        for (layer, (px, mask)) in self.layers.iter_mut().zip(next_layers) {
-            layer.pixels = Raster::from_dense(new_w, new_h, 4, &px);
-            layer.mask = mask.map(|m| Raster::from_dense(new_w, new_h, 1, &m));
+        for (layer, (pixels, mask)) in self.layers.iter_mut().zip(next_layers) {
+            layer.pixels = pixels;
+            layer.mask = mask;
             layer.ox = 0;
             layer.oy = 0;
             // A text block's anchor is in canvas pixels: it rides the same
@@ -1851,9 +1862,14 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(gray) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
+        let pixels = Raster::try_from_dense(w, h, 4, &out)?;
+        let mask = match mask {
+            Some(gray) => Some(Raster::try_from_dense(w, h, 1, &gray)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         if center.is_none() {
             // Empty layer: carry the offset through the forward map about
@@ -1983,9 +1999,14 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(gray) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
+        let pixels = Raster::try_from_dense(w, h, 4, &out)?;
+        let mask = match mask {
+            Some(gray) => Some(Raster::try_from_dense(w, h, 1, &gray)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         self.mark_full_dirty();
         Ok(())
@@ -2053,9 +2074,14 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(gray) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
+        let pixels = Raster::try_from_dense(w, h, 4, &out)?;
+        let mask = match mask {
+            Some(gray) => Some(Raster::try_from_dense(w, h, 1, &gray)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         self.mark_full_dirty();
         Ok(())
@@ -2139,9 +2165,14 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &out);
-        if let Some(gray) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &gray));
+        let pixels = Raster::try_from_dense(w, h, 4, &out)?;
+        let mask = match mask {
+            Some(gray) => Some(Raster::try_from_dense(w, h, 1, &gray)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         self.mark_full_dirty();
         Ok(())
@@ -2229,12 +2260,17 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
+        let pixels = Raster::try_from_dense(w, h, 4, &next)?;
+        let mask = match mask {
+            Some(nm) => Some(Raster::try_from_dense(w, h, 1, &nm)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].ox = -self.layers[index].ox;
-        if let Some(nm) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         self.mark_full_dirty();
         Ok(())
@@ -2269,12 +2305,17 @@ impl Document {
             }
             None => None,
         };
-        self.layers[index].pixels = Raster::from_dense(w, h, 4, &next);
+        let pixels = Raster::try_from_dense(w, h, 4, &next)?;
+        let mask = match mask {
+            Some(nm) => Some(Raster::try_from_dense(w, h, 1, &nm)?),
+            None => None,
+        };
+        self.layers[index].pixels = pixels;
         // Mirror the offset too so the content flips about the canvas
         // center, exactly as before offsets existed.
         self.layers[index].oy = -self.layers[index].oy;
-        if let Some(nm) = mask {
-            self.layers[index].mask = Some(Raster::from_dense(w, h, 1, &nm));
+        if let Some(m) = mask {
+            self.layers[index].mask = Some(m);
         }
         self.mark_full_dirty();
         Ok(())
@@ -2378,7 +2419,7 @@ impl Document {
         // a plain pixel layer, never editable text (a text source above
         // vanishes with `src`). Pixels already match, so only the block drops.
         self.layers[index - 1].text = None;
-        self.layers[index - 1].pixels.replace_dense(&dst_px);
+        self.layers[index - 1].pixels.try_set_dense(&dst_px)?;
         self.layers.remove(index);
         self.active = index - 1;
         self.mark_full_dirty();
@@ -2617,10 +2658,13 @@ impl Document {
     /// Build a lasso mask from a freehand loop (canvas float coordinates).
     /// Sets the rectangular selection to the loop's bounding box and returns
     /// it, or clears the mask and returns `None` for degenerate loops.
-    pub fn set_lasso(&mut self, points: &[(f32, f32)]) -> Option<(u32, u32, u32, u32)> {
+    pub fn set_lasso(
+        &mut self,
+        points: &[(f32, f32)],
+    ) -> Result<Option<(u32, u32, u32, u32)>, String> {
         if points.len() < 3 || self.w == 0 || self.h == 0 {
             self.selection_mask = None;
-            return None;
+            return Ok(None);
         }
         let (w, h) = (self.w, self.h);
         let mut fx0 = f32::INFINITY;
@@ -2640,11 +2684,11 @@ impl Document {
         );
         if x1 <= x0 || y1 <= y0 {
             self.selection_mask = None;
-            return None;
+            return Ok(None);
         }
         // Even-odd scanline fill of the polygon.
         let n = points.len();
-        let mut mask = vec![0u8; (w * h) as usize];
+        let mut mask = try_zeroed((w * h) as usize)?;
         for y in y0..=y1 {
             let yc = y as f32 + 0.5;
             let mut xs = Vec::new();
@@ -2668,11 +2712,11 @@ impl Document {
         }
         if mask.iter().all(|&b| b == 0) {
             self.selection_mask = None;
-            return None;
+            return Ok(None);
         }
         self.selection = Some((x0, y0, x1, y1));
         self.selection_mask = Some(mask);
-        Some((x0, y0, x1, y1))
+        Ok(Some((x0, y0, x1, y1)))
     }
 
     /// Pixels covered by the active selection (mask coverage for graduated
@@ -2713,19 +2757,19 @@ impl Document {
     /// Rasterize the rectangular selection into the mask (255 inside),
     /// ANDed with any existing mask. Returns false when nothing is
     /// selected (mask-only selections pass through untouched).
-    fn bake_rect_to_mask(&mut self) -> bool {
+    fn bake_rect_to_mask(&mut self) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
         if w == 0 || h == 0 {
-            return false;
+            return Ok(false);
         }
         let Some((rx0, ry0, rx1, ry1)) = self.selection else {
-            return self
+            return Ok(self
                 .selection_mask
                 .as_ref()
-                .is_some_and(|m| m.iter().any(|&b| b != 0));
+                .is_some_and(|m| m.iter().any(|&b| b != 0)));
         };
         let n = (w * h) as usize;
-        let mut mask = vec![0u8; n];
+        let mut mask = try_zeroed(n)?;
         for y in ry0..=ry1.min(h - 1) {
             for x in rx0..=rx1.min(w - 1) {
                 mask[(y * w + x) as usize] = 255;
@@ -2740,10 +2784,10 @@ impl Document {
         }
         if mask.iter().all(|&b| b == 0) {
             self.clear_selection();
-            return false;
+            return Ok(false);
         }
         self.selection_mask = Some(mask);
-        true
+        Ok(true)
     }
 
     /// Re-tighten the bounds rect to the mask (clears both when empty).
@@ -2760,14 +2804,14 @@ impl Document {
     }
 
     /// Separable sliding-window blur over one gray channel (edge-replicated).
-    fn blur_gray(src: &[u8], w: u32, h: u32, r: i32) -> Vec<u8> {
+    fn blur_gray(src: &[u8], w: u32, h: u32, r: i32) -> Result<Vec<u8>, String> {
         if r <= 0 || w == 0 || h == 0 {
-            return src.to_vec();
+            return try_copy(src);
         }
         let (w, h, r) = (w as usize, h as usize, r as isize);
         let win = (2 * r + 1) as u32;
         let at = |buf: &[u8], i: isize, n: isize| buf[i.clamp(0, n - 1) as usize] as u32;
-        let mut tmp = vec![0u8; w * h];
+        let mut tmp = try_zeroed(w * h)?;
         for y in 0..h {
             let mut sum = 0u32;
             for x in -r..=r {
@@ -2779,7 +2823,7 @@ impl Document {
                     + at(&src[y * w..(y + 1) * w], x as isize + r + 1, w as isize);
             }
         }
-        let mut out = vec![0u8; w * h];
+        let mut out = try_zeroed(w * h)?;
         for x in 0..w {
             let mut sum = 0u32;
             for y in -r..=r {
@@ -2793,26 +2837,26 @@ impl Document {
                 sum = sum - tmp[yo * w + x] as u32 + tmp[yi * w + x] as u32;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Sliding-window extremum over a replicated-edge line.
-    fn slide_extreme(line: &[u8], r: usize, dilate: bool) -> Vec<u8> {
+    fn slide_extreme(line: &[u8], r: usize, dilate: bool) -> Result<Vec<u8>, String> {
         use std::collections::VecDeque;
         let n = line.len();
         if n == 0 || r == 0 {
-            return line.to_vec();
+            return try_copy(line);
         }
-        let mut pad = Vec::with_capacity(n + 2 * r);
-        for _ in 0..r {
-            pad.push(line[0]);
+        let mut pad = try_vec(n + 2 * r, 0u8)?;
+        for slot in pad.iter_mut().take(r) {
+            *slot = line[0];
         }
-        pad.extend_from_slice(line);
-        for _ in 0..r {
-            pad.push(line[n - 1]);
+        pad[r..r + n].copy_from_slice(line);
+        for slot in pad.iter_mut().skip(r + n) {
+            *slot = line[n - 1];
         }
         let better = |a: u8, b: u8| if dilate { a >= b } else { a <= b };
-        let mut out = vec![0u8; n];
+        let mut out = try_vec(n, 0u8)?;
         let mut dq: VecDeque<usize> = VecDeque::new();
         for i in 0..pad.len() {
             while let Some(&back) = dq.back() {
@@ -2837,35 +2881,35 @@ impl Document {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Separable box dilate (max) / erode (min) over one gray channel.
-    fn morph_gray(src: &[u8], w: u32, h: u32, r: i32, dilate: bool) -> Vec<u8> {
+    fn morph_gray(src: &[u8], w: u32, h: u32, r: i32, dilate: bool) -> Result<Vec<u8>, String> {
         if r <= 0 || w == 0 || h == 0 {
-            return src.to_vec();
+            return try_copy(src);
         }
         let (w, h, r) = (w as usize, h as usize, r as usize);
-        let mut tmp = vec![0u8; w * h];
+        let mut tmp = try_zeroed(w * h)?;
         for y in 0..h {
             tmp[y * w..(y + 1) * w].copy_from_slice(&Self::slide_extreme(
                 &src[y * w..(y + 1) * w],
                 r,
                 dilate,
-            ));
+            )?);
         }
-        let mut out = vec![0u8; w * h];
-        let mut col = vec![0u8; h];
+        let mut out = try_zeroed(w * h)?;
+        let mut col = try_vec(h, 0u8)?;
         for x in 0..w {
             for y in 0..h {
                 col[y] = tmp[y * w + x];
             }
-            let done = Self::slide_extreme(&col, r, dilate);
+            let done = Self::slide_extreme(&col, r, dilate)?;
             for y in 0..h {
                 out[y * w + x] = done[y];
             }
         }
-        out
+        Ok(out)
     }
 
     /// Feather (soften) the selection edge by `radius` px: the mask ramps
@@ -2873,86 +2917,92 @@ impl Document {
     /// The bounds rect grows to contain the falloff. Returns false when
     /// there was nothing to feather. Selection-only: not undoable (like
     /// Clear selection).
-    pub fn feather_selection(&mut self, radius: u32) -> bool {
+    pub fn feather_selection(&mut self, radius: u32) -> Result<bool, String> {
         let r = radius.min(Self::MAX_SELECT_RADIUS as u32) as i32;
-        if !self.bake_rect_to_mask() {
-            return false;
+        if !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
         if r > 0 {
-            if let Some(m) = self.selection_mask.take() {
-                self.selection_mask = Some(Self::blur_gray(&m, self.w, self.h, r));
+            if let Some(m) = self.selection_mask.as_deref() {
+                let blurred = Self::blur_gray(m, self.w, self.h, r)?;
+                self.selection_mask = Some(blurred);
             }
             self.retighten_selection();
         }
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Grow (positive) or shrink (negative) the selection by `px`,
     /// clamped to ±[`Document::MAX_SELECT_RADIUS`]. Shrinking to nothing
     /// clears it. Returns false when nothing remains. Not undoable.
-    pub fn grow_selection(&mut self, px: i32) -> bool {
+    pub fn grow_selection(&mut self, px: i32) -> Result<bool, String> {
         let px = px.clamp(-Self::MAX_SELECT_RADIUS, Self::MAX_SELECT_RADIUS);
-        if !self.bake_rect_to_mask() {
-            return false;
+        if !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
         if px == 0 {
-            return true;
+            return Ok(true);
         }
-        if let Some(m) = self.selection_mask.take() {
-            self.selection_mask = Some(Self::morph_gray(&m, self.w, self.h, px.abs(), px > 0));
+        if let Some(m) = self.selection_mask.as_deref() {
+            let morphed = Self::morph_gray(m, self.w, self.h, px.abs(), px > 0)?;
+            self.selection_mask = Some(morphed);
         }
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// De-jag the selection edge (blur + re-threshold, edge position kept).
     /// Returns false when there was nothing to smooth. Not undoable.
-    pub fn smooth_selection(&mut self) -> bool {
-        if !self.bake_rect_to_mask() {
-            return false;
+    pub fn smooth_selection(&mut self) -> Result<bool, String> {
+        if !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
-        if let Some(m) = self.selection_mask.take() {
-            let soft = Self::blur_gray(&m, self.w, self.h, 2);
-            self.selection_mask = Some(
-                soft.into_iter()
-                    .map(|v| if v >= 128 { 255 } else { 0 })
-                    .collect(),
-            );
+        if let Some(m) = self.selection_mask.as_deref() {
+            let soft = Self::blur_gray(m, self.w, self.h, 2)?;
+            let mut out = try_zeroed(soft.len())?;
+            for (d, &v) in out.iter_mut().zip(&soft) {
+                *d = if v >= 128 { 255 } else { 0 };
+            }
+            self.selection_mask = Some(out);
         }
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Flip the selection (unbounded complements become full-canvas masks).
     /// Returns false when there was nothing to invert. Not undoable.
-    pub fn invert_selection(&mut self) -> bool {
-        if !self.bake_rect_to_mask() {
-            return false;
+    pub fn invert_selection(&mut self) -> Result<bool, String> {
+        if !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
-        if let Some(m) = self.selection_mask.take() {
-            self.selection_mask = Some(m.into_iter().map(|v| 255 - v).collect());
+        if let Some(m) = self.selection_mask.as_deref() {
+            let mut out = try_zeroed(m.len())?;
+            for (d, &v) in out.iter_mut().zip(m) {
+                *d = 255 - v;
+            }
+            self.selection_mask = Some(out);
         }
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Nudge the selection by `(dx, dy)` canvas px (rect corners clamp to
     /// the canvas; masks shift with zero-fill, so content pushed off the
     /// edge is lost). Shrinking to nothing clears it. Returns false when
     /// nothing remains. Not undoable.
-    pub fn translate_selection(&mut self, dx: i32, dy: i32) -> bool {
+    pub fn translate_selection(&mut self, dx: i32, dy: i32) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
-        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
-            return false;
+        if w == 0 || h == 0 || !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
         if dx == 0 && dy == 0 {
-            return true;
+            return Ok(true);
         }
-        let Some(m) = self.selection_mask.take() else {
-            return false;
+        let Some(m) = self.selection_mask.as_deref() else {
+            return Ok(false);
         };
         let n = (w * h) as usize;
-        let mut out = vec![0u8; n];
+        let mut out = try_zeroed(n)?;
         for y in 0..h {
             for x in 0..w {
                 let (sx, sy) = (x as i32 - dx, y as i32 - dy);
@@ -2963,22 +3013,22 @@ impl Document {
         }
         if out.iter().all(|&b| b == 0) {
             self.clear_selection();
-            return false;
+            return Ok(false);
         }
         self.selection_mask = Some(out);
         self.retighten_selection();
-        true
+        Ok(true)
     }
 
     /// Mirror the selection left-right (rect corners remap, masks flip).
     /// Returns false when there was no selection. Not undoable.
-    pub fn flip_selection_h(&mut self) -> bool {
+    pub fn flip_selection_h(&mut self) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
-        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
-            return false;
+        if w == 0 || h == 0 || !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
-        if let Some(m) = self.selection_mask.take() {
-            let mut out = vec![0u8; (w * h) as usize];
+        if let Some(m) = self.selection_mask.as_deref() {
+            let mut out = try_zeroed((w * h) as usize)?;
             for y in 0..h {
                 for x in 0..w {
                     out[(y * w + x) as usize] = m[(y * w + (w - 1 - x)) as usize];
@@ -2987,18 +3037,18 @@ impl Document {
             self.selection_mask = Some(out);
         }
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Mirror the selection top-bottom. Returns false when there was no
     /// selection. Not undoable.
-    pub fn flip_selection_v(&mut self) -> bool {
+    pub fn flip_selection_v(&mut self) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
-        if w == 0 || h == 0 || !self.bake_rect_to_mask() {
-            return false;
+        if w == 0 || h == 0 || !self.bake_rect_to_mask()? {
+            return Ok(false);
         }
-        if let Some(m) = self.selection_mask.take() {
-            let mut out = vec![0u8; (w * h) as usize];
+        if let Some(m) = self.selection_mask.as_deref() {
+            let mut out = try_zeroed((w * h) as usize)?;
             for y in 0..h {
                 for x in 0..w {
                     out[(y * w + x) as usize] = m[((h - 1 - y) * w + x) as usize];
@@ -3007,26 +3057,26 @@ impl Document {
             self.selection_mask = Some(out);
         }
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Select the active layer's pixels more opaque than `threshold`
     /// (offset-aware; uncovered canvas counts as transparent). Replaces any
     /// selection; empty layers clear it. Returns false when nothing is
     /// selected. Not undoable.
-    pub fn select_opaque(&mut self, threshold: u8) -> bool {
+    pub fn select_opaque(&mut self, threshold: u8) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
         if w == 0 || h == 0 {
             self.clear_selection();
-            return false;
+            return Ok(false);
         }
         let Some(layer) = self.layers.get(self.active) else {
             self.clear_selection();
-            return false;
+            return Ok(false);
         };
         let (ox, oy) = (layer.ox, layer.oy);
-        let src = layer.pixels.to_dense();
-        let mut mask = vec![0u8; (w * h) as usize];
+        let src = layer.pixels.try_to_dense()?;
+        let mut mask = try_zeroed((w * h) as usize)?;
         for y in 0..h {
             for x in 0..w {
                 let (lx, ly) = (x as i32 - ox, y as i32 - oy);
@@ -3051,7 +3101,7 @@ impl Document {
             None
         };
         self.retighten_selection();
-        self.selection_mask.is_some()
+        Ok(self.selection_mask.is_some())
     }
 
     /// Paint the selection outline `width` px wide (clamped 1..=32) with
@@ -3063,10 +3113,10 @@ impl Document {
         brush: &super::brush::Brush,
         color: super::brush::Color,
         width: u32,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let (w, h) = (self.w, self.h);
         if w == 0 || h == 0 {
-            return false;
+            return Ok(false);
         }
         let inside = |m: &[u8], x: i32, y: i32| -> bool {
             if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -3074,7 +3124,7 @@ impl Document {
             }
             m[(y as u32 * w + x as u32) as usize] > 127
         };
-        let mut edge = vec![false; (w * h) as usize];
+        let mut edge = try_vec((w * h) as usize, false)?;
         let mut any = false;
         match self.selection_mask.as_deref() {
             Some(m) if m.len() == (w * h) as usize => {
@@ -3116,13 +3166,18 @@ impl Document {
             }
         }
         if !any {
-            return false;
+            return Ok(false);
         }
         let r = width.clamp(1, 32) as i32 - 1;
         if r > 0 {
-            let gray: Vec<u8> = edge.iter().map(|&b| if b { 255 } else { 0 }).collect();
-            let fat = Self::morph_gray(&gray, w, h, r, true);
-            edge = fat.into_iter().map(|v| v != 0).collect();
+            let mut gray = try_zeroed(edge.len())?;
+            for (g, &e) in gray.iter_mut().zip(&edge) {
+                *g = if e { 255 } else { 0 };
+            }
+            let fat = Self::morph_gray(&gray, w, h, r, true)?;
+            for (e, &v) in edge.iter_mut().zip(&fat) {
+                *e = v != 0;
+            }
         }
         if self.symmetry == SymmetryMode::Off {
             // Dense row spans: one read/write per row instead of a tile
@@ -3151,7 +3206,7 @@ impl Document {
             }
         }
         self.mark_full_dirty();
-        true
+        Ok(true)
     }
 
     /// Separable sliding-window box blur (all channels), O(w*h) and
@@ -3163,26 +3218,30 @@ impl Document {
     /// Sums are clamped-window sums of at most `255 * window`, so a
     /// per-radius divide table gives the same integer truncation as
     /// `sum / window` without a runtime division per channel.
-    fn box_blur(src: &[u8], w: u32, h: u32, r: i32) -> Vec<u8> {
+    fn box_blur(src: &[u8], w: u32, h: u32, r: i32) -> Result<Vec<u8>, String> {
         let (wu, hu) = (w as usize, h as usize);
         if r <= 0 || wu == 0 || hu == 0 {
-            return src.to_vec();
+            return try_copy(src);
         }
         let r = r as usize;
         let window = (2 * r + 1) as u32;
-        let div: Vec<u8> = (0..=255 * window).map(|s| (s / window) as u8).collect();
+        let mut div = try_zeroed((255 * window) as usize + 1)?;
+        for (s, d) in div.iter_mut().enumerate() {
+            *d = (s as u32 / window) as u8;
+        }
         let stride = wu * 4;
         // Window sample offsets per coordinate (scaled by `step`), clamped
         // to the edge: the entering sample and the leaving one.
-        let edge_offsets = |n: usize, step: usize| {
-            (0..n)
-                .map(|i| (i + r + 1).min(n - 1) * step)
-                .zip((0..n).map(|i| i.saturating_sub(r) * step))
-                .collect::<Vec<_>>()
+        let edge_offsets = |n: usize, step: usize| -> Result<Vec<(usize, usize)>, String> {
+            let mut out = try_vec(n, (0usize, 0usize))?;
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = ((i + r + 1).min(n - 1) * step, i.saturating_sub(r) * step);
+            }
+            Ok(out)
         };
         // Horizontal pass: src -> tmp, one sliding sum per row.
-        let x_offsets = edge_offsets(wu, 4);
-        let mut tmp = vec![0u8; src.len()];
+        let x_offsets = edge_offsets(wu, 4)?;
+        let mut tmp = try_zeroed(src.len())?;
         for y in 0..hu {
             let row = &src[y * stride..y * stride + stride];
             let dst = &mut tmp[y * stride..y * stride + stride];
@@ -3208,15 +3267,15 @@ impl Document {
             }
         }
         // Vertical pass: tmp -> out, one sliding sum per column row.
-        let mut out = vec![0u8; src.len()];
-        let mut acc = vec![0u32; stride];
+        let mut out = try_zeroed(src.len())?;
+        let mut acc = try_vec(stride, 0u32)?;
         for dy in 0..=2 * r {
             let o = dy.saturating_sub(r).min(hu - 1) * stride;
             for (a, &b) in acc.iter_mut().zip(&tmp[o..o + stride]) {
                 *a += b as u32;
             }
         }
-        let y_offsets = edge_offsets(hu, stride);
+        let y_offsets = edge_offsets(hu, stride)?;
         for y in 0..hu {
             let dst = &mut out[y * stride..y * stride + stride];
             for (d, &s) in dst.iter_mut().zip(&acc) {
@@ -3229,22 +3288,27 @@ impl Document {
                 *a = *a + b as u32 - c as u32;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Brightness/contrast on a layer: `brightness` -255..=255 is added,
     /// `contrast` 0.0..=3.0 scales around mid-gray (1.0 keeps contrast).
     /// RGB only; alpha is untouched. Honors the active selection.
     /// Caller checkpoints for undo first.
-    pub fn adjust_tone(&mut self, index: usize, brightness: i32, contrast: f32) {
+    pub fn adjust_tone(
+        &mut self,
+        index: usize,
+        brightness: i32,
+        contrast: f32,
+    ) -> Result<(), String> {
         if index >= self.layers.len() || (brightness == 0 && (contrast - 1.0).abs() < f32::EPSILON)
         {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -3270,28 +3334,29 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Box blur on a layer, `radius` 1..=25 (0 is a no-op). Honors the
     /// active selection for writes. Caller checkpoints for undo first.
-    pub fn blur_layer(&mut self, index: usize, radius: u32) {
+    pub fn blur_layer(&mut self, index: usize, radius: u32) -> Result<(), String> {
         if index >= self.layers.len() || radius == 0 {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
-        let dense = self.layers[index].pixels.to_dense();
-        let blurred = Self::box_blur(&dense, w, h, radius.min(25) as i32);
+        let dense = self.layers[index].pixels.try_to_dense()?;
+        let blurred = Self::box_blur(&dense, w, h, radius.min(25) as i32)?;
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
         // Without a selection or mask every pixel takes the blurred value;
         // the blend below would be the identity, so skip it (and the second
         // dense copy of the layer) entirely.
         if sel.is_none() && mask.is_none() {
-            self.layers[index].pixels.replace_dense(&blurred);
+            self.layers[index].pixels.try_set_dense(&blurred)?;
             self.mark_full_dirty();
-            return;
+            return Ok(());
         }
         let mut pixels = dense;
         for y in 0..h {
@@ -3312,24 +3377,25 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Unsharp mask on a layer: `amount` 0.0..=2.0 mixes the high-frequency
     /// detail back in (0 is a no-op). Honors the active selection.
     /// Caller checkpoints for undo first.
-    pub fn sharpen_layer(&mut self, index: usize, amount: f32) {
+    pub fn sharpen_layer(&mut self, index: usize, amount: f32) -> Result<(), String> {
         if index >= self.layers.len() || amount <= 0.0 {
-            return;
+            return Ok(());
         }
         let amount = amount.min(2.0);
         let (w, h) = (self.w, self.h);
-        let src = self.layers[index].pixels.to_dense();
-        let blurred = Self::box_blur(&src, w, h, 2);
+        let src = self.layers[index].pixels.try_to_dense()?;
+        let blurred = Self::box_blur(&src, w, h, 2)?;
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 let selected = !matches!(sel, Some((a, b, c, d)) if x < a || x > c || y < b || y > d)
@@ -3350,21 +3416,22 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// Remap the RGB channels through `lut` (alpha untouched). Honors the
     /// active selection with graduated-mask mixing. Caller checkpoints
     /// for undo first. Powers Curves + Levels (M36) and the M37 pack.
-    pub fn apply_lut(&mut self, index: usize, lut: &[u8; 256]) {
+    pub fn apply_lut(&mut self, index: usize, lut: &[u8; 256]) -> Result<(), String> {
         if index >= self.layers.len() {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -3389,27 +3456,34 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// M37 HSL adjust: rotate hue by `hue_deg` degrees, scale saturation
     /// by `sat_mult`, shift lightness by `light` (-1..=1). Grays have no
     /// hue, so they only answer to lightness (same honesty as the palette
     /// harmonies). Honors the active selection. Caller checkpoints first.
-    pub fn adjust_hsl(&mut self, index: usize, hue_deg: f32, sat_mult: f32, light: f32) {
+    pub fn adjust_hsl(
+        &mut self,
+        index: usize,
+        hue_deg: f32,
+        sat_mult: f32,
+        light: f32,
+    ) -> Result<(), String> {
         if index >= self.layers.len() {
-            return;
+            return Ok(());
         }
         let sat_mult = sat_mult.clamp(0.0, 4.0);
         let light = light.clamp(-1.0, 1.0);
         if hue_deg == 0.0 && sat_mult == 1.0 && light == 0.0 {
-            return;
+            return Ok(());
         }
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -3445,22 +3519,23 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// M37 Color balance: channel offsets in -255..=255 (positive warms
     /// toward red/green/blue, negative toward cyan/magenta/yellow).
     /// Honors the active selection. Caller checkpoints first.
-    pub fn color_balance(&mut self, index: usize, r: i32, g: i32, b: i32) {
+    pub fn color_balance(&mut self, index: usize, r: i32, g: i32, b: i32) -> Result<(), String> {
         if index >= self.layers.len() || (r == 0 && g == 0 && b == 0) {
-            return;
+            return Ok(());
         }
         let off = [r as f32, g as f32, b as f32];
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -3485,8 +3560,9 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// M37 Recolor (colorize): push every pixel's hue/saturation toward
@@ -3494,16 +3570,16 @@ impl Document {
     /// 0..=1 (0 is a no-op). White stays white, black stays black —
     /// that is what colorize means. Honors the active selection.
     /// Caller checkpoints first.
-    pub fn colorize(&mut self, index: usize, target: [u8; 3], strength: f32) {
+    pub fn colorize(&mut self, index: usize, target: [u8; 3], strength: f32) -> Result<(), String> {
         if index >= self.layers.len() || strength <= 0.0 {
-            return;
+            return Ok(());
         }
         let strength = strength.clamp(0.0, 1.0);
         let (th, ts, _) = super::palette::rgb_to_hsl(target);
         let (w, h) = (self.w, self.h);
         let sel = self.selection;
         let mask = self.selection_mask.as_deref();
-        let mut pixels = self.layers[index].pixels.to_dense();
+        let mut pixels = self.layers[index].pixels.try_to_dense()?;
         for y in 0..h {
             for x in 0..w {
                 if let Some((a, b, c, d)) = sel {
@@ -3530,8 +3606,9 @@ impl Document {
                 }
             }
         }
-        self.layers[index].pixels.replace_dense(&pixels);
+        self.layers[index].pixels.try_set_dense(&pixels)?;
         self.mark_full_dirty();
+        Ok(())
     }
 
     /// M40 Liquify push: displace layer pixels along the drag vector
@@ -7160,6 +7237,8 @@ mod tests {
         Vec<(i32, i32)>,
         u32,
         u32,
+        Option<(u32, u32, u32, u32)>,
+        Option<Vec<u8>>,
     );
 
     fn snapshot(doc: &Document) -> Snapshot {
@@ -7172,17 +7251,26 @@ mod tests {
             doc.layers.iter().map(|l| (l.ox, l.oy)).collect(),
             doc.w,
             doc.h,
+            doc.selection,
+            doc.selection_mask.clone(),
         )
     }
 
     /// Make every fallible buffer allocation of `op` fail in turn: each
     /// failure must come back as an error with the document untouched, so
     /// a tablet that runs out of memory mid-gesture keeps its pixels.
-    fn assert_oom_is_atomic(mut op: impl FnMut(&mut Document) -> Result<(), String>) {
+    fn assert_oom_is_atomic(op: impl FnMut(&mut Document) -> Result<(), String>) {
+        assert_oom_is_atomic_with(oom_doc, op);
+    }
+
+    fn assert_oom_is_atomic_with(
+        make: impl Fn() -> Document,
+        mut op: impl FnMut(&mut Document) -> Result<(), String>,
+    ) {
         use crate::raster::with_failed_alloc;
         let mut failures = 0;
         for nth in 0..12 {
-            let mut doc = oom_doc();
+            let mut doc = make();
             let before = snapshot(&doc);
             match with_failed_alloc(nth, || op(&mut doc)) {
                 Err(e) => {
@@ -7214,17 +7302,64 @@ mod tests {
     }
 
     #[test]
+    fn filter_allocation_failures_leave_the_document_untouched() {
+        let mut lut = [0u8; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = 255 - i as u8;
+        }
+        assert_oom_is_atomic(|d| d.adjust_tone(0, 10, 1.5));
+        assert_oom_is_atomic(|d| d.blur_layer(0, 2));
+        assert_oom_is_atomic(|d| d.sharpen_layer(0, 0.5));
+        assert_oom_is_atomic(|d| d.apply_lut(0, &lut));
+        assert_oom_is_atomic(|d| d.adjust_hsl(0, 30.0, 1.5, 0.1));
+        assert_oom_is_atomic(|d| d.color_balance(0, 10, -10, 5));
+        assert_oom_is_atomic(|d| d.colorize(0, [200, 40, 30], 0.5));
+    }
+
+    #[test]
+    fn selection_allocation_failures_leave_the_selection_untouched() {
+        use crate::brush::{Brush, Color};
+        let selected = || {
+            let mut doc = oom_doc();
+            doc.selection_mask = Some(vec![255; (doc.w * doc.h) as usize]);
+            doc
+        };
+        assert_oom_is_atomic_with(selected, |d| d.feather_selection(2).map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.grow_selection(1).map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.smooth_selection().map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.invert_selection().map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.translate_selection(1, 1).map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.flip_selection_h().map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.flip_selection_v().map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| d.select_opaque(0).map(|_| ()));
+        assert_oom_is_atomic_with(selected, |d| {
+            let pts = [(1.0, 1.0), (6.0, 1.0), (1.0, 6.0)];
+            d.set_lasso(&pts).map(|_| ())
+        });
+        let brush = Brush {
+            size: 1.0,
+            softness: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        assert_oom_is_atomic_with(selected, |d| {
+            d.stroke_selection(&brush, Color::rgb(0, 255, 0), 1)
+                .map(|_| ())
+        });
+    }
+
+    #[test]
     fn tone_brightness_contrast_and_alpha() {
         let mut doc = Document::new(2, 1);
         doc.layers[0].pixels = px_rgba(&doc, &[100, 100, 100, 200, 100, 100, 100, 200]);
-        doc.adjust_tone(0, 10, 1.0);
+        doc.adjust_tone(0, 10, 1.0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [110, 110, 110, 200]);
         // Zero contrast flattens to mid-gray; alpha still untouched.
-        doc.adjust_tone(0, 0, 0.0);
+        doc.adjust_tone(0, 0, 0.0).unwrap();
         assert_eq!(doc.layers[0].pixels.get4(0), [128, 128, 128, 200]);
         // Identity is a no-op.
         let before = doc.layers[0].pixels.clone();
-        doc.adjust_tone(0, 0, 1.0);
+        doc.adjust_tone(0, 0, 1.0).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
     }
 
@@ -7233,7 +7368,7 @@ mod tests {
         let mut doc = Document::new(8, 8);
         doc.layers[0].pixels.fill(77);
         let before = doc.layers[0].pixels.clone();
-        doc.blur_layer(0, 3);
+        doc.blur_layer(0, 3).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
         // Single opaque dot on transparency spreads out.
         let mut doc = Document::new(9, 9);
@@ -7241,7 +7376,7 @@ mod tests {
             .pixels
             .set(((4 * 9 + 4) * 4 + 3) as usize, 255);
         doc.layers[0].pixels.set(((4 * 9 + 4) * 4) as usize, 255);
-        doc.blur_layer(0, 2);
+        doc.blur_layer(0, 2).unwrap();
         let at =
             |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 9 + x) * 4 + 3) as usize);
         assert!(at(&doc, 4, 4) < 255);
@@ -7263,7 +7398,7 @@ mod tests {
                 doc.layers[0].pixels.set(o + 3, 255);
             }
         }
-        doc.sharpen_layer(0, 1.0);
+        doc.sharpen_layer(0, 1.0).unwrap();
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 8 + x) * 4) as usize);
         assert!(at(&doc, 3, 4) < 100, "dark edge pixel dips");
         assert!(
@@ -7280,11 +7415,11 @@ mod tests {
         let mut doc = Document::new(6, 6);
         doc.layers[0].pixels.fill(255);
         doc.selection = Some((0, 0, 2, 2));
-        doc.adjust_tone(0, -50, 1.0);
+        doc.adjust_tone(0, -50, 1.0).unwrap();
         assert_eq!(doc.layers[0].pixels.get(0), 205);
         let o = ((5 * 6 + 5) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get(o), 255);
-        doc.blur_layer(0, 2);
+        doc.blur_layer(0, 2).unwrap();
         assert_eq!(doc.layers[0].pixels.get(o), 255);
         doc.clear_selection();
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
@@ -7351,12 +7486,16 @@ mod tests {
                 .collect();
             for r in [1, 2, 3, 5, 25] {
                 assert_eq!(
-                    Document::box_blur(&src, w, h, r),
+                    Document::box_blur(&src, w, h, r).unwrap(),
                     naive_box_blur(&src, w, h, r),
                     "{w}x{h} r{r}"
                 );
             }
-            assert_eq!(Document::box_blur(&src, w, h, 0), src, "{w}x{h} r0");
+            assert_eq!(
+                Document::box_blur(&src, w, h, 0).unwrap(),
+                src,
+                "{w}x{h} r0"
+            );
         }
     }
 
@@ -7370,13 +7509,13 @@ mod tests {
         // No selection: every pixel takes the blurred value.
         let mut doc = Document::new(w, h);
         doc.layers[0].pixels = px_rgba(&doc, &src);
-        doc.blur_layer(0, 3);
+        doc.blur_layer(0, 3).unwrap();
         assert_eq!(doc.layers[0].pixels.to_dense(), want);
         // Rect selection: only the inside changes.
         let mut doc = Document::new(w, h);
         doc.layers[0].pixels = px_rgba(&doc, &src);
         doc.selection = Some((10, 8, 25, 20));
-        doc.blur_layer(0, 3);
+        doc.blur_layer(0, 3).unwrap();
         let got = doc.layers[0].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
@@ -7390,10 +7529,10 @@ mod tests {
         let mut doc = Document::new(w, h);
         doc.layers[0].pixels = px_rgba(&doc, &src);
         doc.selection = Some((10, 8, 25, 20));
-        assert!(doc.feather_selection(2));
+        assert!(doc.feather_selection(2).unwrap());
         let sel = doc.selection.unwrap();
         let mask = doc.selection_mask.clone().unwrap();
-        doc.blur_layer(0, 3);
+        doc.blur_layer(0, 3).unwrap();
         let got = doc.layers[0].pixels.to_dense();
         for y in 0..h {
             for x in 0..w {
@@ -7533,7 +7672,10 @@ mod tests {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(20, 20);
         let pts = vec![(0.0, 0.0), (12.0, 0.0), (0.0, 12.0), (0.0, 0.0)];
-        let bbox = doc.set_lasso(&pts).expect("lasso builds");
+        let bbox = doc
+            .set_lasso(&pts)
+            .expect("lasso builds")
+            .expect("lasso selects");
         assert!(doc.pixel_selected(2, 2));
         assert!(!doc.pixel_selected(15, 15));
         assert_eq!(doc.selection, Some(bbox));
@@ -7549,7 +7691,7 @@ mod tests {
         let outside = ((15 * 20 + 15) * 4) as usize;
         assert_eq!(doc.layers[0].pixels.get(outside + 3), 0);
         // Degenerate loops clear.
-        assert!(doc.set_lasso(&[]).is_none());
+        assert!(doc.set_lasso(&[]).unwrap().is_none());
         assert!(doc.selection_mask.is_none());
         doc.clear_selection();
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
@@ -7798,7 +7940,8 @@ mod tests {
     #[test]
     fn lasso_writes_full_strength_masks() {
         let mut doc = Document::new(10, 10);
-        doc.set_lasso(&[(2.0, 2.0), (2.0, 5.0), (5.0, 5.0), (5.0, 2.0)]);
+        doc.set_lasso(&[(2.0, 2.0), (2.0, 5.0), (5.0, 5.0), (5.0, 2.0)])
+            .unwrap();
         let mask = doc.selection_mask.clone().unwrap();
         assert!(mask.iter().all(|&b| b == 0 || b == 255));
         assert_eq!(
@@ -7810,7 +7953,7 @@ mod tests {
     #[test]
     fn feather_ramps_and_expands_bounds() {
         let mut doc = selected_rect(20, 20, (5, 5, 14, 14));
-        assert!(doc.feather_selection(3));
+        assert!(doc.feather_selection(3).unwrap());
         let m = doc.selection_mask.clone().unwrap();
         let at = |x: u32, y: u32| m[(y * 20 + x) as usize];
         // Deep interior stays full, far exterior stays empty.
@@ -7825,28 +7968,28 @@ mod tests {
         assert!((count - 100).abs() <= 2, "{count}");
         // Radius 0 only normalizes, and empty selections report false.
         let mut doc2 = selected_rect(20, 20, (5, 5, 14, 14));
-        assert!(doc2.feather_selection(0));
+        assert!(doc2.feather_selection(0).unwrap());
         assert_eq!(doc2.selection_pixel_count(), 100);
         let mut doc3 = Document::new(8, 8);
-        assert!(!doc3.feather_selection(4));
+        assert!(!doc3.feather_selection(4).unwrap());
     }
 
     #[test]
     fn grow_and_shrink_track_bounds() {
         let mut doc = selected_rect(20, 20, (5, 5, 14, 14));
-        assert!(doc.grow_selection(2));
+        assert!(doc.grow_selection(2).unwrap());
         assert_eq!(doc.selection, Some((3, 3, 16, 16)));
         assert!(doc.selection_pixel_count() > 100);
-        assert!(doc.grow_selection(-2));
+        assert!(doc.grow_selection(-2).unwrap());
         assert_eq!(doc.selection, Some((5, 5, 14, 14)));
         assert_eq!(doc.selection_pixel_count(), 100);
         // Shrinking to nothing clears everything.
-        assert!(!doc.grow_selection(-50));
+        assert!(!doc.grow_selection(-50).unwrap());
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
         // Zero on nothing stays nothing.
-        assert!(!doc.grow_selection(0));
+        assert!(!doc.grow_selection(0).unwrap());
         let mut doc2 = Document::new(8, 8);
-        assert!(!doc2.grow_selection(3));
+        assert!(!doc2.grow_selection(3).unwrap());
     }
 
     #[test]
@@ -7854,31 +7997,31 @@ mod tests {
         let mut doc = Document::new(12, 12);
         doc.selection_mask = Some(vec![255u8; 144]);
         doc.selection_mask.as_mut().unwrap()[5 * 12 + 5] = 0;
-        assert!(doc.smooth_selection());
+        assert!(doc.smooth_selection().unwrap());
         // Single-pixel hole heals (blur r2 keeps it over threshold).
         assert_eq!(doc.selection_mask.clone().unwrap()[5 * 12 + 5], 255);
         // Solid rects survive smoothing byte-identical in the interior.
         let mut doc2 = selected_rect(20, 20, (5, 5, 14, 14));
-        assert!(doc2.smooth_selection());
+        assert!(doc2.smooth_selection().unwrap());
         assert_eq!(
             doc2.selection_mask.clone().unwrap()[(10 * 20 + 10) as usize],
             255
         );
         let mut doc3 = Document::new(8, 8);
-        assert!(!doc3.smooth_selection());
+        assert!(!doc3.smooth_selection().unwrap());
     }
 
     #[test]
     fn invert_flips_to_full_canvas_complement() {
         let mut doc = selected_rect(10, 10, (2, 2, 5, 5));
-        assert!(doc.invert_selection());
+        assert!(doc.invert_selection().unwrap());
         let m = doc.selection_mask.clone().unwrap();
         assert_eq!(m[(3 * 10 + 3) as usize], 0);
         assert_eq!(m[0], 255);
         assert_eq!(doc.selection, Some((0, 0, 9, 9)));
         assert_eq!(doc.selection_pixel_count(), 100 - 16);
         let mut doc2 = Document::new(8, 8);
-        assert!(!doc2.invert_selection());
+        assert!(!doc2.invert_selection().unwrap());
     }
 
     #[test]
@@ -7892,7 +8035,7 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(255, 0, 0), 2.5, 2.5);
-        assert!(doc.select_opaque(8));
+        assert!(doc.select_opaque(8).unwrap());
         let n = doc.selection_pixel_count();
         assert!(n > 0 && n < 100, "{n}");
         // Bounds hug the dab.
@@ -7900,7 +8043,7 @@ mod tests {
         assert!(x1 - x0 <= 4 && y1 - y0 <= 4);
         // Untouched layers clear the selection.
         let mut doc2 = Document::new(8, 8);
-        assert!(!doc2.select_opaque(8));
+        assert!(!doc2.select_opaque(8).unwrap());
         assert!(doc2.selection.is_none());
     }
 
@@ -7915,7 +8058,9 @@ mod tests {
             ..Default::default()
         };
         doc.checkpoint();
-        assert!(doc.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
+        assert!(doc
+            .stroke_selection(&brush, Color::rgb(0, 255, 0), 1)
+            .unwrap());
         let at =
             |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 12 + x) * 4) as usize + 3);
         // Edge pixels painted, deep interior untouched.
@@ -7928,7 +8073,9 @@ mod tests {
         assert_eq!(at(&doc, 2, 4), 0);
         // No selection, no paint.
         let mut doc2 = Document::new(8, 8);
-        assert!(!doc2.stroke_selection(&brush, Color::rgb(0, 255, 0), 1));
+        assert!(!doc2
+            .stroke_selection(&brush, Color::rgb(0, 255, 0), 1)
+            .unwrap());
     }
 
     #[test]
@@ -7936,13 +8083,13 @@ mod tests {
         use crate::brush::{Brush, Color};
         let mut doc = Document::new(20, 20);
         doc.selection = Some((5, 5, 14, 14));
-        assert!(doc.feather_selection(3));
+        assert!(doc.feather_selection(3).unwrap());
         // A ramp pixel just outside the old edge carries partial coverage.
         let m = doc.selection_mask.clone().unwrap();
         let ramp = m[(4 * 20 + 10) as usize];
         // Tone applies proportionally through the ramp.
         doc.checkpoint();
-        doc.adjust_tone(0, 100, 1.0);
+        doc.adjust_tone(0, 100, 1.0).unwrap();
         let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 20 + x) * 4) as usize);
         assert_eq!(at(&doc, 10, 10), 100);
         let edge = at(&doc, 10, 4);
@@ -7955,7 +8102,7 @@ mod tests {
         // Dabs fade through the same ramp.
         let mut doc2 = Document::new(20, 20);
         doc2.selection = Some((5, 5, 14, 14));
-        assert!(doc2.feather_selection(3));
+        assert!(doc2.feather_selection(3).unwrap());
         let brush = Brush {
             size: 1.0,
             softness: 0.0,
@@ -8019,7 +8166,7 @@ mod tests {
     fn translate_selection_moves_rect() {
         let mut doc = Document::new(10, 10);
         doc.selection = Some((2, 2, 5, 5));
-        assert!(doc.translate_selection(3, 1));
+        assert!(doc.translate_selection(3, 1).unwrap());
         assert_eq!(doc.selection, Some((5, 3, 8, 6)));
         // Weights survive a mask nudge (bake materializes the rect first).
         let m = doc.selection_mask.clone().unwrap();
@@ -8030,12 +8177,12 @@ mod tests {
     fn translate_selection_off_canvas_clears() {
         let mut doc = Document::new(4, 4);
         doc.selection = Some((0, 0, 1, 1));
-        assert!(!doc.translate_selection(10, 0));
+        assert!(!doc.translate_selection(10, 0).unwrap());
         assert!(doc.selection.is_none() && doc.selection_mask.is_none());
         // Partial push keeps the on-canvas tail.
         let mut doc = Document::new(4, 4);
         doc.selection = Some((0, 0, 1, 1));
-        assert!(doc.translate_selection(3, 0));
+        assert!(doc.translate_selection(3, 0).unwrap());
         assert_eq!(doc.selection, Some((3, 0, 3, 1)));
     }
 
@@ -8043,21 +8190,21 @@ mod tests {
     fn flip_selection_mirrors_rect_and_mask() {
         let mut doc = Document::new(10, 10);
         doc.selection = Some((1, 2, 4, 6));
-        assert!(doc.flip_selection_h());
+        assert!(doc.flip_selection_h().unwrap());
         assert_eq!(doc.selection, Some((5, 2, 8, 6)));
         let mut doc = Document::new(10, 10);
         doc.selection = Some((1, 2, 4, 6));
-        assert!(doc.flip_selection_v());
+        assert!(doc.flip_selection_v().unwrap());
         assert_eq!(doc.selection, Some((1, 3, 4, 7)));
         // Weighted mask pixels land mirrored (feather fringe included).
         let mut doc = Document::new(4, 4);
         let mut mask = vec![0u8; 16];
         mask[0] = 128;
         doc.selection_mask = Some(mask);
-        assert!(doc.flip_selection_h());
+        assert!(doc.flip_selection_h().unwrap());
         let m = doc.selection_mask.clone().unwrap();
         assert_eq!(m[3], 128);
-        assert!(doc.flip_selection_v());
+        assert!(doc.flip_selection_v().unwrap());
         let m = doc.selection_mask.clone().unwrap();
         assert_eq!(m[15], 128);
     }
@@ -8106,14 +8253,14 @@ mod tests {
         let lut = levels_lut(128, 1.0, 255);
         // Only pixel (0,0) selected: it crushes, the rest is untouched.
         doc.selection = Some((0, 0, 0, 0));
-        doc.apply_lut(0, &lut);
+        doc.apply_lut(0, &lut).unwrap();
         assert_eq!(doc.layers[0].pixels.get(0), 0);
         // Pixel (1,1) offset 20 in the 4x4 RGBA buffer.
         let o = 20usize;
         assert_eq!(doc.layers[0].pixels.get(o), 100);
         // Whole canvas: mid gray crushes to 0, alpha stays 255.
         doc.clear_selection();
-        doc.apply_lut(0, &lut);
+        doc.apply_lut(0, &lut).unwrap();
         assert_eq!(doc.layers[0].pixels.get(o), 0);
         assert_eq!(doc.layers[0].pixels.get(o + 3), 255);
     }
@@ -8130,19 +8277,19 @@ mod tests {
         };
         // Gray has no hue: hue spins leave it gray, lightness lifts it.
         doc.dab(&brush, Color::rgb(128, 128, 128), 1.5, 1.5);
-        doc.adjust_hsl(0, 180.0, 2.0, 0.0);
+        doc.adjust_hsl(0, 180.0, 2.0, 0.0).unwrap();
         let o = 20usize;
         assert_eq!(doc.layers[0].pixels.get(o), doc.layers[0].pixels.get(o + 1));
         assert_eq!(
             doc.layers[0].pixels.get(o + 1),
             doc.layers[0].pixels.get(o + 2)
         );
-        doc.adjust_hsl(0, 0.0, 1.0, 1.0);
+        doc.adjust_hsl(0, 0.0, 1.0, 1.0).unwrap();
         assert_eq!(doc.layers[0].pixels.get(o), 255);
         // Pure red rotated +120 lands on green.
         let mut doc = Document::new(2, 2);
         doc.dab(&brush, Color::rgb(255, 0, 0), 0.5, 0.5);
-        doc.adjust_hsl(0, 120.0, 1.0, 0.0);
+        doc.adjust_hsl(0, 120.0, 1.0, 0.0).unwrap();
         let dense = doc.layers[0].pixels.to_dense();
         let px = &dense[0..3];
         assert!(px[1] > 200 && px[0] < 55 && px[2] < 55, "{px:?}");
@@ -8159,18 +8306,18 @@ mod tests {
             ..Default::default()
         };
         doc.dab(&brush, Color::rgb(100, 100, 100), 0.5, 0.5);
-        doc.color_balance(0, 51, 0, 0);
+        doc.color_balance(0, 51, 0, 0).unwrap();
         assert_eq!(doc.layers[0].pixels.get(0), 151);
         assert_eq!(doc.layers[0].pixels.get(1), 100);
         // No-op guards leave pixels alone.
         let before = doc.layers[0].pixels.clone();
-        doc.color_balance(0, 0, 0, 0);
-        doc.colorize(0, [255, 0, 0], 0.0);
+        doc.color_balance(0, 0, 0, 0).unwrap();
+        doc.colorize(0, [255, 0, 0], 0.0).unwrap();
         assert_eq!(doc.layers[0].pixels, before);
         // Colorize mid-gray to red: keeps luminance, takes the hue.
         let mut doc = Document::new(2, 2);
         doc.dab(&brush, Color::rgb(128, 128, 128), 0.5, 0.5);
-        doc.colorize(0, [255, 0, 0], 1.0);
+        doc.colorize(0, [255, 0, 0], 1.0).unwrap();
         let dense = doc.layers[0].pixels.to_dense();
         let px = &dense[0..3];
         assert!(px[0] > 200 && px[1] < 80 && px[2] < 80, "{px:?}");
@@ -8178,7 +8325,7 @@ mod tests {
         let mut doc = Document::new(4, 4);
         doc.dab(&brush, Color::rgb(100, 100, 100), 1.5, 1.5);
         doc.selection = Some((0, 0, 0, 0));
-        doc.color_balance(0, 51, 51, 51);
+        doc.color_balance(0, 51, 51, 51).unwrap();
         assert_eq!(doc.layers[0].pixels.get(0), 151);
         assert_eq!(doc.layers[0].pixels.get(20), 100);
     }
@@ -8971,7 +9118,9 @@ mod tests {
         }
         doc.selection_mask = Some(mask.clone());
         doc.translate_layer(0, 5, -3);
-        assert!(doc.stroke_selection(&brush, Color::rgb(10, 200, 20), 1));
+        assert!(doc
+            .stroke_selection(&brush, Color::rgb(10, 200, 20), 1)
+            .unwrap());
 
         let inside = |x: i64, y: i64| {
             x >= 0

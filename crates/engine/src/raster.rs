@@ -30,6 +30,27 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// [`try_zeroed`] for other element types (filter scratch tables).
+pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>, String> {
+    #[cfg(test)]
+    if fail_next_allocation() {
+        return Err("out of memory (injected test failure)".to_string());
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|e| format!("out of memory for {len} items: {e}"))?;
+    buf.resize(len, value);
+    Ok(buf)
+}
+
+/// Copy a byte buffer fallibly: `to_vec()` aborts on OOM, which a filter
+/// preview over an 8K layer must not do.
+pub(crate) fn try_copy(src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = try_zeroed(src.len())?;
+    out.copy_from_slice(src);
+    Ok(out)
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only fault injection: the n-th fallible allocation from now
@@ -157,6 +178,33 @@ impl Raster {
         let idx = (ty * self.tiles_x + tx) as usize;
         let arc = self.tiles[idx].get_or_insert_with(|| Arc::new(vec![0u8; len]));
         Arc::make_mut(arc).as_mut_slice()
+    }
+
+    /// Fallible [`Self::tile_mut`]: editor writes allocate the tile (and a
+    /// private copy when it is still shared by undo) through `try_zeroed`,
+    /// so an 8K allocation failure surfaces as an error instead of
+    /// aborting the process.
+    pub(crate) fn try_tile_mut(&mut self, tx: u32, ty: u32) -> Result<&mut [u8], String> {
+        if tx >= self.tiles_x || ty >= self.tiles_y {
+            return Err(format!(
+                "tile ({tx},{ty}) outside {}x{}",
+                self.tiles_x, self.tiles_y
+            ));
+        }
+        let len = self.tile_len();
+        let idx = (ty * self.tiles_x + tx) as usize;
+        if self.tiles[idx].is_none() {
+            self.tiles[idx] = Some(Arc::new(try_zeroed(len)?));
+        }
+        let arc = self.tiles[idx]
+            .as_mut()
+            .expect("tile was just materialised");
+        if Arc::strong_count(arc) > 1 {
+            let mut copy = try_zeroed(len)?;
+            copy.copy_from_slice(arc);
+            *arc = Arc::new(copy);
+        }
+        Ok(Arc::get_mut(arc).expect("tile is unshared").as_mut_slice())
     }
 
     /// Overwrite a whole tile from `bytes` (which must be `tile_len()`
@@ -438,6 +486,25 @@ impl Raster {
     /// Replace every tile from a dense buffer sized for this geometry.
     /// Rows shorter than `w` read as zero; all-zero tiles stay `None`.
     pub fn replace_dense(&mut self, bytes: &[u8]) {
+        self.try_replace_dense(bytes)
+            .expect("raster tile allocation failed");
+    }
+
+    /// Replace the contents fallibly and atomically: the new tiles are
+    /// built in a clone that shares the old tile `Arc`s, so a failed
+    /// allocation drops that clone and leaves `self` exactly as it was.
+    pub(crate) fn try_set_dense(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut next = self.clone();
+        next.try_replace_dense(bytes)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Fallible [`Self::replace_dense`] for editor paths: the destination
+    /// raster may keep whatever tiles were already materialised if the
+    /// allocation fails, so callers checkpoint or write from a fresh
+    /// raster.
+    pub(crate) fn try_replace_dense(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.tiles.fill(None);
         let step = self.bpp();
         let w = self.w as usize;
@@ -459,19 +526,28 @@ impl Raster {
                     if chunk.iter().any(|&v| v != 0) {
                         let local_x = x - tx as usize * TILE as usize;
                         let local = ((y % TILE as usize) * TILE as usize + local_x) * step;
-                        let t = self.tile_mut(tx, y as u32 / TILE);
+                        let t = self.try_tile_mut(tx, y as u32 / TILE)?;
                         t[local..local + (b - a)].copy_from_slice(chunk);
                     }
                 }
                 x = tx_end;
             }
         }
+        Ok(())
     }
 
     pub fn from_dense(w: u32, h: u32, bpp: u8, bytes: &[u8]) -> Self {
         let mut r = Raster::new(w, h, bpp);
         r.replace_dense(bytes);
         r
+    }
+
+    /// Fallible [`Self::from_dense`]: a failed allocation drops the fresh
+    /// raster instead of aborting the app.
+    pub fn try_from_dense(w: u32, h: u32, bpp: u8, bytes: &[u8]) -> Result<Self, String> {
+        let mut r = Raster::new(w, h, bpp);
+        r.try_replace_dense(bytes)?;
+        Ok(r)
     }
 
     /// Slide all content by (`sx`, `sy`) pixels with zero fill; content that
@@ -675,6 +751,29 @@ mod tests {
         assert_eq!(try_zeroed(3).unwrap(), vec![0u8; 3]);
         // A request no allocator can satisfy must be an Err, not an abort.
         assert!(try_zeroed(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn tile_allocation_failures_are_errors_not_aborts() {
+        let mut r = Raster::rgba(300, 300);
+        let err = with_failed_alloc(0, || r.try_tile_mut(0, 0)).unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
+        assert_eq!(r.alloc_bytes(), 0, "a failed tile stays unmaterialised");
+        let err = with_failed_alloc(0, || {
+            Raster::try_from_dense(300, 200, 4, &vec![7u8; 300 * 200 * 4])
+        })
+        .unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
+    }
+
+    #[test]
+    fn try_set_dense_failure_keeps_the_previous_pixels() {
+        let mut r = Raster::rgba(300, 300);
+        r.set4(0, [1, 2, 3, 4]);
+        let before = r.to_dense();
+        let err = with_failed_alloc(0, || r.try_set_dense(&vec![9u8; 300 * 300 * 4])).unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
+        assert_eq!(r.to_dense(), before);
     }
 
     #[test]

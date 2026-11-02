@@ -3027,3 +3027,12 @@ fn mask_action_is_idle_when_there_is_no_mask_to_show() {
     // never built), so nothing to do.
     assert_eq!(mask_action(false, true, false), MaskAction::Idle);
 }
+
+#[test]
+fn layer_name_width_keeps_the_trailing_controls_reachable() {
+    // A dock wide enough: the name takes exactly what is left.
+    assert_eq!(panels::layer_name_width(350.0, 100.0), 250.0);
+    // Cramped rows keep a readable stub instead of collapsing the name.
+    assert_eq!(panels::layer_name_width(150.0, 120.0), 48.0);
+    assert_eq!(panels::layer_name_width(30.0, 0.0), 48.0);
+}

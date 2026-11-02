@@ -116,9 +116,13 @@ impl ProCraftApp {
     /// A preview whose layer changed underneath (paint stroke, undo, layer
     /// op, new/opened doc…) never restores its stale snapshot — that wipe
     /// is exactly "my paint disappeared" — it restarts on current pixels.
-    pub(crate) fn filter_scrub(&mut self, kind: u8, apply: impl Fn(&mut Document, usize)) {
+    pub(crate) fn filter_scrub(
+        &mut self,
+        kind: u8,
+        apply: impl Fn(&mut Document, usize) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.text_paint_blocked() {
-            return;
+            return Ok(());
         }
         let layer = self.doc.active;
         // Stale-snapshot guard: the live layer must still match what our
@@ -161,24 +165,30 @@ impl ProCraftApp {
                 }
                 None => {
                     self.filter_preview = None;
-                    return;
+                    return Ok(());
                 }
             }
         }
         if let Some(mut fp) = self.filter_preview.take() {
             if self.doc.layers.get(fp.layer).is_none() {
-                return;
+                return Ok(());
             }
             // Throttle: the layer keeps the last preview; Apply catches up.
             if !fresh && fp.last.elapsed() < PREVIEW_MIN_DT {
                 fp.stale = true;
                 self.filter_preview = Some(fp);
-                return;
+                return Ok(());
             }
             if let Some(l) = self.doc.layers.get_mut(fp.layer) {
                 l.pixels.clone_from(&fp.pixels);
             }
-            apply(&mut self.doc, fp.layer);
+            if let Err(e) = apply(&mut self.doc, fp.layer) {
+                // The apply allocated before writing, so the layer is still
+                // the pre-filter snapshot; drop the now-empty undo step.
+                self.doc.discard_last_checkpoint();
+                self.filter_preview = None;
+                return Err(e);
+            }
             if let Some(l) = self.doc.layers.get(fp.layer) {
                 fp.live_hash = l.pixels.fingerprint();
             }
@@ -186,6 +196,7 @@ impl ProCraftApp {
             fp.stale = false;
             self.filter_preview = Some(fp);
         }
+        Ok(())
     }
 
     /// Re-apply current slider values over the scrub snapshot (for a
@@ -194,38 +205,65 @@ impl ProCraftApp {
     /// If the layer moved on underneath (see `filter_scrub`), the stale
     /// preview is dropped and the values apply fresh on the active layer
     /// (new undo step) — the intervening work is always kept.
-    pub(crate) fn restamp_preview(&mut self, apply: impl Fn(&mut Document, usize)) {
+    pub(crate) fn restamp_preview(
+        &mut self,
+        apply: impl Fn(&mut Document, usize) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.text_paint_blocked() {
-            return;
+            return Ok(());
         }
         let expired = match &self.filter_preview {
             Some(fp) => match self.doc.layers.get(fp.layer) {
                 Some(l) => l.pixels.fingerprint() != fp.live_hash,
                 None => true,
             },
-            None => return,
+            None => return Ok(()),
         };
         if expired {
             self.filter_preview = None;
             self.doc.checkpoint();
             let layer = self.doc.active;
             if self.doc.layers.get(layer).is_some() {
-                apply(&mut self.doc, layer);
+                if let Err(e) = apply(&mut self.doc, layer) {
+                    self.doc.discard_last_checkpoint();
+                    return Err(e);
+                }
             }
-            return;
+            return Ok(());
         }
         if let Some(mut fp) = self.filter_preview.take() {
             if self.doc.layers.get(fp.layer).is_some() {
                 if let Some(l) = self.doc.layers.get_mut(fp.layer) {
                     l.pixels.clone_from(&fp.pixels);
                 }
-                apply(&mut self.doc, fp.layer);
+                if let Err(e) = apply(&mut self.doc, fp.layer) {
+                    // Restored to the scrub snapshot above; the checkpoint
+                    // now covers no change at all.
+                    self.doc.discard_last_checkpoint();
+                    return Err(e);
+                }
                 if let Some(l) = self.doc.layers.get(fp.layer) {
                     fp.live_hash = l.pixels.fingerprint();
                 }
             }
             self.filter_preview = Some(fp);
         }
+        Ok(())
+    }
+
+    /// Apply a filter once from an Apply button: checkpoint, apply, and on
+    /// allocation failure drop the now-empty undo step so the layer and the
+    /// undo history stay exactly as they were.
+    pub(crate) fn apply_filter_once(
+        &mut self,
+        apply: impl FnOnce(&mut Document) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.doc.checkpoint();
+        let result = apply(&mut self.doc);
+        if result.is_err() {
+            self.doc.discard_last_checkpoint();
+        }
+        result
     }
 
     /// M38 Typography: validate imported TTF/OTF bytes and keep them as
