@@ -356,7 +356,7 @@ impl eframe::App for ProCraftApp {
                 {
                     if self.android_inset_top < 0.0 {
                         self.android_inset_top = rfd::android_status_bar_height()
-                            .map(|px| clamp_status_inset(px))
+                            .map(clamp_status_inset)
                             .unwrap_or(0.0);
                     }
                     if self.android_inset_top > 0.0 {
@@ -777,6 +777,23 @@ impl eframe::App for ProCraftApp {
                         "Check for updates",
                         "https://github.com/surfrpt1/procraft/releases",
                     );
+                    #[cfg(target_os = "android")]
+                    {
+                        ui.separator();
+                        ui.label(format!("Renderer: {}", self.renderer));
+                        if crate::entry::renderer_fallback_active() {
+                            ui.label(
+                                "The hardware renderer failed to start, so ProCraft is \
+                                 using the OpenGL fallback.",
+                            );
+                            if ui.button("Retry hardware renderer").clicked() {
+                                crate::entry::clear_renderer_fallback();
+                                self.status = "The hardware renderer will be tried again on \
+                                               the next launch."
+                                    .to_string();
+                            }
+                        }
+                    }
                     ui.label("Original code, MIT licensed.");
                 });
             });

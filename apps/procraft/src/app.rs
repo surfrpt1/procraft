@@ -22,6 +22,10 @@ pub(crate) struct ProCraftApp {
     /// strings may use icon glyphs. iPad has no such font, so the same
     /// strings fall back to plain words (see `tool_label`).
     pub(crate) has_symbols: bool,
+    /// Active eframe backend on Android, shown in About so a device
+    /// running the GLES fallback is identifiable.
+    #[cfg(target_os = "android")]
+    pub(crate) renderer: &'static str,
     pub(crate) page_custom: [u8; 3],
     pub(crate) picker_size: f32,
     pub(crate) texture: Option<TextureHandle>,
@@ -358,6 +362,14 @@ impl ProCraftApp {
         // lookup; no dir on a platform without APPDATA/HOME means
         // settings stay session-only).
         let settings_dir = crate::settings::settings_dir();
+        // A GLES fallback has no wgpu state; the presence of a GL context
+        // is the runtime answer to which backend eframe started.
+        #[cfg(target_os = "android")]
+        let renderer = if cc.gl.is_some() {
+            "OpenGL (GLES)"
+        } else {
+            "wgpu"
+        };
         let mut app = Self {
             doc: Document::new(1280, 800),
             brush: Brush::default(),
@@ -367,6 +379,8 @@ impl ProCraftApp {
             theme: Theme::Dark,
             theme_applied: None,
             has_symbols,
+            #[cfg(target_os = "android")]
+            renderer,
             page_custom: [255, 255, 255],
             picker_size: 165.0,
             texture: None,

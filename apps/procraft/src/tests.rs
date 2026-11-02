@@ -3036,3 +3036,13 @@ fn layer_name_width_keeps_the_trailing_controls_reachable() {
     assert_eq!(panels::layer_name_width(150.0, 120.0), 48.0);
     assert_eq!(panels::layer_name_width(30.0, 0.0), 48.0);
 }
+
+#[test]
+fn renderer_fallback_starts_with_the_recorded_backend() {
+    use entry::{backend_attempts, Backend};
+    // First launch: hardware renderer, then GLES.
+    assert_eq!(backend_attempts(false), &[Backend::Wgpu, Backend::Glow]);
+    // A recorded fallback starts on GLES but still probes the hardware
+    // renderer if GLES fails.
+    assert_eq!(backend_attempts(true), &[Backend::Glow, Backend::Wgpu]);
+}

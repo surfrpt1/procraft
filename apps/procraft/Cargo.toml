@@ -37,12 +37,14 @@ rfd = "0.17"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence", "links"] }
 rfd-shim = { path = "../../crates/rfd-shim" }
 
-# Android: same wgpu recipe as iOS (glow has no mobile backend) with the
-# native-activity entry; `accesskit` is unavailable with native-activity so
-# it stays out. File dialogs reuse the declining shim until the Storage
-# Access bridge lands (see the File-menu note in `src/lib.rs`).
+# Android: wgpu is tried first and the glow (GLES/EGL) backend is the
+# fallback for devices whose Vulkan driver cannot bring up a surface
+# (entry.rs retries on startup failure). `accesskit` is unavailable with
+# native-activity so it stays out. File dialogs reuse the declining shim
+# until the Storage Access bridge lands (see the File-menu note in
+# `src/lib.rs`).
 [target.'cfg(target_os = "android")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity", "wayland", "x11", "persistence", "links"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "glow", "android-native-activity", "wayland", "x11", "persistence", "links"] }
 rfd-shim = { path = "../../crates/rfd-shim" }
 android-activity = "0.6"
 
