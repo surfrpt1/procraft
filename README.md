@@ -32,12 +32,12 @@ Android files live in the app's external folder
 in-app Import browser reads it, and saves land there, then appear in
 Photos after a media scan.
 
-## Status: milestone 50 + v0.10.0 extras
+## Status: milestone 50 + v0.11.0 extras
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
 - [x] egui desktop app: paint, layers panel, color/size sliders, PNG export
-- [x] Project files (`.procraft` v10 with masks, clipping + 10 blends, layer offsets, mirror center, groups + group opacity, frame holds; v1-v9 still open), pinch-to-zoom, themes, page colors with active-preset highlight
+- [x] Project files (`.procraft` v12 with per-tile payloads, masks, clipping + 10 blends, layer offsets, mirror center, groups + group opacity, frame holds; v1-v11 still open), pinch-to-zoom, themes, page colors with active-preset highlight
 - [x] Rectangular + freehand lasso selections constraining paint
 - [x] Flood fill bucket with tolerance (selection-aware, symmetry-mirrored) + ColorDrop threshold-drag (hold + drag sweeps 0-255 with live preview, one undo step)
 - [x] Move tool (drag active layer), shape tools (line/rect/ellipse/triangle/diamond/star/arrow/polygon + fill)
@@ -89,6 +89,17 @@ Photos after a media scan.
 - [x] Big UI pass (B2): per-device design tokens, pill buttons, section cards, thick quick-bar sliders, a three-state Dark/Light/Paper toggle, dark as the default theme
 - [x] Brush imports: Clip Studio Paint `.sut` support (SQLite variant settings, embedded tips, pattern tips + dynamics); imported sizes and textures render faithfully via bundled shape/grain stand-ins, grain depth and cell tuning; only the selected preset highlights
 - [x] Workspace board: dotted canvas backing behind the page; Export GIF and Import GIF share one row; liquify warps the whole drag segment every frame
+
+### v0.11.0 extras (8K canvas + stability)
+
+- [x] 8K canvas: tiled copy-on-write layer storage with tile-granular undo, layer moves and painting; tile composite cache and a viewport-resolution fallback for large documents
+- [x] Project format v12: per-tile payloads with all-zero tiles omitted (v1-v11 still open)
+- [x] 8K presets and an 8192 px cap with a live memory readout; sampled gallery thumbnails and time-lapse frames instead of full-canvas transients
+- [x] Speed: scanline shape fills, row-major box blur, one-texture integer-blend animation playback, dense pixel paths across brush/fill/liquify
+- [x] Crash safety: out-of-memory is reported instead of aborting across liquify, transforms, filters, exports and saves
+- [x] Layers: group actions menu (reorder, move out), multi-select grouping, undoable layer and group renames, mask-view fallback on maskless layers
+- [x] Mobile: GLES renderer fallback on Android, interactive slide-over drawers and dialogs, reference card in its own window, unified top-bar pills
+- [x] Brushes: Chalk and Airbrush back to their dense reference look, Round keeps round stroke caps, richer Marker, Pencil paints full colour, per-tool brush settings persist across launches
 
 ## Icon
 

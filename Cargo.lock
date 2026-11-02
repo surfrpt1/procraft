@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "procraft"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "android-activity",
  "eframe",
@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "procraft-engine"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
