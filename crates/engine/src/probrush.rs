@@ -532,7 +532,12 @@ pub(super) fn decode_image_mask(
 
 fn zip_names(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Vec<String> {
     (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter_map(|i| {
+            archive
+                .by_index(i)
+                .ok()
+                .and_then(|f| f.name().ok().map(|name| name.into_owned()))
+        })
         .collect()
 }
 
