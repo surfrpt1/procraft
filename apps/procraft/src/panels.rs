@@ -1372,6 +1372,7 @@ impl ProCraftApp {
                     let mut remove = None;
                     let mut move_out = None;
                     let mut select = None;
+                    let mut rename = None;
                     let mut touched = false;
                     let mut acts = GroupRowActions::default();
                     for row in layer_panel_rows(&self.doc) {
@@ -1451,7 +1452,9 @@ impl ProCraftApp {
                                     if self.renaming_text.trim().is_empty() {
                                         self.renaming_text = format!("Layer {}", i + 1);
                                     }
-                                    layer.name = std::mem::take(&mut self.renaming_text);
+                                    // Deferred: `layer` borrows the document, and
+                                    // the rename must go through the undo history.
+                                    rename = Some((i, std::mem::take(&mut self.renaming_text)));
                                 }
                                 if commit || cancel {
                                     self.renaming = None;
@@ -1543,6 +1546,9 @@ impl ProCraftApp {
                     if let Some(i) = remove {
                         self.ghost_dirty = true;
                         self.doc.remove_layer(i);
+                    }
+                    if let Some((i, name)) = rename {
+                        self.doc.rename_layer(i, name);
                     }
                     if let Some(i) = move_out {
                         let name = self.doc.layers[i].name.clone();

@@ -442,24 +442,46 @@ const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_CANVAS_SIDE: u32 = 8192;
 
 #[derive(Clone, Debug)]
-struct UndoEntry {
-    layer: usize,
-    pixels: Raster,
-    mask: Option<Raster>,
-    ox: i32,
-    oy: i32,
-    /// Text-layer vector source at snapshot time, so undo/redo restore the
-    /// block and its pixels together.
-    text: Option<crate::text::TextBlock>,
+enum UndoEntry {
+    Layer {
+        layer: usize,
+        pixels: Raster,
+        mask: Option<Raster>,
+        ox: i32,
+        oy: i32,
+        /// Text-layer vector source at snapshot time, so undo/redo restore the
+        /// block and its pixels together.
+        text: Option<crate::text::TextBlock>,
+    },
+    /// A name change keeps its own step: undoing it only swaps the name, so
+    /// it costs no pixel snapshot and cannot evict paint history.
+    Rename {
+        target: RenameTarget,
+        old: String,
+        new: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum RenameTarget {
+    Layer(usize),
+    Group(u32),
 }
 
 impl UndoEntry {
     fn byte_size(&self) -> usize {
-        self.pixels.alloc_bytes()
-            + self.mask.as_ref().map_or(0, Raster::alloc_bytes)
-            + self.text.as_ref().map_or(0, |t| {
-                t.text.len() + t.style.font_bytes.as_ref().map_or(0, Vec::len)
-            })
+        match self {
+            UndoEntry::Layer {
+                pixels, mask, text, ..
+            } => {
+                pixels.alloc_bytes()
+                    + mask.as_ref().map_or(0, Raster::alloc_bytes)
+                    + text.as_ref().map_or(0, |t| {
+                        t.text.len() + t.style.font_bytes.as_ref().map_or(0, Vec::len)
+                    })
+            }
+            UndoEntry::Rename { old, new, .. } => old.len() + new.len(),
+        }
     }
 }
 

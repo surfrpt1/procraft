@@ -167,10 +167,32 @@ impl Document {
         id
     }
 
-    pub fn rename_group(&mut self, id: u32, name: String) {
-        if let Some(g) = self.group_mut(id) {
-            g.name = name;
+    /// Rename a layer as its own undo step. An unchanged name records
+    /// nothing; returns whether the name changed.
+    pub fn rename_layer(&mut self, index: usize, name: String) -> bool {
+        let Some(layer) = self.layers.get_mut(index) else {
+            return false;
+        };
+        if layer.name == name {
+            return false;
         }
+        let old = std::mem::replace(&mut layer.name, name.clone());
+        self.record_rename(RenameTarget::Layer(index), old, name);
+        true
+    }
+
+    /// Rename a group as its own undo step. An unchanged name records
+    /// nothing; returns whether the name changed.
+    pub fn rename_group(&mut self, id: u32, name: String) -> bool {
+        let Some(group) = self.group_mut(id) else {
+            return false;
+        };
+        if group.name == name {
+            return false;
+        }
+        let old = std::mem::replace(&mut group.name, name.clone());
+        self.record_rename(RenameTarget::Group(id), old, name);
+        true
     }
 
     pub fn set_group_visible(&mut self, id: u32, visible: bool) {

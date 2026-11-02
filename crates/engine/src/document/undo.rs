@@ -25,6 +25,14 @@ impl Document {
         }
     }
 
+    /// Record a name change as its own undo step. The caller has already
+    /// applied `new`; a rename costs no pixel snapshot.
+    pub(super) fn record_rename(&mut self, target: RenameTarget, old: String, new: String) {
+        self.redo.clear();
+        self.redo_bytes = 0;
+        self.push_undo(UndoEntry::Rename { target, old, new });
+    }
+
     /// Push onto the undo stack, evicting oldest-first while over either cap.
     /// The newest step is always kept, even if it alone exceeds the budget.
     fn push_undo(&mut self, entry: UndoEntry) {
@@ -52,7 +60,7 @@ impl Document {
 
     /// Copy of the active layer for the history stacks, if there is one.
     fn snapshot(&self) -> Option<UndoEntry> {
-        self.layers.get(self.active).map(|layer| UndoEntry {
+        self.layers.get(self.active).map(|layer| UndoEntry::Layer {
             layer: self.active,
             pixels: layer.pixels.clone(),
             mask: layer.mask.clone(),
@@ -65,19 +73,27 @@ impl Document {
     /// Rewind the active layer to the newest checkpoint without consuming it.
     /// The stroke replay path uses this to redraw the stroke with taper.
     pub fn restore_last_checkpoint(&mut self) -> bool {
-        let Some(entry) = self.undo.last() else {
+        let Some(UndoEntry::Layer {
+            layer: index,
+            pixels,
+            mask,
+            ox,
+            oy,
+            text,
+        }) = self.undo.last()
+        else {
             return false;
         };
-        let index = entry.layer;
+        let index = *index;
         {
             let Some(layer) = self.layers.get_mut(index) else {
                 return false;
             };
-            layer.pixels.clone_from(&entry.pixels);
-            layer.mask.clone_from(&entry.mask);
-            layer.ox = entry.ox;
-            layer.oy = entry.oy;
-            layer.text.clone_from(&entry.text);
+            layer.pixels.clone_from(pixels);
+            layer.mask.clone_from(mask);
+            layer.ox = *ox;
+            layer.oy = *oy;
+            layer.text.clone_from(text);
         }
         self.active = index.min(self.layers.len().saturating_sub(1));
         self.mark_full_dirty();
@@ -89,10 +105,19 @@ impl Document {
     /// tapered stroke replay pays for the stroke bbox instead of a full
     /// layer copy (256 MiB at 8K). The checkpoint stays on the undo stack.
     pub fn restore_checkpoint_region(&mut self, rect: (u32, u32, u32, u32)) -> bool {
-        let Some(entry) = self.undo.last() else {
+        let Some(UndoEntry::Layer {
+            layer: index,
+            pixels,
+            mask: entry_mask,
+            ox,
+            oy,
+            ..
+        }) = self.undo.last()
+        else {
             return false;
         };
-        let index = entry.layer;
+        let index = *index;
+        let (ox, oy) = (*ox, *oy);
         let (x0, y0) = (
             rect.0.min(self.w.saturating_sub(1)),
             rect.1.min(self.h.saturating_sub(1)),
@@ -109,9 +134,9 @@ impl Document {
             let Some(layer) = self.layers.get_mut(index) else {
                 return false;
             };
-            let (lox, loy) = (entry.ox, entry.oy);
-            layer.ox = entry.ox;
-            layer.oy = entry.oy;
+            let (lox, loy) = (ox, oy);
+            layer.ox = ox;
+            layer.oy = oy;
             // One run per row: the rewind copies whole spans into the tiles
             // instead of a get/set per byte (a full-8K stroke bbox would
             // otherwise be hundreds of millions of calls).
@@ -126,9 +151,7 @@ impl Document {
                     continue;
                 }
                 let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
-                layer
-                    .pixels
-                    .copy_run(&entry.pixels, start, ly, start, ly, run);
+                layer.pixels.copy_run(pixels, start, ly, start, ly, run);
             }
             // A mask the stroke created has no checkpoint copy: it started
             // fully revealed (255).
@@ -144,7 +167,7 @@ impl Document {
                         continue;
                     }
                     let (start, ly, run) = (start as u32, ly as u32, (end - start + 1) as u32);
-                    match entry.mask.as_ref() {
+                    match entry_mask.as_ref() {
                         Some(m) => layer_mask.copy_run(m, start, ly, start, ly, run),
                         None => layer_mask.fill_run(ly, start, run, 255),
                     }
@@ -158,43 +181,85 @@ impl Document {
 
     /// Restore the most recent snapshot. Returns false when history is empty.
     pub fn undo(&mut self) -> bool {
-        if let Some(entry) = self.undo.pop() {
-            self.undo_bytes -= entry.byte_size();
-            if let Some(cur) = self.snapshot() {
+        let Some(entry) = self.undo.pop() else {
+            return false;
+        };
+        self.undo_bytes -= entry.byte_size();
+        match entry {
+            UndoEntry::Rename { target, old, new } => {
+                self.apply_rename(&target, &old);
+                self.push_redo(UndoEntry::Rename { target, old, new });
+                true
+            }
+            entry @ UndoEntry::Layer { .. } => {
+                let Some(cur) = self.snapshot() else {
+                    return false;
+                };
                 self.push_redo(cur);
-                if let Some(layer) = self.layers.get_mut(entry.layer) {
-                    layer.pixels = entry.pixels;
-                    layer.mask = entry.mask;
-                    layer.ox = entry.ox;
-                    layer.oy = entry.oy;
-                    layer.text = entry.text;
-                    self.active = entry.layer.min(self.layers.len().saturating_sub(1));
-                    self.mark_full_dirty();
-                    return true;
-                }
+                self.restore_layer(entry)
             }
         }
-        false
     }
 
     /// Re-apply the most recently undone snapshot. Returns false when empty.
     pub fn redo(&mut self) -> bool {
-        if let Some(entry) = self.redo.pop() {
-            self.redo_bytes -= entry.byte_size();
-            if let Some(cur) = self.snapshot() {
+        let Some(entry) = self.redo.pop() else {
+            return false;
+        };
+        self.redo_bytes -= entry.byte_size();
+        match entry {
+            UndoEntry::Rename { target, old, new } => {
+                self.apply_rename(&target, &new);
+                self.push_undo(UndoEntry::Rename { target, old, new });
+                true
+            }
+            entry @ UndoEntry::Layer { .. } => {
+                let Some(cur) = self.snapshot() else {
+                    return false;
+                };
                 self.push_undo(cur);
-                if let Some(layer) = self.layers.get_mut(entry.layer) {
-                    layer.pixels = entry.pixels;
-                    layer.mask = entry.mask;
-                    layer.ox = entry.ox;
-                    layer.oy = entry.oy;
-                    layer.text = entry.text;
-                    self.active = entry.layer.min(self.layers.len().saturating_sub(1));
-                    self.mark_full_dirty();
-                    return true;
+                self.restore_layer(entry)
+            }
+        }
+    }
+
+    fn restore_layer(&mut self, entry: UndoEntry) -> bool {
+        let UndoEntry::Layer {
+            layer: index,
+            pixels,
+            mask,
+            ox,
+            oy,
+            text,
+        } = entry
+        else {
+            return false;
+        };
+        let Some(layer) = self.layers.get_mut(index) else {
+            return false;
+        };
+        layer.pixels = pixels;
+        layer.mask = mask;
+        layer.ox = ox;
+        layer.oy = oy;
+        layer.text = text;
+        self.active = index.min(self.layers.len().saturating_sub(1));
+        self.mark_full_dirty();
+        true
+    }
+
+    fn apply_rename(&mut self, target: &RenameTarget, name: &str) {
+        match *target {
+            RenameTarget::Layer(index) => {
+                if let Some(layer) = self.layers.get_mut(index) {
+                    layer.name = name.to_string();
+                }
+            }
+            RenameTarget::Group(id) => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.name = name.to_string();
                 }
             }
         }
-        false
     }
 }

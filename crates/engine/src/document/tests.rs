@@ -152,6 +152,57 @@ fn redo_restores_undone_work() {
 }
 
 #[test]
+fn layer_rename_is_undoable_and_redoable() {
+    let mut doc = Document::new(1, 1);
+    doc.layers[0].name = "Base".to_string();
+    assert!(doc.rename_layer(0, "Sky".to_string()));
+    assert_eq!(doc.layers[0].name, "Sky");
+    assert!(doc.undo());
+    assert_eq!(doc.layers[0].name, "Base");
+    assert!(doc.redo());
+    assert_eq!(doc.layers[0].name, "Sky");
+}
+
+#[test]
+fn rename_undo_follows_stroke_order() {
+    let mut doc = Document::new(1, 1);
+    doc.layers[0].name = "Base".to_string();
+    doc.checkpoint();
+    doc.layers[0].pixels = px_rgba(&doc, &[9, 9, 9, 255]);
+    assert!(doc.rename_layer(0, "Sky".to_string()));
+    assert!(doc.undo());
+    assert_eq!(doc.layers[0].name, "Base");
+    assert_eq!(doc.layers[0].pixels, vec![9, 9, 9, 255]);
+    assert!(doc.undo());
+    assert_eq!(doc.layers[0].pixels, vec![0, 0, 0, 0]);
+    assert!(doc.redo());
+    assert_eq!(doc.layers[0].pixels, vec![9, 9, 9, 255]);
+    assert!(doc.redo());
+    assert_eq!(doc.layers[0].name, "Sky");
+}
+
+#[test]
+fn renaming_to_the_same_name_adds_no_undo_step() {
+    let mut doc = Document::new(1, 1);
+    doc.layers[0].name = "Base".to_string();
+    assert!(!doc.rename_layer(0, "Base".to_string()));
+    assert!(!doc.undo());
+}
+
+#[test]
+fn group_rename_is_undoable_and_redoable() {
+    let mut doc = Document::new(1, 1);
+    doc.add_layer("top".to_string());
+    let id = doc.group_layers(&[0, 1], "Group".to_string()).unwrap();
+    assert!(doc.rename_group(id, "Sky".to_string()));
+    assert_eq!(doc.group(id).unwrap().name, "Sky");
+    assert!(doc.undo());
+    assert_eq!(doc.group(id).unwrap().name, "Group");
+    assert!(doc.redo());
+    assert_eq!(doc.group(id).unwrap().name, "Sky");
+}
+
+#[test]
 fn group_hide_conceals_members_in_flatten() {
     let mut doc = Document::new(2, 1);
     doc.layers[0].pixels = px_rgba(&doc, &[255, 0, 0, 255, 255, 0, 0, 255]);
