@@ -2494,6 +2494,48 @@ fn selection_allocation_failures_leave_the_selection_untouched() {
 }
 
 #[test]
+fn liquify_allocation_failures_leave_the_document_untouched() {
+    assert_oom_is_atomic(|d| d.liquify(0, 4.0, 4.0, 2.0, 1.0, 6.0, 1.0));
+    assert_oom_is_atomic(|d| d.liquify_segment(0, (1.0, 1.0), (6.0, 6.0), 4.0, 0.8));
+}
+
+#[test]
+fn liquify_allocation_failure_rolls_back_the_whole_stroke() {
+    use crate::raster::with_failed_alloc;
+    let painted = || {
+        let mut doc = Document::new(64, 32);
+        let bytes: Vec<u8> = (0..64 * 32 * 4)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
+        doc.layers[0].pixels = Raster::from_dense(64, 32, 4, &bytes);
+        doc
+    };
+    // A stroke that cannot even snapshot its source leaves no trace.
+    let mut doc = painted();
+    let before = snapshot(&doc);
+    let err = with_failed_alloc(0, || doc.liquify_begin(0)).unwrap_err();
+    assert!(err.contains("out of memory"), "{err}");
+    assert_eq!(snapshot(&doc), before);
+    // Fail a later segment: the pixels the earlier segments already warped
+    // go back to the stroke start, not just to the previous frame.
+    doc.liquify_begin(0).unwrap();
+    doc.liquify_segment(0, (8.0, 16.0), (40.0, 16.0), 24.0, 0.8)
+        .unwrap();
+    assert_ne!(
+        doc.layers[0].pixels.to_dense(),
+        before.0[0],
+        "the first segment warped something"
+    );
+    let err = with_failed_alloc(0, || {
+        doc.liquify_segment(0, (40.0, 16.0), (56.0, 20.0), 24.0, 0.8)
+    })
+    .unwrap_err();
+    assert!(err.contains("out of memory"), "{err}");
+    assert_eq!(snapshot(&doc), before, "the stroke was not rolled back");
+    assert!(doc.liquify.is_none(), "the failed stroke is discarded");
+}
+
+#[test]
 fn tone_brightness_contrast_and_alpha() {
     let mut doc = Document::new(2, 1);
     doc.layers[0].pixels = px_rgba(&doc, &[100, 100, 100, 200, 100, 100, 100, 200]);
@@ -3485,14 +3527,14 @@ fn liquify_pushes_pixels_along_the_drag() {
     // Solid white bar on the left half.
     doc.fill_rect(&brush, Color::rgb(255, 255, 255), 4, 4, 11, 27);
     // Push right at the bar's edge: the bar's rim must advance.
-    doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 1.0);
+    doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 1.0).unwrap();
     let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
     assert!(at(&doc, 14, 15) > 200, "rim advanced");
     assert_eq!(at(&doc, 24, 15), 0, "far field untouched");
     // Zero push and zero strength are no-ops.
     let before = doc.layers[0].pixels.clone();
-    doc.liquify(0, 11.5, 15.5, 0.0, 0.0, 16.0, 1.0);
-    doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 0.0);
+    doc.liquify(0, 11.5, 15.5, 0.0, 0.0, 16.0, 1.0).unwrap();
+    doc.liquify(0, 11.5, 15.5, 6.0, 0.0, 16.0, 0.0).unwrap();
     assert_eq!(doc.layers[0].pixels, before);
 }
 
@@ -3508,7 +3550,7 @@ fn liquify_pushes_across_a_tile_seam() {
     };
     doc.fill_rect(&brush, Color::rgb(255, 0, 0), 0, 0, 255, 39);
     doc.fill_rect(&brush, Color::rgb(0, 0, 255), 256, 0, 519, 39);
-    doc.liquify(0, 256.0, 20.0, 10.0, 0.0, 24.0, 1.0);
+    doc.liquify(0, 256.0, 20.0, 10.0, 0.0, 24.0, 1.0).unwrap();
     let at = |x: u32| doc.layers[0].pixels.get4(((20 * 520 + x) * 4) as usize);
     assert_eq!(
         at(257),
@@ -3538,7 +3580,7 @@ fn liquify_moves_only_pixels_inside_the_selection() {
     // The disc straddles the selection edge at x = 31: inside pixels
     // warp, outside pixels must stay byte-identical.
     doc.selection = Some((0, 0, 31, 31));
-    doc.liquify(0, 28.0, 16.0, 0.0, 6.0, 40.0, 1.0);
+    doc.liquify(0, 28.0, 16.0, 0.0, 6.0, 40.0, 1.0).unwrap();
     let moved = at(&doc.layers[0].pixels, 20, 16);
     assert!(
         (94..=96).contains(&(moved[1] as i32)),
@@ -3573,7 +3615,7 @@ fn liquify_scales_the_push_by_mask_coverage() {
     mask[(16 * w + 28) as usize] = 64; // k = 64/255
     mask[(16 * w + 30) as usize] = 0;
     doc.selection_mask = Some(mask);
-    doc.liquify(0, 28.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+    doc.liquify(0, 28.0, 16.0, 8.0, 0.0, 40.0, 1.0).unwrap();
     let at = |x: u32, y: u32| doc.layers[0].pixels.get4(((y * w + x) * 4) as usize);
     // A quarter-covered pixel moves a quarter of the way: it samples
     // ~2 px back, where the ramp reads ~104.
@@ -3699,8 +3741,8 @@ fn liquify_matches_a_dense_field_reference() {
     // ring outside the rewritten pixels, then a second push folds in.
     let mut doc = Document::new(32, 32);
     doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
-    doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0);
-    doc.liquify(0, 10.0, 20.0, -8.0, 5.0, 18.0, 0.6);
+    doc.liquify(0, 20.0, 12.0, 9.0, -7.0, 14.0, 1.0).unwrap();
+    doc.liquify(0, 10.0, 20.0, -8.0, 5.0, 18.0, 0.6).unwrap();
     assert_eq!(
         doc.layers[0].pixels,
         field_warp(
@@ -3716,7 +3758,7 @@ fn liquify_matches_a_dense_field_reference() {
     // Corner warp: reads clamp against the canvas edge.
     let mut doc = Document::new(32, 32);
     doc.layers[0].pixels = Raster::from_dense(32, 32, 4, &bytes);
-    doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7);
+    doc.liquify(0, 2.0, 2.0, 5.0, 4.0, 14.0, 0.7).unwrap();
     assert_eq!(
         doc.layers[0].pixels,
         field_warp(&bytes, 32, 32, &[(2.0, 2.0, 5.0, 4.0, 14.0, 0.7)])
@@ -3737,7 +3779,7 @@ fn repeated_pushes_carry_the_rim_without_smearing_it() {
     // Content is carried with the pointer: ten pushes from one spot keep
     // pulling the rim outward instead of summing a force at fixed pixels.
     for _ in 0..10 {
-        doc.liquify(0, 32.0, 16.0, 8.0, 0.0, 40.0, 1.0);
+        doc.liquify(0, 32.0, 16.0, 8.0, 0.0, 40.0, 1.0).unwrap();
     }
     let px = |x: u32| doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
     let rim = (0..64u32).rev().find(|&x| px(x)[3] > 0).unwrap();
@@ -3770,13 +3812,14 @@ fn liquify_drag_carries_content_with_the_pointer() {
     }
     // A 160 px drag at strength 0.5, fed as ~4 px pointer segments and
     // starting 70 px short of the bar (it enters the disc's rim).
-    doc.liquify_begin(0);
+    doc.liquify_begin(0).unwrap();
     let (x0, x1, y) = (242.0f32, 402.0f32, 180.0f32);
     let n = 40u32;
     let mut at = x0;
     for i in 1..=n {
         let to = x0 + (x1 - x0) * i as f32 / n as f32;
-        doc.liquify_segment(0, (at, y), (to, y), 128.0, 0.5);
+        doc.liquify_segment(0, (at, y), (to, y), 128.0, 0.5)
+            .unwrap();
         at = to;
     }
     doc.liquify_end();
@@ -3818,7 +3861,7 @@ fn liquify_keeps_edge_color_at_partial_alpha() {
     // A half-strength push stretches the bar's rim into fractional
     // alpha. Straight-alpha filtering would drag transparent black into
     // it (and the rim turns [227, 0, 0]); premultiplied keeps [255, 0, 0].
-    doc.liquify(0, 30.5, 16.0, 6.0, 0.0, 40.0, 0.5);
+    doc.liquify(0, 30.5, 16.0, 6.0, 0.0, 40.0, 0.5).unwrap();
     let mut partial = 0;
     for x in 0..64u32 {
         let [r, g, b, a] = doc.layers[0].pixels.get4(((16 * 64 + x) * 4) as usize);
@@ -3839,7 +3882,7 @@ fn liquify_starts_a_new_snapshot_after_a_paint() {
         .map(|i| ((i * 37 + 11) % 256) as u8)
         .collect();
     doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
-    doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+    doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0).unwrap();
     // Paint over everything: the open stroke's snapshot is now stale,
     // and the next push must warp the new pixels, not resurrect the old.
     let brush = Brush {
@@ -3850,7 +3893,7 @@ fn liquify_starts_a_new_snapshot_after_a_paint() {
     };
     doc.fill_rect(&brush, Color::rgb(255, 255, 255), 0, 0, w - 1, h - 1);
     for _ in 0..4 {
-        doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0);
+        doc.liquify(0, 16.0, 16.0, 6.0, 0.0, 24.0, 1.0).unwrap();
     }
     for y in 0..h {
         for x in 0..w {
@@ -3902,9 +3945,9 @@ fn liquify_segment_matches_manual_stepping() {
     doc.layers[0].pixels = Raster::from_dense(w, h, 4, &bytes);
     let mut manual = doc.clone();
     let (from, to, size, strength) = ((6.0, 10.0), (84.0, 24.0), 24.0, 0.8);
-    doc.liquify_segment(0, from, to, size, strength);
+    doc.liquify_segment(0, from, to, size, strength).unwrap();
     for ((x, y), (dx, dy)) in liquify_steps(from, to, (size * 0.125).max(2.0)) {
-        manual.liquify(0, x, y, dx, dy, size, strength);
+        manual.liquify(0, x, y, dx, dy, size, strength).unwrap();
     }
     assert_eq!(doc.layers[0].pixels, manual.layers[0].pixels);
 }
@@ -3926,9 +3969,9 @@ fn liquify_segment_matches_manual_stepping_with_symmetry() {
     doc.symmetry = SymmetryMode::Horizontal;
     let mut manual = doc.clone();
     let (from, to, size, strength) = ((20.0, 18.0), (44.0, 40.0), 20.0, 0.8);
-    doc.liquify_segment(0, from, to, size, strength);
+    doc.liquify_segment(0, from, to, size, strength).unwrap();
     for ((x, y), (dx, dy)) in liquify_steps(from, to, (size * 0.125).max(2.0)) {
-        manual.liquify(0, x, y, dx, dy, size, strength);
+        manual.liquify(0, x, y, dx, dy, size, strength).unwrap();
     }
     assert_eq!(doc.layers[0].pixels, manual.layers[0].pixels);
 }
@@ -3949,7 +3992,7 @@ fn liquify_mirrors_with_symmetry() {
     doc.symmetry = SymmetryMode::Horizontal;
     // Push right at the left bar's rim: the mirrored push runs left
     // at the mirrored point with a mirrored direction.
-    doc.liquify(0, 7.5, 15.5, 6.0, 0.0, 16.0, 1.0);
+    doc.liquify(0, 7.5, 15.5, 6.0, 0.0, 16.0, 1.0).unwrap();
     let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
     assert!(at(&doc, 10, 15) > 200, "primary rim advanced");
     assert!(at(&doc, 21, 15) > 200, "mirrored rim advanced");
@@ -3974,7 +4017,7 @@ fn liquify_mirrors_kaleidoscope_push_vectors() {
     doc.symmetry_segments = 4;
     // Push up at the east bar's middle: k=1 mirrors the point 90
     // degrees CCW (south) and rotates the push vector to point west.
-    doc.liquify(0, 23.0, 16.0, 0.0, -6.0, 16.0, 1.0);
+    doc.liquify(0, 23.0, 16.0, 0.0, -6.0, 16.0, 1.0).unwrap();
     let at = |d: &Document, x: u32, y: u32| d.layers[0].pixels.get(((y * 32 + x) * 4) as usize);
     assert!(at(&doc, 23, 13) > 200, "primary push advanced the east rim");
     assert!(at(&doc, 12, 23) > 200, "k=1 push pulled the south bar west");

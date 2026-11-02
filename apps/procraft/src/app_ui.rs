@@ -2525,8 +2525,13 @@ impl eframe::App for ProCraftApp {
                     if resp.drag_started() && !gesture && !self.text_paint_blocked() {
                         if let Some(pos) = pos {
                             self.doc.checkpoint();
-                            self.doc.liquify_begin(self.doc.active);
-                            self.liquify_from = Some(to_canvas(pos));
+                            if let Err(e) = self.doc.liquify_begin(self.doc.active) {
+                                // Nothing was warped: drop the empty step.
+                                self.doc.discard_last_checkpoint();
+                                self.status = e;
+                            } else {
+                                self.liquify_from = Some(to_canvas(pos));
+                            }
                         }
                     }
                     if resp.dragged() {
@@ -2537,22 +2542,37 @@ impl eframe::App for ProCraftApp {
                             // from the stroke's snapshot, so a fast drag
                             // neither trails the pointer nor blurs what
                             // earlier pushes already warped.
-                            self.doc.liquify_segment(
+                            match self.doc.liquify_segment(
                                 self.doc.active,
                                 from,
                                 to,
                                 self.liquify_size,
                                 self.liquify_strength,
-                            );
-                            // Ghosts show the neighbor frames only; warping
-                            // the active frame leaves them untouched.
-                            self.liquify_from = Some(to);
+                            ) {
+                                Ok(()) => {
+                                    // Ghosts show the neighbor frames only;
+                                    // warping the active frame leaves them
+                                    // untouched.
+                                    self.liquify_from = Some(to);
+                                }
+                                Err(e) => {
+                                    // Out of memory: the stroke rolled back
+                                    // whole, so this drag has nothing left to
+                                    // continue from.
+                                    self.doc.discard_last_checkpoint();
+                                    self.liquify_from = None;
+                                    self.status = e;
+                                }
+                            }
                         }
                     }
                     if resp.drag_stopped() {
-                        self.liquify_from = None;
+                        // A failed stroke already cleared the anchor: leave
+                        // its error in the status bar instead of claiming a
+                        // warp that was rolled back.
+                        let complete = self.liquify_from.take().is_some();
                         self.doc.liquify_end();
-                        if !self.text_paint_blocked() {
+                        if complete && !self.text_paint_blocked() {
                             self.capture_timelapse();
                             self.status = "Liquified.".to_string();
                         }

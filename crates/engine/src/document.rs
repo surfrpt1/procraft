@@ -1,7 +1,7 @@
 //! Layers, documents, compositing and undo.
 
 use crate::brush::{slot_span, slot_x};
-use crate::raster::{try_copy, try_vec, try_zeroed, Raster, TILE};
+use crate::raster::{try_copy, try_fill, try_vec, try_zeroed, Raster, TILE};
 use liquify::LiquifyStroke;
 
 /// How a layer's pixels combine with what's beneath.

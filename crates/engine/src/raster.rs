@@ -32,15 +32,24 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, String> {
 
 /// [`try_zeroed`] for other element types (filter scratch tables).
 pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>, String> {
+    let mut buf = Vec::new();
+    try_fill(&mut buf, len, value)?;
+    Ok(buf)
+}
+
+/// Refill `buf` with `len` copies of `value`, reserving fallibly. An
+/// existing buffer keeps its capacity, so per-frame scratch does not
+/// reallocate and a failure leaves the previous bytes in place.
+pub(crate) fn try_fill<T: Clone>(buf: &mut Vec<T>, len: usize, value: T) -> Result<(), String> {
     #[cfg(test)]
     if fail_next_allocation() {
         return Err("out of memory (injected test failure)".to_string());
     }
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
+    buf.clear();
+    buf.try_reserve(len)
         .map_err(|e| format!("out of memory for {len} items: {e}"))?;
     buf.resize(len, value);
-    Ok(buf)
+    Ok(())
 }
 
 /// Copy a byte buffer fallibly: `to_vec()` aborts on OOM, which a filter
@@ -205,6 +214,30 @@ impl Raster {
             *arc = Arc::new(copy);
         }
         Ok(Arc::get_mut(arc).expect("tile is unshared").as_mut_slice())
+    }
+
+    /// Fallible [`Clone`]: copies only the tile pointer row and shares the
+    /// tiles, so an 8K stroke snapshot cannot abort on allocation failure.
+    pub(crate) fn try_clone(&self) -> Result<Raster, String> {
+        #[cfg(test)]
+        if fail_next_allocation() {
+            return Err("out of memory (injected test failure)".to_string());
+        }
+        let mut tiles = Vec::new();
+        tiles
+            .try_reserve_exact(self.tiles.len())
+            .map_err(|e| format!("out of memory for {} tiles: {e}", self.tiles.len()))?;
+        for tile in &self.tiles {
+            tiles.push(tile.clone());
+        }
+        Ok(Self {
+            w: self.w,
+            h: self.h,
+            bpp: self.bpp,
+            tiles_x: self.tiles_x,
+            tiles_y: self.tiles_y,
+            tiles,
+        })
     }
 
     /// Overwrite a whole tile from `bytes` (which must be `tile_len()`
@@ -406,16 +439,47 @@ impl Raster {
     /// `get` per byte.
     pub(crate) fn region_into(&self, rect: (u32, u32, u32, u32), out: &mut Vec<u8>) {
         out.clear();
+        let Some((rect, rw)) = self.region_rect(rect) else {
+            return;
+        };
+        out.resize(rw * (rect.3 - rect.1 + 1) as usize * self.bpp(), 0);
+        self.copy_region(rect, rw, out);
+    }
+
+    /// Fallible [`Self::region_into`] for editor paths: the buffer
+    /// allocation is reported instead of aborting.
+    pub(crate) fn try_region_into(
+        &self,
+        rect: (u32, u32, u32, u32),
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let Some((rect, rw)) = self.region_rect(rect) else {
+            out.clear();
+            return Ok(());
+        };
+        try_fill(out, rw * (rect.3 - rect.1 + 1) as usize * self.bpp(), 0)?;
+        self.copy_region(rect, rw, out);
+        Ok(())
+    }
+
+    /// Clipped copy bounds and their row stride, or `None` when the rect
+    /// copies nothing.
+    fn region_rect(&self, rect: (u32, u32, u32, u32)) -> Option<((u32, u32, u32, u32), usize)> {
         let (x0, y0, x1, y1) = rect;
         if x0 > x1 || y0 > y1 || self.is_empty() {
-            return;
+            return None;
         }
         let x1 = x1.min(self.w - 1);
         let y1 = y1.min(self.h - 1);
         let (x0, y0) = (x0.min(x1), y0.min(y1));
+        Some(((x0, y0, x1, y1), (x1 - x0 + 1) as usize))
+    }
+
+    /// Copy a clipped rect into `out`, which must already hold
+    /// `rw * rows * bpp` bytes.
+    fn copy_region(&self, rect: (u32, u32, u32, u32), rw: usize, out: &mut [u8]) {
+        let (x0, y0, x1, y1) = rect;
         let bpp = self.bpp();
-        let rw = (x1 - x0 + 1) as usize;
-        out.resize(rw * (y1 - y0 + 1) as usize * bpp, 0);
         for ty in y0 / TILE..=y1 / TILE {
             for tx in x0 / TILE..=x1 / TILE {
                 let Some(tile) = self.tiles[(ty * self.tiles_x + tx) as usize].as_deref() else {
@@ -481,6 +545,49 @@ impl Raster {
             done += n / bpp;
         }
         changed
+    }
+
+    /// Fallible [`Self::write_row_changed`] for editor paths: a tile
+    /// materialisation or copy-on-write clone reports its allocation
+    /// failure instead of aborting, leaving the bytes already written.
+    pub(crate) fn try_write_row_changed(
+        &mut self,
+        x0: u32,
+        y: u32,
+        row: &[u8],
+    ) -> Result<bool, String> {
+        let bpp = self.bpp();
+        let pixels = row.len() / bpp;
+        if pixels == 0 || y >= self.h {
+            return Ok(false);
+        }
+        let ty = y / TILE;
+        let mut changed = false;
+        let mut done = 0usize;
+        while done < pixels {
+            let x = x0 + done as u32;
+            if x >= self.w {
+                break;
+            }
+            let tx = x / TILE;
+            let n = ((TILE - x % TILE) as usize).min(pixels - done) * bpp;
+            let src = &row[done * bpp..done * bpp + n];
+            let off = ((y % TILE) * TILE + x % TILE) as usize * bpp;
+            let slot = (ty * self.tiles_x + tx) as usize;
+            // Same rules as the infallible version: an unchanged run never
+            // copies a shared tile, and a zero run never materialises one.
+            let write = match self.tiles[slot].as_ref() {
+                Some(tile) => tile[off..off + n] != *src,
+                None => src.iter().any(|&b| b != 0),
+            };
+            if write {
+                let t = self.try_tile_mut(tx, ty)?;
+                t[off..off + n].copy_from_slice(src);
+                changed = true;
+            }
+            done += n / bpp;
+        }
+        Ok(changed)
     }
 
     /// Replace every tile from a dense buffer sized for this geometry.
@@ -774,6 +881,24 @@ mod tests {
         let err = with_failed_alloc(0, || r.try_set_dense(&vec![9u8; 300 * 300 * 4])).unwrap_err();
         assert!(err.contains("out of memory"), "{err}");
         assert_eq!(r.to_dense(), before);
+    }
+
+    #[test]
+    fn fallible_row_region_and_clone_report_oom() {
+        let mut r = Raster::rgba(300, 4);
+        let mut row = vec![0u8; 300 * 4];
+        row[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let err = with_failed_alloc(0, || r.try_write_row_changed(0, 0, &row)).unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
+        assert_eq!(r.alloc_bytes(), 0, "a failed write materialises nothing");
+
+        let mut out = vec![9u8; 8];
+        let err = with_failed_alloc(0, || r.try_region_into((0, 0, 9, 9), &mut out)).unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
+        assert_eq!(out, vec![9u8; 8], "a failed read keeps the old bytes");
+
+        let err = with_failed_alloc(0, || r.try_clone()).unwrap_err();
+        assert!(err.contains("out of memory"), "{err}");
     }
 
     #[test]

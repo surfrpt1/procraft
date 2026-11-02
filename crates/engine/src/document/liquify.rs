@@ -25,11 +25,14 @@ impl LiquifyField {
     /// Dense copy of `rect` (inclusive) into `out`, row-major with stride =
     /// rect width; returns that stride. Copies whole tile rows, so a
     /// disc-sized read does not pay a hash lookup per pixel.
-    fn snapshot_into(&self, rect: (u32, u32, u32, u32), out: &mut Vec<[f32; 2]>) -> u32 {
+    fn try_snapshot_into(
+        &self,
+        rect: (u32, u32, u32, u32),
+        out: &mut Vec<[f32; 2]>,
+    ) -> Result<u32, String> {
         let (x0, y0, x1, y1) = rect;
         let rw = x1 - x0 + 1;
-        out.clear();
-        out.resize((rw * (y1 - y0 + 1)) as usize, [0.0f32; 2]);
+        try_fill(out, (rw * (y1 - y0 + 1)) as usize, [0.0f32; 2])?;
         for ty in (y0 / TILE)..=(y1 / TILE) {
             for tx in (x0 / TILE)..=(x1 / TILE) {
                 let Some(t) = self.tiles.get(&(ty * self.tiles_x + tx)) else {
@@ -48,24 +51,46 @@ impl LiquifyField {
                 }
             }
         }
-        rw
+        Ok(rw)
     }
 
     /// Write a dense `rect` (row-major, `stride` pixels per row) back into
     /// the tiles, materialising each touched tile once instead of once per
     /// pixel.
-    fn commit(&mut self, rect: (u32, u32, u32, u32), dense: &[[f32; 2]], stride: u32) {
+    fn try_commit(
+        &mut self,
+        rect: (u32, u32, u32, u32),
+        dense: &[[f32; 2]],
+        stride: u32,
+    ) -> Result<(), String> {
         let (x0, y0, x1, y1) = rect;
+        let tile_len = (TILE * TILE * 2) as usize;
         for ty in (y0 / TILE)..=(y1 / TILE) {
             for tx in (x0 / TILE)..=(x1 / TILE) {
                 let gx0 = x0.max(tx * TILE);
                 let gx1 = x1.min(tx * TILE + TILE - 1);
                 let gy0 = y0.max(ty * TILE);
                 let gy1 = y1.min(ty * TILE + TILE - 1);
-                let tile = self.tiles.entry(ty * self.tiles_x + tx).or_insert_with(|| {
-                    std::sync::Arc::new(vec![0.0f32; (TILE * TILE * 2) as usize])
-                });
-                let t = std::sync::Arc::make_mut(tile);
+                let key = ty * self.tiles_x + tx;
+                if !self.tiles.contains_key(&key) {
+                    // Reserve the slot before filling it: the insert itself
+                    // must not be the allocation that aborts.
+                    self.tiles
+                        .try_reserve(1)
+                        .map_err(|e| format!("out of memory for the liquify field: {e}"))?;
+                    self.tiles
+                        .insert(key, std::sync::Arc::new(try_vec(tile_len, 0.0f32)?));
+                }
+                let tile = self
+                    .tiles
+                    .get_mut(&key)
+                    .expect("field tile was just materialised");
+                if std::sync::Arc::strong_count(tile) > 1 {
+                    let mut copy = try_vec(tile_len, 0.0f32)?;
+                    copy.copy_from_slice(tile);
+                    *tile = std::sync::Arc::new(copy);
+                }
+                let t = std::sync::Arc::get_mut(tile).expect("field tile is unshared");
                 for gy in gy0..=gy1 {
                     let dst = (((gy % TILE) * TILE + gx0 % TILE) * 2) as usize;
                     let src = ((gy - y0) * stride + (gx0 - x0)) as usize;
@@ -76,6 +101,7 @@ impl LiquifyField {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -105,10 +131,10 @@ pub(super) struct LiquifyStroke {
 }
 
 impl LiquifyStroke {
-    fn new(index: usize, src: Raster, canvas_w: u32, rev: u64) -> Self {
-        Self {
+    fn new(index: usize, pixels: &Raster, canvas_w: u32, rev: u64) -> Result<Self, String> {
+        Ok(Self {
             layer: index,
-            src,
+            src: pixels.try_clone()?,
             field: LiquifyField::new(canvas_w),
             scratch_off: Vec::new(),
             scratch_disc: Vec::new(),
@@ -116,7 +142,7 @@ impl LiquifyStroke {
             scratch_src: Vec::new(),
             scratch_row: Vec::new(),
             rev,
-        }
+        })
     }
 }
 
@@ -186,6 +212,10 @@ impl Document {
     /// the swept region from the stroke's snapshot, so a stroke resamples each
     /// pixel at most once: in place resampling would smear the previous warp
     /// again on every push. Zero push is a no-op.
+    ///
+    /// An allocation failure aborts the stroke and restores the layer to the
+    /// stroke snapshot, so a drag that runs out of memory keeps the pixels it
+    /// had before it started.
     #[allow(clippy::too_many_arguments)]
     pub fn liquify(
         &mut self,
@@ -196,43 +226,55 @@ impl Document {
         dy: f32,
         size: f32,
         strength: f32,
-    ) {
+    ) -> Result<(), String> {
         if index >= self.layers.len() || size < 1.0 || strength <= 0.0 {
-            return;
+            return Ok(());
         }
         if dx == 0.0 && dy == 0.0 {
-            return;
+            return Ok(());
         }
         if self.w == 0 || self.h == 0 {
-            return;
+            return Ok(());
         }
-        let mut stroke = self.take_stroke(index);
+        let mut stroke = self.take_stroke(index)?;
         let mut dirty = Vec::new();
         for (px, py, pdx, pdy) in self.liquify_mirrors(x, y, dx, dy) {
-            if let Some(rect) =
-                self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength)
-            {
-                dirty.push(rect);
+            match self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength) {
+                Ok(Some(rect)) => dirty.push(rect),
+                Ok(None) => {}
+                Err(e) => return Err(self.abort_liquify(stroke, e)),
             }
         }
-        self.flush_liquify(&mut stroke, dirty);
+        if let Err(e) = self.flush_liquify(&mut stroke, dirty) {
+            return Err(self.abort_liquify(stroke, e));
+        }
         self.liquify = Some(stroke);
+        Ok(())
     }
 
     /// Open a liquify stroke on `index`: the snapshot every push resamples
     /// from. The app calls it once per drag (right after the undo
     /// checkpoint) and [`Self::liquify_end`] on release; pushes also open a
     /// stroke on their own when none is active.
-    pub fn liquify_begin(&mut self, index: usize) {
+    pub fn liquify_begin(&mut self, index: usize) -> Result<(), String> {
         if let Some(stroke) = self.liquify.as_ref() {
             if stroke.layer == index && stroke.rev == self.rev {
-                return;
+                return Ok(());
             }
         }
-        self.liquify = self
-            .layers
-            .get(index)
-            .map(|layer| LiquifyStroke::new(index, layer.pixels.clone(), self.w, self.rev));
+        let Some(layer) = self.layers.get(index) else {
+            return Ok(());
+        };
+        match LiquifyStroke::new(index, &layer.pixels, self.w, self.rev) {
+            Ok(stroke) => {
+                self.liquify = Some(stroke);
+                Ok(())
+            }
+            Err(e) => {
+                self.liquify = None;
+                Err(e)
+            }
+        }
     }
 
     /// Close the active liquify stroke and free its snapshot and field.
@@ -247,6 +289,9 @@ impl Document {
     /// segment accumulate first and the swept region renders once, so a long
     /// jump costs one resample of the path instead of one full disc render
     /// per sub-push.
+    ///
+    /// Like [`Self::liquify`], an allocation failure rolls the whole stroke
+    /// back to its snapshot and returns the error.
     pub fn liquify_segment(
         &mut self,
         index: usize,
@@ -254,39 +299,55 @@ impl Document {
         to: (f32, f32),
         size: f32,
         strength: f32,
-    ) {
+    ) -> Result<(), String> {
         if index >= self.layers.len() || size < 1.0 || strength <= 0.0 {
-            return;
+            return Ok(());
         }
         if self.w == 0 || self.h == 0 {
-            return;
+            return Ok(());
         }
         let steps = liquify_steps(from, to, (size * 0.125).max(2.0));
         if steps.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut stroke = self.take_stroke(index);
+        let mut stroke = self.take_stroke(index)?;
         let mut dirty = Vec::new();
         for ((x, y), (dx, dy)) in steps {
             for (px, py, pdx, pdy) in self.liquify_mirrors(x, y, dx, dy) {
-                if let Some(rect) =
-                    self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength)
-                {
-                    dirty.push(rect);
+                match self.liquify_field_push(&mut stroke, px, py, pdx, pdy, size, strength) {
+                    Ok(Some(rect)) => dirty.push(rect),
+                    Ok(None) => {}
+                    Err(e) => return Err(self.abort_liquify(stroke, e)),
                 }
             }
         }
-        self.flush_liquify(&mut stroke, dirty);
+        if let Err(e) = self.flush_liquify(&mut stroke, dirty) {
+            return Err(self.abort_liquify(stroke, e));
+        }
         self.liquify = Some(stroke);
+        Ok(())
     }
 
     /// Reuse the open stroke only while its snapshot still matches the
     /// layer: any other write (paint, undo, filter) starts a new one.
-    fn take_stroke(&mut self, index: usize) -> LiquifyStroke {
+    fn take_stroke(&mut self, index: usize) -> Result<LiquifyStroke, String> {
         match self.liquify.take() {
-            Some(stroke) if stroke.layer == index && stroke.rev == self.rev => stroke,
-            _ => LiquifyStroke::new(index, self.layers[index].pixels.clone(), self.w, self.rev),
+            Some(stroke) if stroke.layer == index && stroke.rev == self.rev => Ok(stroke),
+            _ => LiquifyStroke::new(index, &self.layers[index].pixels, self.w, self.rev),
         }
+    }
+
+    /// Drop a failed stroke whole and put the layer back to the stroke
+    /// snapshot, so a partial field or a half-written region never leaks
+    /// into the next frame. Returns the original error for the caller.
+    fn abort_liquify(&mut self, stroke: LiquifyStroke, err: String) -> String {
+        self.liquify = None;
+        let index = stroke.layer;
+        if let Some(layer) = self.layers.get_mut(index) {
+            layer.pixels = stroke.src;
+        }
+        self.mark_full_dirty();
+        err
     }
 
     /// One push per symmetry mirror, deduped when a mirror lands on an
@@ -313,10 +374,15 @@ impl Document {
 
     /// Render the pushed rects once each (grouped by proximity) and store
     /// the stroke's new revision.
-    fn flush_liquify(&mut self, stroke: &mut LiquifyStroke, dirty: Vec<(u32, u32, u32, u32)>) {
+    fn flush_liquify(
+        &mut self,
+        stroke: &mut LiquifyStroke,
+        dirty: Vec<(u32, u32, u32, u32)>,
+    ) -> Result<(), String> {
         for group in merge_rects(dirty) {
-            self.liquify_render(stroke, &group);
+            self.liquify_render(stroke, &group)?;
         }
+        Ok(())
     }
 
     /// Add one warp to the stroke's field. The disc is read from a dense
@@ -333,7 +399,7 @@ impl Document {
         dy: f32,
         size: f32,
         strength: f32,
-    ) -> Option<(u32, u32, u32, u32)> {
+    ) -> Result<Option<(u32, u32, u32, u32)>, String> {
         let (w, h) = (self.w, self.h);
         let radius = size * 0.5;
         let bx0 = ((x - radius).floor().max(0.0)) as u32;
@@ -341,7 +407,7 @@ impl Document {
         let bx1 = ((x + radius).ceil().min(w as f32 - 1.0).max(0.0)) as u32;
         let by1 = ((y + radius).ceil().min(h as f32 - 1.0).max(0.0)) as u32;
         if bx0 > bx1 || by0 > by1 {
-            return None;
+            return Ok(None);
         }
         let selection = self.selection;
         let mask = self.selection_mask.as_deref();
@@ -350,8 +416,7 @@ impl Document {
         // The displacement this push gives each pixel (reverse sample offset
         // direction: content moves along `(dx, dy)`).
         let mut disp = std::mem::take(&mut stroke.scratch_disc);
-        disp.clear();
-        disp.resize(dw * dh, [0.0f32; 2]);
+        try_fill(&mut disp, dw * dh, [0.0f32; 2])?;
         let mut step = 0.0f32;
         let r2 = radius * radius;
         for gy in 0..dh {
@@ -386,7 +451,7 @@ impl Document {
         }
         if step == 0.0 {
             stroke.scratch_disc = disp;
-            return None;
+            return Ok(None);
         }
         // The offset is carried with the content, like dragging the pixels:
         // `F_new(p) = F_old(p + d) + d`. Summing `d` at a fixed pixel instead
@@ -399,7 +464,8 @@ impl Document {
         let (sx1, sy1) = ((bx1 + pad).min(w - 1), (by1 + pad).min(h - 1));
         let sw = stroke
             .field
-            .snapshot_into((sx0, sy0, sx1, sy1), &mut stroke.scratch_off) as usize;
+            .try_snapshot_into((sx0, sy0, sx1, sy1), &mut stroke.scratch_off)?
+            as usize;
         let old = &stroke.scratch_off;
         for gy in 0..dh {
             let py = by0 + gy as u32;
@@ -438,9 +504,11 @@ impl Document {
                 ];
             }
         }
-        stroke.field.commit((bx0, by0, bx1, by1), &disp, dw as u32);
+        stroke
+            .field
+            .try_commit((bx0, by0, bx1, by1), &disp, dw as u32)?;
         stroke.scratch_disc = disp;
-        Some((bx0, by0, bx1, by1))
+        Ok(Some((bx0, by0, bx1, by1)))
     }
 
     /// Re-render the pushed rects of one group from the stroke snapshot
@@ -449,13 +517,17 @@ impl Document {
     /// wise, skipping bytes that did not change. Filtering is premultiplied
     /// and the writes unpremultiplied, so transparent black never bleeds
     /// into a warped edge and darkens its color.
-    fn liquify_render(&mut self, stroke: &mut LiquifyStroke, parts: &[(u32, u32, u32, u32)]) {
+    fn liquify_render(
+        &mut self,
+        stroke: &mut LiquifyStroke,
+        parts: &[(u32, u32, u32, u32)],
+    ) -> Result<(), String> {
         let (w, h) = (self.w, self.h);
         let Some(&first) = parts.first() else {
-            return;
+            return Ok(());
         };
         if w == 0 || h == 0 {
-            return;
+            return Ok(());
         }
         let mut rect = first;
         for &p in &parts[1..] {
@@ -469,7 +541,7 @@ impl Document {
         let (x0, y0) = (rect.0.min(w - 1), rect.1.min(h - 1));
         let (x1, y1) = (rect.2.min(w - 1), rect.3.min(h - 1));
         if x0 > x1 || y0 > y1 {
-            return;
+            return Ok(());
         }
         let (bw, bh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
         // Cover only the pushed rects inside the group's box: the extra
@@ -478,7 +550,7 @@ impl Document {
         let mut cov = std::mem::take(&mut stroke.scratch_cov);
         cov.clear();
         if parts.len() > 1 {
-            cov.resize(bw * bh, 0);
+            try_fill(&mut cov, bw * bh, 0u8)?;
             for &(px0, py0, px1, py1) in parts {
                 let (px1, py1) = (px1.min(x1), py1.min(y1));
                 let (px0, py0) = (px0.min(px1), py0.min(py1));
@@ -494,7 +566,7 @@ impl Document {
         }
         let fw = stroke
             .field
-            .snapshot_into((x0, y0, x1, y1), &mut stroke.scratch_off);
+            .try_snapshot_into((x0, y0, x1, y1), &mut stroke.scratch_off)?;
         // Furthest reverse sample over the pushed pixels: the source region
         // must reach that far outside the rewritten rect. `+ 1` covers the
         // far bilinear corner.
@@ -520,7 +592,9 @@ impl Document {
         let ry1 = (y1 + reach).min(h - 1);
         let rw = (rx1 - rx0 + 1) as usize;
         let mut src_buf = std::mem::take(&mut stroke.scratch_src);
-        stroke.src.region_into((rx0, ry0, rx1, ry1), &mut src_buf);
+        stroke
+            .src
+            .try_region_into((rx0, ry0, rx1, ry1), &mut src_buf)?;
         let region = &src_buf;
         let sample = |sx: f32, sy: f32| -> [u8; 4] {
             let sx = sx.clamp(0.0, w as f32 - 1.0);
@@ -557,8 +631,7 @@ impl Document {
             ]
         };
         let mut row = std::mem::take(&mut stroke.scratch_row);
-        row.clear();
-        row.resize(bw * 4, 0);
+        try_fill(&mut row, bw * 4, 0u8)?;
         let field = &stroke.scratch_off;
         let layer = &mut self.layers[stroke.layer];
         for py in y0..=y1 {
@@ -588,7 +661,7 @@ impl Document {
                 row[gx * 4..gx * 4 + 4].copy_from_slice(&out);
             }
             if cov_row.is_empty() {
-                let _ = layer.pixels.write_row_changed(x0, py, &row);
+                layer.pixels.try_write_row_changed(x0, py, &row)?;
                 continue;
             }
             let mut gx = 0;
@@ -601,10 +674,11 @@ impl Document {
                 while gx < bw && cov_row[gx] != 0 {
                     gx += 1;
                 }
-                let _ =
-                    layer
-                        .pixels
-                        .write_row_changed(x0 + start as u32, py, &row[start * 4..gx * 4]);
+                layer.pixels.try_write_row_changed(
+                    x0 + start as u32,
+                    py,
+                    &row[start * 4..gx * 4],
+                )?;
             }
         }
         stroke.scratch_cov = cov;
@@ -612,5 +686,6 @@ impl Document {
         stroke.scratch_row = row;
         self.mark_dirty(x0, y0, x1, y1);
         stroke.rev = self.rev;
+        Ok(())
     }
 }
