@@ -8,7 +8,7 @@ version = "0.11.0"
 edition = "2021"
 license = "MIT"
 authors = ["surfrpt1"]
-repository = "https://github.com/surfrpt1/procraft"
+repository = "https://github.com/surfrpt1/procraft-old"
 
 [profile.release]
 strip = true

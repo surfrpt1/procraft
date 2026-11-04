@@ -1,4 +1,20 @@
-# ProCraft
+# ProCraft (retired)
+
+> **This repository is retired.** v0.11.0 (2026-11-02) is the final release:
+> no further features, fixes or support will be published here.
+>
+> **Where to go instead.** A separate, independently maintained painting app
+> also called ProCraft is
+> **[artcraft-android/procraft](https://github.com/artcraft-android/procraft)**,
+> with builds for Android tablets, Windows and Linux, watercolour brushes,
+> animation and 3D painting. Downloads and bug reports live there:
+>
+> - Releases: <https://github.com/artcraft-android/procraft/releases>
+> - Issues: <https://github.com/artcraft-android/procraft/issues>
+>
+> That project has its own maintainers and codebase; this repository is not
+> part of it and is not affiliated with it. The v0.11.0 builds below stay
+> online for anyone still using them.
 
 <p align="center">
   <a href="assets/procraft-promo.mp4">
@@ -17,9 +33,11 @@ original.
 > Interactive. ProCraft is an independent project with its own name, branding
 > and code, and is not affiliated with or endorsed by any other vendor.
 
-## Get ProCraft
+## Get ProCraft (final release)
 
-Signed builds for all three targets on the [releases page](https://github.com/surfrpt1/procraft/releases/latest):
+v0.11.0 is the last signed build for all three targets, on the
+[releases page](https://github.com/surfrpt1/procraft-old/releases/latest). No
+further builds will be added here.
 
 | Platform | File | Install |
 |---|---|---|
@@ -60,7 +78,7 @@ allocated only where you paint, so an empty page costs nothing.
   app falls back to the GLES renderer when wgpu cannot start.
 - GIF import is capped at 4096 px per side.
 
-## Status: milestone 50 + v0.11.0 extras
+## Status: final at milestone 50 + v0.11.0 extras
 
 - [x] Layered document model (add / hide / reorder / opacity / blend)
 - [x] Soft-round brush + eraser with spacing, dynamics and undo
@@ -140,8 +158,8 @@ is the editable source). Shipped as the window icon and the embedded exe icon.
 Needs Rust 1.88+ ([rustup](https://rustup.rs)):
 
 ```sh
-git clone https://github.com/surfrpt1/procraft.git
-cd procraft
+git clone https://github.com/surfrpt1/procraft-old.git
+cd procraft-old
 cargo run --release -p procraft
 ```
 
